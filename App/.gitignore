@@ -1,0 +1,6 @@
+node_modules
+dist
+.env
+*.log
+# Prisma generated client (regenerate with: pnpm db:generate)
+src/generated/

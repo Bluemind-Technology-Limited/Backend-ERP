@@ -1,0 +1,541 @@
+// KIB ERP — Prisma schema (PostgreSQL / Supabase)
+// Event-driven inventory ledger, RBAC, procurement, production & QA.
+// Docs: ../../architecture/KIB-ERP-target-architecture.md
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+  runtime  = "nodejs"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum UserRole {
+  SUPER_ADMIN // full access, manages admins & high-value approvals
+  EXECUTIVE_ADMIN // dashboards, KPIs, approves high-value adjustments
+  STORE_OFFICER // requisitions, GRN receiving, issues to production, transfers
+  PRODUCTION_MANAGER // BOMs, production orders, machines/staff allocation
+  PROCUREMENT_OFFICER // suppliers, requisition -> purchase orders
+  QA_INSPECTOR // block/release batches, lab tests, GRN approval
+}
+
+enum MaterialType {
+  RAW
+  PACKAGING
+  FINISHED
+}
+
+enum BatchStatus {
+  ACTIVE
+  QUARANTINE
+  REJECTED
+  EXPIRED
+}
+
+enum LedgerEventType {
+  PO_RECEIPT // positive
+  PROD_CONSUMPTION // negative
+  PROD_OUTPUT // positive
+  WASTE // negative
+  ADJUSTMENT // +/- (gated)
+  TRANSFER_IN // positive
+  TRANSFER_OUT // negative
+}
+
+enum RequisitionStatus {
+  DRAFT
+  PENDING_APPROVAL
+  APPROVED
+  REJECTED
+}
+
+enum PurchaseOrderStatus {
+  DRAFT
+  SENT
+  PARTIAL
+  RECEIVED
+  CLOSED
+}
+
+enum GoodsReceiptStatus {
+  PENDING_QA
+  APPROVED
+  REJECTED
+}
+
+enum ProductionOrderStatus {
+  SCHEDULED
+  PROCESSING
+  COMPLETED
+  WASTED
+}
+
+enum BomStatus {
+  DRAFT
+  ACTIVE
+  APPROVED
+  ARCHIVED
+}
+
+enum InspectionResult {
+  PENDING
+  PASSED
+  FAILED
+}
+
+enum RecordStatus {
+  ACTIVE
+  INACTIVE
+}
+
+// ---------------------------------------------------------------------------
+// 1. Auth & RBAC
+// ---------------------------------------------------------------------------
+
+model User {
+  // id = Supabase Auth user id (JWT `sub`). The `users` table is the app
+  // profile layer keyed 1:1 to Supabase `auth.users`. Created post-signup
+  // (see seed script / auth webhook), never auto-generated here.
+  id           String   @id
+  email        String   @unique
+  username     String   @unique
+  passwordHash String   @map("password_hash")
+  fullName     String   @map("full_name")
+  role         UserRole
+  phoneNumber  String?  @map("phone_number")
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  requisitions        Requisition[]
+  purchaseOrders      PurchaseOrder[]
+  goodsReceipts       GoodsReceipt[]
+  productionOrders    ProductionOrder[]
+  inspections         InspectionRecord[]
+  createdTransactions InventoryTransaction[] @relation("transaction_creator")
+  approvedAdjustments InventoryTransaction[] @relation("adjustment_approver")
+  notifications       Notification[]
+
+  @@map("users")
+}
+
+model RolePermission {
+  id         String   @id @default(uuid())
+  role       UserRole
+  module     String // e.g. "inventory", "procurement", "production", "qa", "reports"
+  canCreate  Boolean  @default(false) @map("can_create")
+  canRead    Boolean  @default(true) @map("can_read")
+  canUpdate  Boolean  @default(false) @map("can_update")
+  canDelete  Boolean  @default(false) @map("can_delete")
+  canApprove Boolean  @default(false) @map("can_approve")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@unique([role, module])
+  @@map("role_permissions")
+}
+
+// ---------------------------------------------------------------------------
+// 2. Master Data
+// ---------------------------------------------------------------------------
+
+model Material {
+  id            String       @id @default(uuid())
+  name          String
+  sku           String       @unique
+  type          MaterialType
+  category      String?
+  unitOfMeasure String       @map("unit_of_measure") // kg, liters, units
+  barcode       String?
+  shelfLifeDays Int?         @map("shelf_life_days") // expiry parameters
+  requiresLot   Boolean      @default(true) @map("requires_lot")
+  attachments   Json? // [{name, url, kind: NAFDAC|MSDS|COA}]
+  status        RecordStatus @default(ACTIVE)
+  createdAt     DateTime     @default(now()) @map("created_at")
+  updatedAt     DateTime     @updatedAt @map("updated_at")
+
+  batches           BatchLot[]
+  transactions      InventoryTransaction[]
+  bomIngredients    BomIngredient[]
+  bomOutputs        BomVersion[] // finished product variants of this SKU
+  requisitionItems  RequisitionItem[]
+  poItems           PurchaseOrderItem[]
+  grnItems          GoodsReceiptItem[]
+  inspectionRecords InspectionRecord[]
+  suppliers         MaterialSupplier[]
+
+  @@map("materials")
+}
+
+model Warehouse {
+  id        String       @id @default(uuid())
+  name      String
+  code      String       @unique
+  address   String?
+  status    RecordStatus @default(ACTIVE)
+  createdAt DateTime     @default(now()) @map("created_at")
+
+  zones        Zone[]
+  bins         WarehouseBin[]
+  transactions InventoryTransaction[]
+
+  @@map("warehouses")
+}
+
+model Zone {
+  id          String       @id @default(uuid())
+  warehouseId String       @map("warehouse_id")
+  name        String
+  code        String
+  status      RecordStatus @default(ACTIVE)
+
+  warehouse Warehouse      @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+  bins      WarehouseBin[]
+
+  @@unique([warehouseId, code])
+  @@map("zones")
+}
+
+model WarehouseBin {
+  id          String       @id @default(uuid())
+  zoneId      String       @map("zone_id")
+  warehouseId String       @map("warehouse_id")
+  name        String
+  code        String
+  status      RecordStatus @default(ACTIVE)
+
+  zone         Zone                 @relation(fields: [zoneId], references: [id])
+  warehouse    Warehouse            @relation(fields: [warehouseId], references: [id])
+  transactions InventoryTransaction[]
+
+  @@unique([zoneId, code])
+  @@map("warehouse_bins")
+}
+
+model Supplier {
+  id            String       @id @default(uuid())
+  name          String
+  contactPerson String?      @map("contact_person")
+  email         String?
+  phone         String?
+  address       String?
+  taxId         String?      @map("tax_id")
+  status        RecordStatus @default(ACTIVE)
+  createdAt     DateTime     @default(now()) @map("created_at")
+  updatedAt     DateTime     @updatedAt @map("updated_at")
+
+  purchaseOrders PurchaseOrder[]
+  materials      MaterialSupplier[]
+
+  @@map("suppliers")
+}
+
+// Many-to-many: which suppliers can source a given material.
+model MaterialSupplier {
+  materialId String   @map("material_id")
+  supplierId String   @map("supplier_id")
+  material   Material @relation(fields: [materialId], references: [id], onDelete: Cascade)
+  supplier   Supplier @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+
+  @@id([materialId, supplierId])
+  @@map("material_suppliers")
+}
+
+// ---------------------------------------------------------------------------
+// 3. Inventory Ledger (event-sourced)
+// ---------------------------------------------------------------------------
+
+model BatchLot {
+  id               String      @id @default(uuid())
+  batchNumber      String      @map("batch_number")
+  materialId       String      @map("material_id")
+  manufacturingDate DateTime?  @map("manufacturing_date")
+  expiryDate       DateTime?   @map("expiry_date")
+  status           BatchStatus @default(ACTIVE)
+  notes            String?
+  createdAt        DateTime    @default(now()) @map("created_at")
+
+  material           Material                @relation(fields: [materialId], references: [id])
+  transactions       InventoryTransaction[]
+  productionOrders   ProductionOrder[]       @relation("finished_batch")
+  grnItems           GoodsReceiptItem[]
+  inspections        InspectionRecord[]
+
+  @@unique([materialId, batchNumber])
+  @@map("batch_lots")
+}
+
+// THE LEDGER — every stock movement is an immutable entry.
+// "Current stock" is the SUM of transactions per material/batch/bin. Never a mutable column.
+model InventoryTransaction {
+  id            String          @id @default(uuid())
+  eventType     LedgerEventType @map("event_type")
+  materialId    String          @map("material_id")
+  batchLotId    String?         @map("batch_lot_id")
+  warehouseId   String          @map("warehouse_id")
+  binId         String?         @map("bin_id")
+  quantity      Decimal         @db.Decimal(15, 4) // signed: + in, - out
+  unitOfMeasure String          @map("unit_of_measure")
+  referenceType String?         @map("reference_type") // PO, GRN, PROD_ORDER, ADJUSTMENT
+  referenceId   String?         @map("reference_id")
+  createdById   String          @map("created_by_id")
+  approvedById  String?         @map("approved_by_id") // for gated adjustments
+  notes         String?
+  createdAt     DateTime        @default(now()) @map("created_at")
+
+  material   Material      @relation(fields: [materialId], references: [id])
+  batchLot   BatchLot?     @relation(fields: [batchLotId], references: [id])
+  warehouse  Warehouse     @relation(fields: [warehouseId], references: [id])
+  bin        WarehouseBin? @relation(fields: [binId], references: [id])
+  createdBy  User          @relation("transaction_creator", fields: [createdById], references: [id])
+  approvedBy User?         @relation("adjustment_approver", fields: [approvedById], references: [id])
+
+  @@index([materialId, batchLotId, warehouseId])
+  @@index([createdAt])
+  @@map("inventory_transactions")
+}
+
+// ---------------------------------------------------------------------------
+// 4. Procurement (Requisition -> PO -> GRN)
+// ---------------------------------------------------------------------------
+
+model Requisition {
+  id            String            @id @default(uuid())
+  number        String            @unique
+  requestedById String            @map("requested_by_id")
+  status        RequisitionStatus @default(DRAFT)
+  notes         String?
+  createdAt     DateTime          @default(now()) @map("created_at")
+  updatedAt     DateTime          @updatedAt @map("updated_at")
+
+  requestedBy    User             @relation(fields: [requestedById], references: [id])
+  items          RequisitionItem[]
+  purchaseOrders PurchaseOrder[]
+
+  @@map("requisitions")
+}
+
+model RequisitionItem {
+  id            String  @id @default(uuid())
+  requisitionId String  @map("requisition_id")
+  materialId    String  @map("material_id")
+  quantity      Decimal @db.Decimal(15, 4)
+  unitOfMeasure String  @map("unit_of_measure")
+
+  requisition Requisition @relation(fields: [requisitionId], references: [id], onDelete: Cascade)
+  material    Material    @relation(fields: [materialId], references: [id])
+
+  @@map("requisition_items")
+}
+
+model PurchaseOrder {
+  id               String              @id @default(uuid())
+  number           String              @unique
+  supplierId       String              @map("supplier_id")
+  requisitionId    String?             @map("requisition_id")
+  createdById      String              @map("created_by_id")
+  status           PurchaseOrderStatus @default(DRAFT)
+  orderDate        DateTime?           @default(now()) @map("order_date")
+  expectedDelivery DateTime?           @map("expected_delivery")
+  notes            String?
+  createdAt        DateTime            @default(now()) @map("created_at")
+  updatedAt        DateTime            @updatedAt @map("updated_at")
+
+  supplier      Supplier        @relation(fields: [supplierId], references: [id])
+  requisition   Requisition?    @relation(fields: [requisitionId], references: [id])
+  createdBy     User            @relation(fields: [createdById], references: [id])
+  items         PurchaseOrderItem[]
+  goodsReceipts GoodsReceipt[]
+
+  @@map("purchase_orders")
+}
+
+model PurchaseOrderItem {
+  id            String  @id @default(uuid())
+  poId          String  @map("po_id")
+  materialId    String  @map("material_id")
+  quantity      Decimal @db.Decimal(15, 4)
+  unitCost      Decimal @db.Decimal(15, 4) @map("unit_cost")
+  receivedQty   Decimal @default(0) @db.Decimal(15, 4) @map("received_qty")
+  unitOfMeasure String  @map("unit_of_measure")
+
+  po       PurchaseOrder @relation(fields: [poId], references: [id], onDelete: Cascade)
+  material Material      @relation(fields: [materialId], references: [id])
+
+  @@map("purchase_order_items")
+}
+
+model GoodsReceipt {
+  id            String             @id @default(uuid())
+  number        String             @unique
+  poId          String             @map("po_id")
+  receivedById  String             @map("received_by_id")
+  status        GoodsReceiptStatus @default(PENDING_QA)
+  receivedAt    DateTime           @default(now()) @map("received_at")
+  notes         String?
+  createdAt     DateTime           @default(now()) @map("created_at")
+
+  po         PurchaseOrder       @relation(fields: [poId], references: [id])
+  receivedBy User                @relation(fields: [receivedById], references: [id])
+  items      GoodsReceiptItem[]
+
+  @@map("goods_receipts")
+}
+
+model GoodsReceiptItem {
+  id            String  @id @default(uuid())
+  grnId         String  @map("grn_id")
+  materialId    String  @map("material_id")
+  batchLotId    String  @map("batch_lot_id")
+  quantity      Decimal @db.Decimal(15, 4)
+  unitOfMeasure String  @map("unit_of_measure")
+
+  grn      GoodsReceipt @relation(fields: [grnId], references: [id], onDelete: Cascade)
+  material Material     @relation(fields: [materialId], references: [id])
+  batchLot BatchLot     @relation(fields: [batchLotId], references: [id])
+
+  @@map("goods_receipt_items")
+}
+
+// ---------------------------------------------------------------------------
+// 5. Production Engineering & Execution
+// ---------------------------------------------------------------------------
+
+model Bom {
+  id          String   @id @default(uuid())
+  productName String   @map("product_name")
+  description String?
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  versions BomVersion[]
+
+  @@map("boms")
+}
+
+model BomVersion {
+  id             String    @id @default(uuid())
+  bomId          String    @map("bom_id")
+  version        Int
+  description    String?
+  expectedYield  Decimal   @db.Decimal(15, 4) @map("expected_yield")
+  yieldUnit      String    @map("yield_unit")
+  finishedSkuId  String    @map("finished_sku_id") // the FINISHED material produced
+  status         BomStatus @default(DRAFT)
+  createdAt      DateTime  @default(now()) @map("created_at")
+
+  bom              Bom                @relation(fields: [bomId], references: [id], onDelete: Cascade)
+  finishedSku      Material           @relation(fields: [finishedSkuId], references: [id])
+  ingredients      BomIngredient[]
+  productionOrders ProductionOrder[]
+
+  @@unique([bomId, version])
+  @@map("bom_versions")
+}
+
+model BomIngredient {
+  id            String   @id @default(uuid())
+  bomVersionId  String   @map("bom_version_id")
+  materialId    String   @map("material_id")
+  quantity      Decimal  @db.Decimal(15, 4)
+  unitOfMeasure String   @map("unit_of_measure")
+  isPercentage  Boolean  @default(false) @map("is_percentage") // % vs absolute weight
+
+  bomVersion BomVersion @relation(fields: [bomVersionId], references: [id], onDelete: Cascade)
+  material   Material   @relation(fields: [materialId], references: [id])
+
+  @@map("bom_ingredients")
+}
+
+model Machine {
+  id     String       @id @default(uuid())
+  name   String
+  code   String       @unique
+  status RecordStatus @default(ACTIVE)
+
+  productionOrders ProductionOrder[]
+
+  @@map("machines")
+}
+
+model Shift {
+  id        String @id @default(uuid())
+  name      String
+  startTime String @map("start_time")
+  endTime   String @map("end_time")
+
+  productionOrders ProductionOrder[]
+
+  @@map("shifts")
+}
+
+model ProductionOrder {
+  id             String                @id @default(uuid())
+  orderNumber    String                @unique
+  bomVersionId   String                @map("bom_version_id")
+  targetQuantity Decimal               @db.Decimal(15, 4) @map("target_quantity")
+  actualYield    Decimal?              @db.Decimal(15, 4) @map("actual_yield")
+  status         ProductionOrderStatus @default(SCHEDULED)
+  scheduledStart DateTime?             @map("scheduled_start")
+  actualEnd      DateTime?             @map("actual_end")
+  machineId      String?               @map("machine_id")
+  shiftId        String?               @map("shift_id")
+  createdById    String                @map("created_by_id")
+  finishedBatchId String?              @map("finished_batch_id")
+  createdAt      DateTime              @default(now()) @map("created_at")
+  updatedAt      DateTime              @updatedAt @map("updated_at")
+
+  bomVersion    BomVersion @relation(fields: [bomVersionId], references: [id])
+  machine       Machine?   @relation(fields: [machineId], references: [id])
+  shift         Shift?     @relation(fields: [shiftId], references: [id])
+  createdBy     User       @relation(fields: [createdById], references: [id])
+  finishedBatch BatchLot?  @relation("finished_batch", fields: [finishedBatchId], references: [id])
+
+  @@map("production_orders")
+}
+
+// ---------------------------------------------------------------------------
+// 6. QA
+// ---------------------------------------------------------------------------
+
+model InspectionRecord {
+  id             String           @id @default(uuid())
+  inspectionType String           @map("inspection_type") // GRN | FINISHED_BATCH
+  materialId     String           @map("material_id")
+  batchLotId     String?          @map("batch_lot_id")
+  referenceId    String?          @map("reference_id") // GRN or Production Order
+  result         InspectionResult @default(PENDING)
+  notes          String?
+  inspectedById  String?          @map("inspected_by_id")
+  inspectedAt    DateTime?        @map("inspected_at")
+  createdAt      DateTime         @default(now()) @map("created_at")
+
+  material  Material @relation(fields: [materialId], references: [id])
+  batchLot  BatchLot? @relation(fields: [batchLotId], references: [id])
+  inspector User?    @relation(fields: [inspectedById], references: [id])
+
+  @@map("inspection_records")
+}
+
+// ---------------------------------------------------------------------------
+// 7. Notifications / Alerts
+// ---------------------------------------------------------------------------
+
+model Notification {
+  id        String   @id @default(uuid())
+  userId    String   @map("user_id")
+  title     String
+  body      String?
+  type      String // EXPIRY | LOW_STOCK | APPROVAL | SYSTEM
+  isRead    Boolean  @default(false) @map("is_read")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@map("notifications")
+}
