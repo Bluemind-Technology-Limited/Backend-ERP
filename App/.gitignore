@@ -4,3 +4,5 @@ dist
 *.log
 # Prisma generated client (regenerate with: pnpm db:generate)
 src/generated/
+api/index.js
+.vercel
