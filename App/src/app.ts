@@ -19,10 +19,13 @@ app.use(express.json());
 app.get("/health", async (_req: Request, res: Response) => {
   let dbStatus = "down";
   try {
-    await prisma.$queryRaw`SELECT 1`;
-    dbStatus = "up";
-  } catch {
+    if (prisma) {
+      await prisma.$queryRaw`SELECT 1`;
+      dbStatus = "up";
+    }
+  } catch (err) {
     dbStatus = "down";
+    console.error("Healthcheck DB connectivity error:", err);
   }
   res.json({ status: "ok", db: dbStatus, timestamp: new Date().toISOString() });
 });
