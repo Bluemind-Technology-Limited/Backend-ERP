@@ -15,6 +15,14 @@ export const app: Express = express();
 app.use(cors());
 app.use(express.json());
 
+// Basic root check
+app.get("/", (req: Request, res: Response) => {
+  res.json({
+    status: "ok",
+    message: "KIB Group Backend API Server is running!"
+  });
+});
+
 // Health check — includes DB connectivity probe
 app.get("/health", async (_req: Request, res: Response) => {
   let dbStatus = "down";
