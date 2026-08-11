@@ -224,11 +224,12 @@ router.post("/materials", requirePermission("master_data", "create"), async (req
 
 router.patch("/materials/:id", requirePermission("master_data", "update"), async (req: Request, res: Response) => {
   try {
-    const { name, category, unitOfMeasure, barcode, shelfLifeDays, requiresLot, attachments, status, supplierIds } = req.body;
+    const { name, type, category, unitOfMeasure, barcode, shelfLifeDays, requiresLot, attachments, status, supplierIds } = req.body;
     const material = await prisma.material.update({
       where: { id: req.params.id },
       data: {
         name,
+        type,
         category,
         unitOfMeasure,
         barcode,
