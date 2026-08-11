@@ -8,6 +8,7 @@ import productionRouter from "./production.js";
 import qaRouter from "./qa.js";
 import notificationsRouter from "./notifications.js";
 import reportsRouter from "./reports.js";
+import qstashRouter from "./qstash.js";
 
 const router: Router = Router();
 
@@ -20,5 +21,6 @@ router.use("/production", productionRouter);
 router.use("/qa", qaRouter);
 router.use("/notifications", notificationsRouter);
 router.use("/reports", reportsRouter);
+router.use("/qstash", qstashRouter);
 
 export default router;
