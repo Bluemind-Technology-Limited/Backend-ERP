@@ -3,7 +3,7 @@ import { requireAuth } from "../middleware/auth.js";
 import { requirePermission } from "../middleware/rbac.js";
 import { prisma } from "../lib/db.js";
 import { postLedgerEntry } from "../lib/ledger.js";
-import { LedgerEventType, ProductionOrderStatus } from "../generated/prisma/client.js";
+import { LedgerEventType, ProductionOrderStatus } from "@prisma/client";
 
 const router: Router = Router();
 router.use(requireAuth);

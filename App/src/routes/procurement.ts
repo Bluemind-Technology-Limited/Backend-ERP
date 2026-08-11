@@ -2,7 +2,7 @@ import { Router, type Request, type Response } from "express";
 import { requireAuth } from "../middleware/auth.js";
 import { requirePermission } from "../middleware/rbac.js";
 import { prisma } from "../lib/db.js";
-import { RequisitionStatus, PurchaseOrderStatus } from "../generated/prisma/client.js";
+import { RequisitionStatus, PurchaseOrderStatus } from "@prisma/client";
 
 const router: Router = Router();
 router.use(requireAuth);

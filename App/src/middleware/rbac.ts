@@ -1,5 +1,5 @@
 import type { NextFunction, Request, Response } from "express";
-import type { UserRole } from "../generated/prisma/client.js";
+import type { UserRole } from "@prisma/client";
 import { prisma } from "../lib/db.js";
 
 /**

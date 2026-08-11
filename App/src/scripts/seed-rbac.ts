@@ -6,7 +6,7 @@
  */
 import "dotenv/config";
 import { prisma } from "../lib/db.js";
-import type { UserRole } from "../generated/prisma/client.js";
+import type { UserRole } from "@prisma/client";
 
 type Matrix = Partial<Record<"create" | "read" | "update" | "delete" | "approve", boolean>>;
 
