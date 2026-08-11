@@ -1,8 +1,5 @@
 import "dotenv/config";
-import { app } from "./app";
+import { app } from "./app.js"; 
 
-const PORT = Number(process.env.PORT) || 3002;
-
-app.listen(PORT, () => {
-  console.log(`API server running on http://localhost:${PORT}`);
-});
+// Export the app so Vercel can handle the routing
+export default app;
