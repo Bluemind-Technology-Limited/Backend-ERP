@@ -1,8 +1,8 @@
 import { Router, type Request, type Response } from "express";
 import { createClient } from "@supabase/supabase-js";
-import { requireAuth } from "../middleware/auth";
-import { requirePermission } from "../middleware/rbac";
-import { prisma } from "../lib/db";
+import { requireAuth } from "../middleware/auth.js";
+import { requirePermission } from "../middleware/rbac.js";
+import { prisma } from "../lib/db.js";
 
 const router: Router = Router();
 

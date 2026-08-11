@@ -7,7 +7,7 @@
  */
 import "dotenv/config";
 import { createClient } from "@supabase/supabase-js";
-import { prisma } from "../lib/db";
+import { prisma } from "../lib/db.js";
 
 const DEMO_USERS = [
   { email: "admin@kib.group", password: "demopass123", fullName: "Alex Johnson", role: "SUPER_ADMIN" },

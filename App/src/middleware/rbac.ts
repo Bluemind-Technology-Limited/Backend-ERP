@@ -1,6 +1,6 @@
 import type { NextFunction, Request, Response } from "express";
-import type { UserRole } from "../generated/prisma/client";
-import { prisma } from "../lib/db";
+import type { UserRole } from "../generated/prisma/client.js";
+import { prisma } from "../lib/db.js";
 
 /**
  * Restricts a route to one of the given app roles.

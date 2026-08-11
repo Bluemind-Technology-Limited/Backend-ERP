@@ -1,13 +1,13 @@
 import { Router } from "express";
-import authRouter from "./auth";
-import masterDataRouter from "./master-data";
-import procurementRouter from "./procurement";
-import grnRouter from "./grn";
-import inventoryRouter from "./inventory";
-import productionRouter from "./production";
-import qaRouter from "./qa";
-import notificationsRouter from "./notifications";
-import reportsRouter from "./reports";
+import authRouter from "./auth.js";
+import masterDataRouter from "./master-data.js";
+import procurementRouter from "./procurement.js";
+import grnRouter from "./grn.js";
+import inventoryRouter from "./inventory.js";
+import productionRouter from "./production.js";
+import qaRouter from "./qa.js";
+import notificationsRouter from "./notifications.js";
+import reportsRouter from "./reports.js";
 
 const router: Router = Router();
 

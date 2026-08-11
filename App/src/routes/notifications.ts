@@ -1,7 +1,7 @@
 import { Router, type Request, type Response } from "express";
-import { requireAuth } from "../middleware/auth";
-import { prisma } from "../lib/db";
-import { getStock } from "../lib/ledger";
+import { requireAuth } from "../middleware/auth.js";
+import { prisma } from "../lib/db.js";
+import { getStock } from "../lib/ledger.js";
 
 const router: Router = Router();
 router.use(requireAuth);
