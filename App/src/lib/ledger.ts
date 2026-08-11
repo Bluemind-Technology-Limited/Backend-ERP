@@ -1,4 +1,4 @@
-import { PrismaClient, LedgerEventType } from "../generated/prisma/client";
+import { PrismaClient, LedgerEventType } from "../generated/prisma/client.js";
 
 /**
  * KIB ERP — Inventory Ledger Engine

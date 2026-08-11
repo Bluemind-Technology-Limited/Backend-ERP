@@ -1,6 +1,6 @@
 import type { NextFunction, Request, Response } from "express";
-import { prisma } from "../lib/db";
-import { verifySupabaseToken } from "../lib/verifyToken";
+import { prisma } from "../lib/db.js";
+import { verifySupabaseToken } from "../lib/verifyToken.js";
 
 /**
  * Verifies the Supabase-issued JWT offline (ES256 via JWKS, or HS256 via

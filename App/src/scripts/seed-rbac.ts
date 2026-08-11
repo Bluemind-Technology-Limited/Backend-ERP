@@ -5,8 +5,8 @@
  * Run with: pnpm tsx src/scripts/seed-rbac.ts
  */
 import "dotenv/config";
-import { prisma } from "../lib/db";
-import type { UserRole } from "../generated/prisma/client";
+import { prisma } from "../lib/db.js";
+import type { UserRole } from "../generated/prisma/client.js";
 
 type Matrix = Partial<Record<"create" | "read" | "update" | "delete" | "approve", boolean>>;
 

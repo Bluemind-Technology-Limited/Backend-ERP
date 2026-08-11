@@ -1,8 +1,8 @@
 import "dotenv/config";
 import express, { type Express, type Request, type Response } from "express";
 import cors from "cors";
-import { prisma } from "./lib/db";
-import apiRouter from "./routes";
+import { prisma } from "./lib/db.js";
+import apiRouter from "./routes/index.js";
 
 /**
  * Express app — created here (without app.listen) so the same instance can be

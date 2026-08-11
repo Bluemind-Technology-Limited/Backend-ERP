@@ -1,9 +1,9 @@
 import { Router, type Request, type Response } from "express";
-import { requireAuth } from "../middleware/auth";
-import { requirePermission } from "../middleware/rbac";
-import { prisma } from "../lib/db";
-import { postLedgerEntry } from "../lib/ledger";
-import { LedgerEventType } from "../generated/prisma/client";
+import { requireAuth } from "../middleware/auth.js";
+import { requirePermission } from "../middleware/rbac.js";
+import { prisma } from "../lib/db.js";
+import { postLedgerEntry } from "../lib/ledger.js";
+import { LedgerEventType } from "../generated/prisma/client.js";
 
 const router: Router = Router();
 router.use(requireAuth);
