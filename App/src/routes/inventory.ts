@@ -44,6 +44,35 @@ router.get("/stock/history", requirePermission("inventory", "read"), async (req:
 });
 
 /**
+ * POST /stock — Add a new product/good directly to the Inventory.
+ */
+router.post("/stock", requirePermission("inventory", "create"), async (req: Request, res: Response) => {
+  try {
+    const { name, minQuantity, unitOfMeasure } = req.body;
+    if (!name) {
+      return res.status(400).json({ error: "Product name is required" });
+    }
+
+    const sku = `SKU-${Date.now().toString().slice(-6)}`;
+    const material = await prisma.material.create({
+      data: {
+        name,
+        sku,
+        type: "RAW",
+        unitOfMeasure: unitOfMeasure || "units",
+        minQuantity: minQuantity !== undefined && minQuantity !== "" ? Number(minQuantity) : 0,
+        status: "ACTIVE",
+      },
+    });
+
+    res.status(201).json({ ok: true, material });
+  } catch (error) {
+    console.error("POST /stock error:", error);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+/**
  * POST /stock/transfer — internal transfer (issue from A, receive to B).
  * Writes two ledger entries in one atomic transaction.
  */

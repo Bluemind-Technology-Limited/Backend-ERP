@@ -21,7 +21,7 @@ router.get("/boms", requirePermission("production", "read"), async (_req: Reques
           include: {
             finishedSku: { select: { id: true, name: true, sku: true } },
             ingredients: {
-              include: { material: { select: { id: true, name: true, sku: true, unitOfMeasure: true } } },
+              include: { material: { select: { id: true, name: true, sku: true, type: true, unitOfMeasure: true } } },
             },
           },
         },
@@ -73,6 +73,22 @@ router.post("/boms", requirePermission("production", "create"), async (req: Requ
     res.status(201).json({ bom });
   } catch (error) {
     console.error("POST /production/boms error:", error);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+/**
+ * DELETE /boms/:id — delete a BOM and all its versions
+ */
+router.delete("/boms/:id", requirePermission("production", "delete"), async (req: Request, res: Response) => {
+  try {
+    await prisma.bom.delete({ where: { id: req.params.id } });
+    res.json({ ok: true });
+  } catch (error: any) {
+    if (error?.code === "P2025") {
+      return res.status(404).json({ error: "BOM not found" });
+    }
+    console.error("DELETE /production/boms/:id error:", error);
     res.status(500).json({ error: "Database error" });
   }
 });
@@ -145,6 +161,15 @@ router.get("/production-orders", requirePermission("production", "read"), async 
         shift: { select: { name: true } },
         createdBy: { select: { fullName: true } },
         finishedBatch: { select: { batchNumber: true, status: true } },
+        ingredientsReleasedBy: { select: { fullName: true } },
+        yieldLoggedBy: { select: { fullName: true } },
+        productionIngredients: {
+          include: {
+            material: { select: { id: true, name: true, sku: true, unitOfMeasure: true } },
+            batchLot: { select: { id: true, batchNumber: true, expiryDate: true } },
+            releasedBy: { select: { fullName: true } },
+          }
+        }
       },
       orderBy: { createdAt: "desc" },
     });
@@ -171,18 +196,39 @@ router.post("/production-orders", requirePermission("production", "create"), asy
     }
 
     const orderNumber = `PRD-${Date.now().toString().slice(-8)}`;
-    const productionOrder = await prisma.productionOrder.create({
-      data: {
-        orderNumber,
-        bomVersionId,
-        targetQuantity: Number(targetQuantity),
-        status: "SCHEDULED",
-        scheduledStart: scheduledStart ? new Date(scheduledStart) : null,
-        machineId: machineId ?? null,
-        shiftId: shiftId ?? null,
-        createdById: req.user!.id,
-      },
-      include: { bomVersion: true },
+    
+    const productionOrder = await prisma.$transaction(async (tx) => {
+      const order = await tx.productionOrder.create({
+        data: {
+          orderNumber,
+          bomVersionId,
+          targetQuantity: Number(targetQuantity),
+          status: "SCHEDULED",
+          scheduledStart: scheduledStart ? new Date(scheduledStart) : null,
+          machineId: machineId ?? null,
+          shiftId: shiftId ?? null,
+          createdById: req.user!.id,
+        },
+        include: { bomVersion: true },
+      });
+
+      // Pre-populate ingredients list
+      for (const ing of bomVersion.ingredients) {
+        const scale = Number(targetQuantity) / Number(bomVersion.expectedYield);
+        const projectedQty = ing.isPercentage
+          ? (Number(ing.quantity) / 100) * scale * Number(bomVersion.expectedYield)
+          : Number(ing.quantity) * scale;
+
+        await tx.productionIngredient.create({
+          data: {
+            productionOrderId: order.id,
+            materialId: ing.materialId,
+            projectedQuantity: projectedQty,
+          },
+        });
+      }
+
+      return order;
     });
 
     res.status(201).json({ productionOrder });
@@ -193,65 +239,200 @@ router.post("/production-orders", requirePermission("production", "create"), asy
 });
 
 // ---------------------------------------------------------------------------
-// Execution (Phase 4): Start / Complete -> auto-consumption via the ledger
+// Execution (Phase 4): Release / Mix / Returns / Complete -> auto-consumption via the ledger
 // ---------------------------------------------------------------------------
 
-/**
- * POST /production-orders/:id/start
- * Writes negative PROD_CONSUMPTION ledger entries for every BOM ingredient.
- */
 router.post("/production-orders/:id/start", requirePermission("production", "update"), async (req: Request, res: Response) => {
+  res.redirect(307, `/production/production-orders/${req.params.id}/release`);
+});
+
+/**
+ * POST /production-orders/:id/release
+ * Releases ingredients, updates releasedQuantity/batchLotId, and logs negative PROD_CONSUMPTION entries.
+ */
+router.post("/production-orders/:id/release", requirePermission("production", "update"), async (req: Request, res: Response) => {
   try {
+    const { warehouseId, ingredients } = req.body;
+    if (!warehouseId) {
+      return res.status(400).json({ error: "warehouseId is required" });
+    }
+    if (!ingredients || !Array.isArray(ingredients)) {
+      return res.status(400).json({ error: "ingredients list is required" });
+    }
+
     const order = await prisma.productionOrder.findUnique({
       where: { id: req.params.id },
-      include: { bomVersion: { include: { ingredients: true } } },
+      include: { productionIngredients: true },
     });
     if (!order) return res.status(404).json({ error: "Production order not found" });
-    if (order.status !== "SCHEDULED") return res.status(400).json({ error: "Order must be SCHEDULED to start" });
-
-    const { warehouseId } = req.body;
-    if (!warehouseId) return res.status(400).json({ error: "warehouseId is required (issue raw materials from this warehouse)" });
 
     await prisma.$transaction(async (tx) => {
-      for (const ing of order.bomVersion.ingredients) {
-        const scale = Number(order.targetQuantity) / Number(order.bomVersion.expectedYield);
-        const qty = ing.isPercentage
-          ? (Number(ing.quantity) / 100) * scale * Number(order.bomVersion.expectedYield)
-          : Number(ing.quantity) * scale;
+      for (const ingReq of ingredients) {
+        const matchingIng = order.productionIngredients.find(i => i.id === ingReq.id);
+        if (!matchingIng) throw new Error(`Ingredient requirement ${ingReq.id} not found in this order`);
+
+        const releasedQty = Number(ingReq.releasedQuantity);
+        if (releasedQty <= 0) continue;
+
+        await tx.productionIngredient.update({
+          where: { id: matchingIng.id },
+          data: {
+            releasedQuantity: releasedQty,
+            batchLotId: ingReq.batchLotId || null,
+            releasedAt: new Date(),
+            releasedById: req.user!.id,
+          },
+        });
+
+        const material = await tx.material.findUnique({
+          where: { id: matchingIng.materialId },
+          select: { unitOfMeasure: true }
+        });
+
         await postLedgerEntry(tx, {
           eventType: LedgerEventType.PROD_CONSUMPTION,
-          materialId: ing.materialId,
+          materialId: matchingIng.materialId,
+          batchLotId: ingReq.batchLotId || null,
           warehouseId,
-          quantity: -qty,
-          unitOfMeasure: ing.unitOfMeasure,
+          quantity: -releasedQty,
+          unitOfMeasure: material?.unitOfMeasure || "kg",
           referenceType: "PROD_ORDER",
           referenceId: order.id,
           createdById: req.user!.id,
-          notes: `Auto-consumption for ${order.orderNumber}`,
+          notes: `Released ingredients for order ${order.orderNumber}`,
         });
       }
+
       await tx.productionOrder.update({
         where: { id: order.id },
-        data: { status: "PROCESSING" },
+        data: {
+          status: "RELEASED",
+          ingredientsReleasedAt: new Date(),
+          ingredientsReleasedById: req.user!.id,
+        },
       });
     });
 
-    res.json({ ok: true, message: `Consumed raw materials for ${order.orderNumber}` });
+    res.json({ ok: true, message: `Ingredients released for ${order.orderNumber}` });
   } catch (error: any) {
-    console.error("POST /production-orders/:id/start error:", error);
+    console.error("POST /production-orders/:id/release error:", error);
+    res.status(500).json({ error: error?.message || "Database error" });
+  }
+});
+
+/**
+ * POST /production-orders/:id/mix
+ * Records the unit mix generated, generates a mixCode, and transitions status to PROCESSING.
+ */
+router.post("/production-orders/:id/mix", requirePermission("production", "update"), async (req: Request, res: Response) => {
+  try {
+    const { mixUnits } = req.body;
+    if (!mixUnits || Number(mixUnits) <= 0) {
+      return res.status(400).json({ error: "mixUnits is required and must be greater than 0" });
+    }
+
+    const order = await prisma.productionOrder.findUnique({ where: { id: req.params.id } });
+    if (!order) return res.status(404).json({ error: "Production order not found" });
+
+    const today = new Date();
+    const dateStr = today.toISOString().split("T")[0].replace(/-/g, "");
+    const todayStart = new Date(today.setHours(0,0,0,0));
+    const count = await prisma.productionOrder.count({
+      where: {
+        mixLogDate: { gte: todayStart }
+      }
+    });
+    const seqStr = String(count + 1).padStart(3, "0");
+    const mixCode = `MIX-${dateStr}-${seqStr}`;
+
+    await prisma.productionOrder.update({
+      where: { id: order.id },
+      data: {
+        mixCode,
+        mixUnits: Number(mixUnits),
+        mixLogDate: new Date(),
+        status: "PROCESSING"
+      }
+    });
+
+    res.json({ ok: true, mixCode, message: `Batch mix recorded: ${mixCode}` });
+  } catch (error: any) {
+    console.error("POST /production-orders/:id/mix error:", error);
+    res.status(500).json({ error: error?.message || "Database error" });
+  }
+});
+
+/**
+ * POST /production-orders/:id/returns
+ * Logs returned/deficit ingredients, writing positive ledger entries to restore stock.
+ */
+router.post("/production-orders/:id/returns", requirePermission("production", "update"), async (req: Request, res: Response) => {
+  try {
+    const { warehouseId, returns } = req.body;
+    if (!warehouseId) {
+      return res.status(400).json({ error: "warehouseId is required" });
+    }
+    if (!returns || !Array.isArray(returns)) {
+      return res.status(400).json({ error: "returns list is required" });
+    }
+
+    const order = await prisma.productionOrder.findUnique({
+      where: { id: req.params.id },
+      include: { productionIngredients: true },
+    });
+    if (!order) return res.status(404).json({ error: "Production order not found" });
+
+    await prisma.$transaction(async (tx) => {
+      for (const ret of returns) {
+        const matchingIng = order.productionIngredients.find(i => i.id === ret.id);
+        if (!matchingIng) throw new Error(`Ingredient ${ret.id} not found in this order`);
+
+        const returnedQty = Number(ret.returnedQuantity);
+        if (returnedQty <= 0) continue;
+
+        await tx.productionIngredient.update({
+          where: { id: matchingIng.id },
+          data: {
+            returnedQuantity: returnedQty,
+          },
+        });
+
+        const material = await tx.material.findUnique({
+          where: { id: matchingIng.materialId },
+          select: { unitOfMeasure: true }
+        });
+
+        await postLedgerEntry(tx, {
+          eventType: LedgerEventType.ADJUSTMENT,
+          materialId: matchingIng.materialId,
+          batchLotId: matchingIng.batchLotId || null,
+          warehouseId,
+          quantity: returnedQty,
+          unitOfMeasure: material?.unitOfMeasure || "kg",
+          referenceType: "PROD_ORDER",
+          referenceId: order.id,
+          createdById: req.user!.id,
+          notes: `Deficit return from order ${order.orderNumber}`,
+        });
+      }
+    });
+
+    res.json({ ok: true, message: "Deficit/returns recorded successfully" });
+  } catch (error: any) {
+    console.error("POST /production-orders/:id/returns error:", error);
     res.status(500).json({ error: error?.message || "Database error" });
   }
 });
 
 /**
  * POST /production-orders/:id/complete
- * Writes positive PROD_OUTPUT ledger entry for the finished SKU (creates batch lot).
+ * Logs actual yield, creates finished batch lot (expiry 2 years out), and completes the order.
  */
 router.post("/production-orders/:id/complete", requirePermission("production", "update"), async (req: Request, res: Response) => {
   try {
     const { batchNumber, warehouseId, actualYield } = req.body;
-    if (!batchNumber || !warehouseId) {
-      return res.status(400).json({ error: "batchNumber and warehouseId are required" });
+    if (!batchNumber || !warehouseId || actualYield === undefined) {
+      return res.status(400).json({ error: "batchNumber, warehouseId, and actualYield are required" });
     }
 
     const order = await prisma.productionOrder.findUnique({
@@ -262,25 +443,31 @@ router.post("/production-orders/:id/complete", requirePermission("production", "
     if (order.status !== "PROCESSING") return res.status(400).json({ error: "Order must be PROCESSING to complete" });
 
     const finishedSkuId = order.bomVersion.finishedSkuId;
-    const yieldQty = actualYield ?? order.targetQuantity;
+    const yieldQty = Number(actualYield);
+
+    const targetQty = Number(order.targetQuantity);
+    const errorPercentage = targetQty > 0 ? (Math.abs(yieldQty - targetQty) / targetQty) * 100 : 0;
+
+    const expiryDate = new Date();
+    expiryDate.setFullYear(expiryDate.getFullYear() + 2);
 
     const result = await prisma.$transaction(async (tx) => {
-      // 1. Finished goods batch lot
       const batchLot = await tx.batchLot.create({
         data: {
           materialId: finishedSkuId,
           batchNumber,
-          status: "QUARANTINE", // QA must release before it's usable
+          manufacturingDate: new Date(),
+          expiryDate: expiryDate,
+          status: "QUARANTINE",
         },
       });
 
-      // 2. PROD_OUTPUT ledger entry
       await postLedgerEntry(tx, {
         eventType: LedgerEventType.PROD_OUTPUT,
         materialId: finishedSkuId,
         batchLotId: batchLot.id,
         warehouseId,
-        quantity: Number(yieldQty),
+        quantity: yieldQty,
         unitOfMeasure: order.bomVersion.yieldUnit,
         referenceType: "PROD_ORDER",
         referenceId: order.id,
@@ -288,7 +475,6 @@ router.post("/production-orders/:id/complete", requirePermission("production", "
         notes: `Output for ${order.orderNumber} (batch ${batchNumber})`,
       });
 
-      // 3. QA inspection record
       await tx.inspectionRecord.create({
         data: {
           inspectionType: "FINISHED_BATCH",
@@ -299,16 +485,23 @@ router.post("/production-orders/:id/complete", requirePermission("production", "
         },
       });
 
-      // 4. Update order
       await tx.productionOrder.update({
         where: { id: order.id },
-        data: { status: "COMPLETED", actualEnd: new Date(), actualYield: Number(yieldQty), finishedBatchId: batchLot.id },
+        data: {
+          status: "COMPLETED",
+          actualEnd: new Date(),
+          actualYield: yieldQty,
+          errorPercentage: errorPercentage,
+          finishedBatchId: batchLot.id,
+          yieldLoggedAt: new Date(),
+          yieldLoggedById: req.user!.id,
+        },
       });
 
       return batchLot;
     });
 
-    res.json({ ok: true, batchLot: result, message: `Batch ${batchNumber} produced and sent to QA (QUARANTINE)` });
+    res.json({ ok: true, batchLot: result, message: `Batch ${batchNumber} completed with ${errorPercentage.toFixed(2)}% error` });
   } catch (error: any) {
     console.error("POST /production-orders/:id/complete error:", error);
     res.status(500).json({ error: error?.message || "Database error" });
@@ -497,6 +690,28 @@ router.post("/waste", requirePermission("production", "update"), async (req: Req
   } catch (error: any) {
     console.error("POST /production/waste error:", error);
     res.status(500).json({ error: error?.message || "Database error" });
+  }
+});
+
+/**
+ * DELETE /production-orders/:id — delete a production order (only SCHEDULED status)
+ */
+router.delete("/production-orders/:id", requirePermission("production", "delete"), async (req: Request, res: Response) => {
+  try {
+    const order = await prisma.productionOrder.findUnique({
+      where: { id: req.params.id },
+    });
+    if (!order) {
+      return res.status(404).json({ error: "Production order not found" });
+    }
+    if (order.status !== "SCHEDULED") {
+      return res.status(409).json({ error: "Can only delete SCHEDULED production orders" });
+    }
+    await prisma.productionOrder.delete({ where: { id: req.params.id } });
+    res.json({ ok: true });
+  } catch (error: any) {
+    console.error("DELETE /production/production-orders/:id error:", error);
+    res.status(500).json({ error: "Database error" });
   }
 });
 

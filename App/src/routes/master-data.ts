@@ -2,6 +2,7 @@ import { Router, type Request, type Response } from "express";
 import { requireAuth } from "../middleware/auth.js";
 import { requirePermission } from "../middleware/rbac.js";
 import { prisma } from "../lib/db.js";
+import { handleApiError, validateRequired } from "../lib/errorHandler.js";
 import { MaterialType, RecordStatus } from "@prisma/client";
 
 const router: Router = Router();
@@ -21,8 +22,7 @@ router.get("/warehouses", requirePermission("master_data", "read"), async (_req:
     });
     res.json({ warehouses });
   } catch (error) {
-    console.error("GET /master-data/warehouses error:", error);
-    res.status(500).json({ error: "Database error" });
+    return handleApiError(error, res, "GET /master-data/warehouses");
   }
 });
 
@@ -187,26 +187,26 @@ router.get("/materials", requirePermission("master_data", "read"), async (req: R
     });
     res.json({ materials });
   } catch (error) {
-    console.error("GET /master-data/materials error:", error);
-    res.status(500).json({ error: "Database error" });
+    return handleApiError(error, res, "GET /master-data/materials");
   }
 });
 
 router.post("/materials", requirePermission("master_data", "create"), async (req: Request, res: Response) => {
   try {
-    const { name, sku, type, category, unitOfMeasure, barcode, shelfLifeDays, requiresLot, attachments, supplierIds } = req.body;
-    if (!name || !sku || !type || !unitOfMeasure) {
-      return res.status(400).json({ error: "name, sku, type and unitOfMeasure are required" });
+    const { name, sku, type, category, unitOfMeasure, barcode, defaultExpiryDate, requiresLot, attachments, supplierIds } = req.body;
+    if (!name || !type || !unitOfMeasure) {
+      return res.status(400).json({ error: "name, type and unitOfMeasure are required" });
     }
+    const finalSku = sku && sku.trim() !== "" ? sku : `SKU-${Date.now().toString().slice(-6)}${Math.floor(Math.random() * 1000).toString().padStart(3, '0')}`;
     const material = await prisma.material.create({
       data: {
         name,
-        sku,
+        sku: finalSku,
         type,
         category: category ?? null,
         unitOfMeasure,
         barcode: barcode ?? null,
-        shelfLifeDays: shelfLifeDays ? Number(shelfLifeDays) : null,
+        defaultExpiryDate: defaultExpiryDate ? new Date(defaultExpiryDate) : null,
         requiresLot: requiresLot ?? true,
         attachments: attachments ?? [],
         suppliers: Array.isArray(supplierIds) && supplierIds.length
@@ -224,7 +224,7 @@ router.post("/materials", requirePermission("master_data", "create"), async (req
 
 router.patch("/materials/:id", requirePermission("master_data", "update"), async (req: Request, res: Response) => {
   try {
-    const { name, type, category, unitOfMeasure, barcode, shelfLifeDays, requiresLot, attachments, status, supplierIds } = req.body;
+    const { name, type, category, unitOfMeasure, barcode, defaultExpiryDate, requiresLot, attachments, status, supplierIds } = req.body;
     const material = await prisma.material.update({
       where: { id: req.params.id },
       data: {
@@ -233,7 +233,7 @@ router.patch("/materials/:id", requirePermission("master_data", "update"), async
         category,
         unitOfMeasure,
         barcode,
-        shelfLifeDays: shelfLifeDays !== undefined ? Number(shelfLifeDays) : undefined,
+        defaultExpiryDate: defaultExpiryDate !== undefined ? (defaultExpiryDate ? new Date(defaultExpiryDate) : null) : undefined,
         requiresLot,
         attachments,
         status,
@@ -250,6 +250,68 @@ router.patch("/materials/:id", requirePermission("master_data", "update"), async
     res.json({ material });
   } catch (error) {
     console.error("PATCH /master-data/materials/:id error:", error);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+router.delete("/materials/:id", requirePermission("master_data", "delete"), async (req: Request, res: Response) => {
+  try {
+    const id = req.params.id;
+    await prisma.$transaction(async (tx) => {
+      // 1. Get all batches for this material to handle relations
+      const batches = await tx.batchLot.findMany({ where: { materialId: id }, select: { id: true } });
+      const batchIds = batches.map(b => b.id);
+
+      // 2. Get all BOM Versions where this is the finished SKU
+      const bomVersions = await tx.bomVersion.findMany({ where: { finishedSkuId: id }, select: { id: true } });
+      const bomVersionIds = bomVersions.map(bv => bv.id);
+
+      // 3. Cleanup Production Orders linked to these BOM Versions
+      // (ProductionIngredient will be cleaned up in step 4 anyway)
+      await tx.productionOrder.deleteMany({ where: { bomVersionId: { in: bomVersionIds } } });
+
+      // 4. Cleanup references in other Production Orders (where this material was a finished batch)
+      await tx.productionOrder.updateMany({ 
+        where: { finishedBatchId: { in: batchIds } }, 
+        data: { finishedBatchId: null } 
+      });
+
+      // 5. Cleanup Production Ingredients
+      await (tx as any).productionIngredient.deleteMany({ where: { materialId: id } });
+
+      // 6. Cleanup Inventory Transactions
+      await tx.inventoryTransaction.deleteMany({ where: { materialId: id } });
+
+      // 7. Cleanup Inspection Records
+      await tx.inspectionRecord.deleteMany({ where: { materialId: id } });
+
+      // 8. Cleanup GRN items
+      await tx.goodsReceiptItem.deleteMany({ where: { materialId: id } });
+
+      // 9. Cleanup PO items
+      await tx.purchaseOrderItem.deleteMany({ where: { materialId: id } });
+
+      // 10. Cleanup Requisition items
+      await tx.requisitionItem.deleteMany({ where: { materialId: id } });
+
+      // 11. Cleanup BOM ingredients
+      await tx.bomIngredient.deleteMany({ where: { materialId: id } });
+
+      // 12. Cleanup BOM versions (where this is the output SKU)
+      await tx.bomVersion.deleteMany({ where: { finishedSkuId: id } });
+
+      // 13. Cleanup Material Supplier links
+      await tx.materialSupplier.deleteMany({ where: { materialId: id } });
+
+      // 14. Cleanup Batches
+      await tx.batchLot.deleteMany({ where: { materialId: id } });
+
+      // 15. Finally delete material
+      await tx.material.delete({ where: { id } });
+    });
+    res.json({ ok: true });
+  } catch (error: any) {
+    console.error("DELETE /master-data/materials/:id error:", error);
     res.status(500).json({ error: "Database error" });
   }
 });
@@ -307,6 +369,35 @@ router.patch("/suppliers/:id", requirePermission("master_data", "update"), async
     res.json({ supplier });
   } catch (error) {
     console.error("PATCH /master-data/suppliers/:id error:", error);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+router.delete("/suppliers/:id", requirePermission("master_data", "delete"), async (req: Request, res: Response) => {
+  try {
+    const id = req.params.id;
+    await prisma.$transaction(async (tx) => {
+      // 1. Get all POs for this supplier
+      const pos = await tx.purchaseOrder.findMany({ where: { supplierId: id }, select: { id: true } });
+      const poIds = pos.map(p => p.id);
+
+      // 2. Cleanup Goods Receipts linked to these POs
+      // (GoodsReceiptItem will cascade delete)
+      await tx.goodsReceipt.deleteMany({ where: { poId: { in: poIds } } });
+
+      // 3. Cleanup Purchase Orders
+      // (PurchaseOrderItem will cascade delete)
+      await tx.purchaseOrder.deleteMany({ where: { supplierId: id } });
+
+      // 4. Cleanup Material links
+      await tx.materialSupplier.deleteMany({ where: { supplierId: id } });
+
+      // 5. Finally delete supplier
+      await tx.supplier.delete({ where: { id } });
+    });
+    res.json({ ok: true });
+  } catch (error: any) {
+    console.error("DELETE /master-data/suppliers/:id error:", error);
     res.status(500).json({ error: "Database error" });
   }
 });

@@ -69,6 +69,7 @@ enum GoodsReceiptStatus {
 
 enum ProductionOrderStatus {
   SCHEDULED
+  RELEASED
   PROCESSING
   COMPLETED
   WASTED
@@ -108,17 +109,21 @@ model User {
   role         UserRole
   phoneNumber  String?  @map("phone_number")
   isActive     Boolean  @default(true) @map("is_active")
+  hasSeenTour  Boolean  @default(false) @map("has_seen_tour")
   createdAt    DateTime @default(now()) @map("created_at")
   updatedAt    DateTime @updatedAt @map("updated_at")
 
-  requisitions        Requisition[]
-  purchaseOrders      PurchaseOrder[]
-  goodsReceipts       GoodsReceipt[]
-  productionOrders    ProductionOrder[]
-  inspections         InspectionRecord[]
-  createdTransactions InventoryTransaction[] @relation("transaction_creator")
-  approvedAdjustments InventoryTransaction[] @relation("adjustment_approver")
-  notifications       Notification[]
+  requisitions              Requisition[]
+  purchaseOrders            PurchaseOrder[]
+  goodsReceipts             GoodsReceipt[]
+  productionOrders          ProductionOrder[]      @relation("order_creator")
+  releasedIngredientsOrders ProductionOrder[]      @relation("order_ingredients_releaser")
+  yieldLoggedOrders         ProductionOrder[]      @relation("yield_logger")
+  releasedIngredients       ProductionIngredient[] @relation("ingredient_releaser")
+  inspections               InspectionRecord[]
+  createdTransactions       InventoryTransaction[] @relation("transaction_creator")
+  approvedAdjustments       InventoryTransaction[] @relation("adjustment_approver")
+  notifications             Notification[]
 
   @@map("users")
 }
@@ -143,29 +148,31 @@ model RolePermission {
 // ---------------------------------------------------------------------------
 
 model Material {
-  id            String       @id @default(uuid())
-  name          String
-  sku           String       @unique
-  type          MaterialType
-  category      String?
-  unitOfMeasure String       @map("unit_of_measure") // kg, liters, units
-  barcode       String?
-  shelfLifeDays Int?         @map("shelf_life_days") // expiry parameters
-  requiresLot   Boolean      @default(true) @map("requires_lot")
-  attachments   Json? // [{name, url, kind: NAFDAC|MSDS|COA}]
-  status        RecordStatus @default(ACTIVE)
-  createdAt     DateTime     @default(now()) @map("created_at")
-  updatedAt     DateTime     @updatedAt @map("updated_at")
+  id                String       @id @default(uuid())
+  name              String
+  sku               String       @unique
+  type              MaterialType
+  category          String?
+  unitOfMeasure     String       @map("unit_of_measure") // kg, liters, units
+  barcode           String?
+  defaultExpiryDate DateTime?    @map("default_expiry_date") // Default expiry (e.g., 2 years out)
+  requiresLot       Boolean      @default(true) @map("requires_lot")
+  minQuantity       Decimal?     @default(0) @map("min_quantity") @db.Decimal(15, 4)
+  attachments       Json? // [{name, url, kind: NAFDAC|MSDS|COA}]
+  status            RecordStatus @default(ACTIVE)
+  createdAt         DateTime     @default(now()) @map("created_at")
+  updatedAt         DateTime     @updatedAt @map("updated_at")
 
-  batches           BatchLot[]
-  transactions      InventoryTransaction[]
-  bomIngredients    BomIngredient[]
-  bomOutputs        BomVersion[] // finished product variants of this SKU
-  requisitionItems  RequisitionItem[]
-  poItems           PurchaseOrderItem[]
-  grnItems          GoodsReceiptItem[]
-  inspectionRecords InspectionRecord[]
-  suppliers         MaterialSupplier[]
+  batches               BatchLot[]
+  transactions          InventoryTransaction[]
+  bomIngredients        BomIngredient[]
+  bomOutputs            BomVersion[] // finished product variants of this SKU
+  requisitionItems      RequisitionItem[]
+  poItems               PurchaseOrderItem[]
+  grnItems              GoodsReceiptItem[]
+  inspectionRecords     InspectionRecord[]
+  suppliers             MaterialSupplier[]
+  productionIngredients ProductionIngredient[]
 
   @@map("materials")
 }
@@ -207,8 +214,8 @@ model WarehouseBin {
   code        String
   status      RecordStatus @default(ACTIVE)
 
-  zone         Zone                 @relation(fields: [zoneId], references: [id])
-  warehouse    Warehouse            @relation(fields: [warehouseId], references: [id])
+  zone         Zone                   @relation(fields: [zoneId], references: [id])
+  warehouse    Warehouse              @relation(fields: [warehouseId], references: [id])
   transactions InventoryTransaction[]
 
   @@unique([zoneId, code])
@@ -249,20 +256,21 @@ model MaterialSupplier {
 // ---------------------------------------------------------------------------
 
 model BatchLot {
-  id               String      @id @default(uuid())
-  batchNumber      String      @map("batch_number")
-  materialId       String      @map("material_id")
-  manufacturingDate DateTime?  @map("manufacturing_date")
-  expiryDate       DateTime?   @map("expiry_date")
-  status           BatchStatus @default(ACTIVE)
-  notes            String?
-  createdAt        DateTime    @default(now()) @map("created_at")
+  id                String      @id @default(uuid())
+  batchNumber       String      @map("batch_number")
+  materialId        String      @map("material_id")
+  manufacturingDate DateTime?   @map("manufacturing_date")
+  expiryDate        DateTime?   @map("expiry_date")
+  status            BatchStatus @default(ACTIVE)
+  notes             String?
+  createdAt         DateTime    @default(now()) @map("created_at")
 
-  material           Material                @relation(fields: [materialId], references: [id])
-  transactions       InventoryTransaction[]
-  productionOrders   ProductionOrder[]       @relation("finished_batch")
-  grnItems           GoodsReceiptItem[]
-  inspections        InspectionRecord[]
+  material              Material               @relation(fields: [materialId], references: [id])
+  transactions          InventoryTransaction[]
+  productionOrders      ProductionOrder[]      @relation("finished_batch")
+  grnItems              GoodsReceiptItem[]
+  inspections           InspectionRecord[]
+  productionIngredients ProductionIngredient[]
 
   @@unique([materialId, batchNumber])
   @@map("batch_lots")
@@ -311,7 +319,7 @@ model Requisition {
   createdAt     DateTime          @default(now()) @map("created_at")
   updatedAt     DateTime          @updatedAt @map("updated_at")
 
-  requestedBy    User             @relation(fields: [requestedById], references: [id])
+  requestedBy    User              @relation(fields: [requestedById], references: [id])
   items          RequisitionItem[]
   purchaseOrders PurchaseOrder[]
 
@@ -344,9 +352,9 @@ model PurchaseOrder {
   createdAt        DateTime            @default(now()) @map("created_at")
   updatedAt        DateTime            @updatedAt @map("updated_at")
 
-  supplier      Supplier        @relation(fields: [supplierId], references: [id])
-  requisition   Requisition?    @relation(fields: [requisitionId], references: [id])
-  createdBy     User            @relation(fields: [createdById], references: [id])
+  supplier      Supplier            @relation(fields: [supplierId], references: [id])
+  requisition   Requisition?        @relation(fields: [requisitionId], references: [id])
+  createdBy     User                @relation(fields: [createdById], references: [id])
   items         PurchaseOrderItem[]
   goodsReceipts GoodsReceipt[]
 
@@ -358,8 +366,8 @@ model PurchaseOrderItem {
   poId          String  @map("po_id")
   materialId    String  @map("material_id")
   quantity      Decimal @db.Decimal(15, 4)
-  unitCost      Decimal @db.Decimal(15, 4) @map("unit_cost")
-  receivedQty   Decimal @default(0) @db.Decimal(15, 4) @map("received_qty")
+  unitCost      Decimal @map("unit_cost") @db.Decimal(15, 4)
+  receivedQty   Decimal @default(0) @map("received_qty") @db.Decimal(15, 4)
   unitOfMeasure String  @map("unit_of_measure")
 
   po       PurchaseOrder @relation(fields: [poId], references: [id], onDelete: Cascade)
@@ -369,17 +377,17 @@ model PurchaseOrderItem {
 }
 
 model GoodsReceipt {
-  id            String             @id @default(uuid())
-  number        String             @unique
-  poId          String             @map("po_id")
-  receivedById  String             @map("received_by_id")
-  status        GoodsReceiptStatus @default(PENDING_QA)
-  receivedAt    DateTime           @default(now()) @map("received_at")
-  notes         String?
-  createdAt     DateTime           @default(now()) @map("created_at")
+  id           String             @id @default(uuid())
+  number       String             @unique
+  poId         String             @map("po_id")
+  receivedById String             @map("received_by_id")
+  status       GoodsReceiptStatus @default(PENDING_QA)
+  receivedAt   DateTime           @default(now()) @map("received_at")
+  notes        String?
+  createdAt    DateTime           @default(now()) @map("created_at")
 
-  po         PurchaseOrder       @relation(fields: [poId], references: [id])
-  receivedBy User                @relation(fields: [receivedById], references: [id])
+  po         PurchaseOrder      @relation(fields: [poId], references: [id])
+  receivedBy User               @relation(fields: [receivedById], references: [id])
   items      GoodsReceiptItem[]
 
   @@map("goods_receipts")
@@ -417,18 +425,18 @@ model Bom {
 }
 
 model BomVersion {
-  id             String    @id @default(uuid())
-  bomId          String    @map("bom_id")
-  version        Int
-  description    String?
-  expectedYield  Decimal   @db.Decimal(15, 4) @map("expected_yield")
-  yieldUnit      String    @map("yield_unit")
-  finishedSkuId  String    @map("finished_sku_id") // the FINISHED material produced
-  status         BomStatus @default(DRAFT)
-  createdAt      DateTime  @default(now()) @map("created_at")
+  id            String    @id @default(uuid())
+  bomId         String    @map("bom_id")
+  version       Int
+  description   String?
+  expectedYield Decimal   @map("expected_yield") @db.Decimal(15, 4)
+  yieldUnit     String    @map("yield_unit")
+  finishedSkuId String    @map("finished_sku_id") // the FINISHED material produced
+  status        BomStatus @default(DRAFT)
+  createdAt     DateTime  @default(now()) @map("created_at")
 
-  bom              Bom                @relation(fields: [bomId], references: [id], onDelete: Cascade)
-  finishedSku      Material           @relation(fields: [finishedSkuId], references: [id])
+  bom              Bom               @relation(fields: [bomId], references: [id], onDelete: Cascade)
+  finishedSku      Material          @relation(fields: [finishedSkuId], references: [id])
   ingredients      BomIngredient[]
   productionOrders ProductionOrder[]
 
@@ -437,12 +445,12 @@ model BomVersion {
 }
 
 model BomIngredient {
-  id            String   @id @default(uuid())
-  bomVersionId  String   @map("bom_version_id")
-  materialId    String   @map("material_id")
-  quantity      Decimal  @db.Decimal(15, 4)
-  unitOfMeasure String   @map("unit_of_measure")
-  isPercentage  Boolean  @default(false) @map("is_percentage") // % vs absolute weight
+  id            String  @id @default(uuid())
+  bomVersionId  String  @map("bom_version_id")
+  materialId    String  @map("material_id")
+  quantity      Decimal @db.Decimal(15, 4)
+  unitOfMeasure String  @map("unit_of_measure")
+  isPercentage  Boolean @default(false) @map("is_percentage") // % vs absolute weight
 
   bomVersion BomVersion @relation(fields: [bomVersionId], references: [id], onDelete: Cascade)
   material   Material   @relation(fields: [materialId], references: [id])
@@ -473,28 +481,58 @@ model Shift {
 }
 
 model ProductionOrder {
-  id             String                @id @default(uuid())
-  orderNumber    String                @unique
-  bomVersionId   String                @map("bom_version_id")
-  targetQuantity Decimal               @db.Decimal(15, 4) @map("target_quantity")
-  actualYield    Decimal?              @db.Decimal(15, 4) @map("actual_yield")
-  status         ProductionOrderStatus @default(SCHEDULED)
-  scheduledStart DateTime?             @map("scheduled_start")
-  actualEnd      DateTime?             @map("actual_end")
-  machineId      String?               @map("machine_id")
-  shiftId        String?               @map("shift_id")
-  createdById    String                @map("created_by_id")
-  finishedBatchId String?              @map("finished_batch_id")
-  createdAt      DateTime              @default(now()) @map("created_at")
-  updatedAt      DateTime              @updatedAt @map("updated_at")
+  id                      String                @id @default(uuid())
+  orderNumber             String                @unique
+  bomVersionId            String                @map("bom_version_id")
+  targetQuantity          Decimal               @map("target_quantity") @db.Decimal(15, 4)
+  actualYield             Decimal?              @map("actual_yield") @db.Decimal(15, 4)
+  errorPercentage         Decimal?              @map("error_percentage") @db.Decimal(5, 2)
+  status                  ProductionOrderStatus @default(SCHEDULED)
+  scheduledStart          DateTime?             @map("scheduled_start")
+  actualEnd               DateTime?             @map("actual_end")
+  machineId               String?               @map("machine_id")
+  shiftId                 String?               @map("shift_id")
+  createdById             String                @map("created_by_id")
+  finishedBatchId         String?               @map("finished_batch_id")
+  mixCode                 String?               @map("mix_code")
+  mixLogDate              DateTime?             @map("mix_log_date")
+  mixUnits                Decimal?              @map("mix_units") @db.Decimal(15, 4)
+  ingredientsReleasedAt   DateTime?             @map("ingredients_released_at")
+  ingredientsReleasedById String?               @map("ingredients_released_by_id")
+  yieldLoggedAt           DateTime?             @map("yield_logged_at")
+  yieldLoggedById         String?               @map("yield_logged_by_id")
+  createdAt               DateTime              @default(now()) @map("created_at")
+  updatedAt               DateTime              @updatedAt @map("updated_at")
 
-  bomVersion    BomVersion @relation(fields: [bomVersionId], references: [id])
-  machine       Machine?   @relation(fields: [machineId], references: [id])
-  shift         Shift?     @relation(fields: [shiftId], references: [id])
-  createdBy     User       @relation(fields: [createdById], references: [id])
-  finishedBatch BatchLot?  @relation("finished_batch", fields: [finishedBatchId], references: [id])
+  bomVersion            BomVersion             @relation(fields: [bomVersionId], references: [id])
+  machine               Machine?               @relation(fields: [machineId], references: [id])
+  shift                 Shift?                 @relation(fields: [shiftId], references: [id])
+  createdBy             User                   @relation("order_creator", fields: [createdById], references: [id])
+  ingredientsReleasedBy User?                  @relation("order_ingredients_releaser", fields: [ingredientsReleasedById], references: [id])
+  yieldLoggedBy         User?                  @relation("yield_logger", fields: [yieldLoggedById], references: [id])
+  finishedBatch         BatchLot?              @relation("finished_batch", fields: [finishedBatchId], references: [id])
+  productionIngredients ProductionIngredient[]
 
   @@map("production_orders")
+}
+
+model ProductionIngredient {
+  id                String    @id @default(uuid())
+  productionOrderId String    @map("production_order_id")
+  materialId        String    @map("material_id")
+  projectedQuantity Decimal   @map("projected_quantity") @db.Decimal(15, 4)
+  releasedQuantity  Decimal   @default(0) @map("released_quantity") @db.Decimal(15, 4)
+  returnedQuantity  Decimal   @default(0) @map("returned_quantity") @db.Decimal(15, 4)
+  batchLotId        String?   @map("batch_lot_id")
+  releasedAt        DateTime? @map("released_at")
+  releasedById      String?   @map("released_by_id")
+
+  productionOrder ProductionOrder @relation(fields: [productionOrderId], references: [id], onDelete: Cascade)
+  material        Material        @relation(fields: [materialId], references: [id])
+  batchLot        BatchLot?       @relation(fields: [batchLotId], references: [id])
+  releasedBy      User?           @relation("ingredient_releaser", fields: [releasedById], references: [id])
+
+  @@map("production_ingredients")
 }
 
 // ---------------------------------------------------------------------------
@@ -513,9 +551,9 @@ model InspectionRecord {
   inspectedAt    DateTime?        @map("inspected_at")
   createdAt      DateTime         @default(now()) @map("created_at")
 
-  material  Material @relation(fields: [materialId], references: [id])
+  material  Material  @relation(fields: [materialId], references: [id])
   batchLot  BatchLot? @relation(fields: [batchLotId], references: [id])
-  inspector User?    @relation(fields: [inspectedById], references: [id])
+  inspector User?     @relation(fields: [inspectedById], references: [id])
 
   @@map("inspection_records")
 }

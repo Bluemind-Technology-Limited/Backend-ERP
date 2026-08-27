@@ -116,12 +116,44 @@ router.get("/profile", requireAuth, async (req: Request, res: Response) => {
         role: true,
         phoneNumber: true,
         isActive: true,
+        hasSeenTour: true,
         createdAt: true,
       },
     });
     res.json({ profile });
   } catch (error) {
     console.error("GET /auth/profile error:", error);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+/**
+ * PATCH /auth/profile — update current user profile
+ */
+router.patch("/profile", requireAuth, async (req: Request, res: Response) => {
+  try {
+    const { phoneNumber, hasSeenTour } = req.body;
+    const profile = await prisma.user.update({
+      where: { id: req.user!.id },
+      data: {
+        ...(phoneNumber !== undefined ? { phoneNumber } : {}),
+        ...(hasSeenTour !== undefined ? { hasSeenTour } : {}),
+      },
+      select: {
+        id: true,
+        email: true,
+        username: true,
+        fullName: true,
+        role: true,
+        phoneNumber: true,
+        isActive: true,
+        hasSeenTour: true,
+        createdAt: true,
+      },
+    });
+    res.json({ profile });
+  } catch (error) {
+    console.error("PATCH /auth/profile error:", error);
     res.status(500).json({ error: "Database error" });
   }
 });

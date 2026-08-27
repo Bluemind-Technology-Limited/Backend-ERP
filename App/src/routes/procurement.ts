@@ -145,12 +145,16 @@ router.post("/purchase-orders", requirePermission("procurement", "create"), asyn
       });
       if (!req) return res.status(404).json({ error: "Requisition not found" });
       if (req.status !== "APPROVED") return res.status(400).json({ error: "Requisition must be APPROVED first" });
-      poItems = req.items.map((it) => ({
-        materialId: it.materialId,
-        quantity: it.quantity,
-        unitCost: 0, // set by procurement officer
-        unitOfMeasure: it.unitOfMeasure,
-      }));
+      
+      // If the user did not supply custom edited items, load from requisition defaults
+      if (!Array.isArray(items) || items.length === 0) {
+        poItems = req.items.map((it) => ({
+          materialId: it.materialId,
+          quantity: it.quantity,
+          unitCost: 0,
+          unitOfMeasure: it.unitOfMeasure,
+        }));
+      }
     }
 
     const number = `PO-${Date.now().toString().slice(-8)}`;
@@ -194,6 +198,50 @@ router.patch("/purchase-orders/:id/status", requirePermission("procurement", "up
     res.json({ purchaseOrder });
   } catch (error) {
     console.error("PATCH /procurement/purchase-orders/:id/status error:", error);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+/**
+ * DELETE /requisitions/:id — delete a requisition (only DRAFT status)
+ */
+router.delete("/requisitions/:id", requirePermission("procurement", "delete"), async (req: Request, res: Response) => {
+  try {
+    const requisition = await prisma.requisition.findUnique({
+      where: { id: req.params.id },
+    });
+    if (!requisition) {
+      return res.status(404).json({ error: "Requisition not found" });
+    }
+    if (requisition.status !== "DRAFT") {
+      return res.status(409).json({ error: "Can only delete DRAFT requisitions" });
+    }
+    await prisma.requisition.delete({ where: { id: req.params.id } });
+    res.json({ ok: true });
+  } catch (error: any) {
+    console.error("DELETE /procurement/requisitions/:id error:", error);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+/**
+ * DELETE /purchase-orders/:id — delete a purchase order (only DRAFT status)
+ */
+router.delete("/purchase-orders/:id", requirePermission("procurement", "delete"), async (req: Request, res: Response) => {
+  try {
+    const purchaseOrder = await prisma.purchaseOrder.findUnique({
+      where: { id: req.params.id },
+    });
+    if (!purchaseOrder) {
+      return res.status(404).json({ error: "Purchase order not found" });
+    }
+    if (purchaseOrder.status !== "DRAFT") {
+      return res.status(409).json({ error: "Can only delete DRAFT purchase orders" });
+    }
+    await prisma.purchaseOrder.delete({ where: { id: req.params.id } });
+    res.json({ ok: true });
+  } catch (error: any) {
+    console.error("DELETE /procurement/purchase-orders/:id error:", error);
     res.status(500).json({ error: "Database error" });
   }
 });
