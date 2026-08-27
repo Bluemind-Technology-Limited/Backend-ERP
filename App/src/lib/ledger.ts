@@ -69,6 +69,7 @@ export interface StockRow {
   warehouseName: string;
   binId: string | null;
   quantity: number; // SUM of signed ledger entries
+  minQuantity?: number | null;
 }
 
 /** Derive current stock: SUM(quantity) grouped per material/batch/warehouse/bin. */
@@ -92,7 +93,7 @@ export async function getStock(
   const batchIds = [...new Set(grouped.map((g) => g.batchLotId).filter(Boolean))] as string[];
 
   const [materials, warehouses, batches] = await Promise.all([
-    prisma.material.findMany({ where: { id: { in: materialIds } }, select: { id: true, name: true, sku: true, unitOfMeasure: true } }),
+    prisma.material.findMany({ where: { id: { in: materialIds } }, select: { id: true, name: true, sku: true, unitOfMeasure: true, minQuantity: true } }),
     prisma.warehouse.findMany({ where: { id: { in: warehouseIds } }, select: { id: true, name: true } }),
     batchIds.length
       ? prisma.batchLot.findMany({ where: { id: { in: batchIds } }, select: { id: true, batchNumber: true } })
@@ -103,21 +104,56 @@ export async function getStock(
   const whMap = new Map(warehouses.map((w) => [w.id, w]));
   const batchMap = new Map(batches.map((b) => [b.id, b]));
 
-  return grouped
-    .filter((g) => (g._sum.quantity ?? 0) !== 0)
-    .map((g) => ({
-      materialId: g.materialId,
-      materialName: matMap.get(g.materialId)?.name ?? g.materialId,
-      sku: matMap.get(g.materialId)?.sku ?? "",
-      unitOfMeasure: g.unitOfMeasure,
-      batchLotId: g.batchLotId,
-      batchNumber: g.batchLotId ? batchMap.get(g.batchLotId)?.batchNumber ?? null : null,
-      warehouseId: g.warehouseId,
-      warehouseName: whMap.get(g.warehouseId)?.name ?? g.warehouseId,
-      binId: g.binId,
-      quantity: Number(g._sum.quantity ?? 0),
-    }))
-    .sort((a, b) => (a.quantity < b.quantity ? 1 : -1));
+  const stockRows: StockRow[] = grouped
+    .map((g) => {
+      const mat = matMap.get(g.materialId);
+      return {
+        materialId: g.materialId,
+        materialName: mat?.name ?? g.materialId,
+        sku: mat?.sku ?? "",
+        unitOfMeasure: g.unitOfMeasure,
+        batchLotId: g.batchLotId,
+        batchNumber: g.batchLotId ? batchMap.get(g.batchLotId)?.batchNumber ?? null : null,
+        warehouseId: g.warehouseId,
+        warehouseName: whMap.get(g.warehouseId)?.name ?? g.warehouseId,
+        binId: g.binId,
+        quantity: Number(g._sum.quantity ?? 0),
+        minQuantity: mat?.minQuantity ? Number(mat.minQuantity) : 0,
+      };
+    });
+
+  // If filtering specifically, don't auto-fill all products unless no filter is applied or if materialId is set
+  if (!filters?.warehouseId && !filters?.batchLotId) {
+    const allActiveMaterials = await prisma.material.findMany({
+      where: {
+        status: "ACTIVE",
+        ...(filters?.materialId ? { id: filters.materialId } : {})
+      },
+      select: { id: true, name: true, sku: true, unitOfMeasure: true, minQuantity: true }
+    });
+
+    const materialIdsWithStock = new Set(stockRows.map((r) => r.materialId));
+
+    for (const mat of allActiveMaterials) {
+      if (!materialIdsWithStock.has(mat.id)) {
+        stockRows.push({
+          materialId: mat.id,
+          materialName: mat.name,
+          sku: mat.sku,
+          unitOfMeasure: mat.unitOfMeasure,
+          batchLotId: null,
+          batchNumber: null,
+          warehouseId: "",
+          warehouseName: "—",
+          binId: null,
+          quantity: 0,
+          minQuantity: mat.minQuantity ? Number(mat.minQuantity) : 0,
+        });
+      }
+    }
+  }
+
+  return stockRows.sort((a, b) => (a.quantity < b.quantity ? 1 : -1));
 }
 
 /** Get the full transaction history (audit trail) for a material/batch. */

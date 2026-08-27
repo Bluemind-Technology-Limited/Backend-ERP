@@ -44,7 +44,7 @@ router.get("/", requirePermission("procurement", "read"), async (req: Request, r
  *   4. creates a PENDING_QA InspectionRecord per batch
  *   5. bumps PO receivedQty / status
  */
-router.post("/grn", requirePermission("procurement", "create"), async (req: Request, res: Response) => {
+router.post("/", requirePermission("procurement", "create"), async (req: Request, res: Response) => {
   try {
     const { poId, notes, items } = req.body;
     if (!poId || !Array.isArray(items) || items.length === 0) {
