@@ -85,6 +85,25 @@ router.post("/inspections/:id/release", requirePermission("qa", "approve"), asyn
           data: { status: "ACTIVE" },
         });
       }
+
+      // If this is a GRN inspection, check if all inspections for this GRN are now PASSED
+      if (inspection.inspectionType === "GRN" && inspection.referenceId) {
+        const pendingInspections = await tx.inspectionRecord.count({
+          where: {
+            referenceId: inspection.referenceId,
+            inspectionType: "GRN",
+            result: "PENDING",
+          },
+        });
+
+        // If no more pending inspections, mark GRN as APPROVED
+        if (pendingInspections === 0) {
+          await tx.goodsReceipt.update({
+            where: { id: inspection.referenceId },
+            data: { status: "APPROVED" },
+          });
+        }
+      }
       return updated;
     });
 
@@ -143,6 +162,14 @@ router.post("/inspections/:id/reject", requirePermission("qa", "approve"), async
             notes: `Rejected batch ${inspection.batchLot.batchNumber} (${notes ?? "failed inspection"})`,
           });
         }
+      }
+
+      // If this is a GRN inspection and it's FAILED, mark the GRN as REJECTED
+      if (inspection.inspectionType === "GRN" && inspection.referenceId) {
+        await tx.goodsReceipt.update({
+          where: { id: inspection.referenceId },
+          data: { status: "REJECTED" },
+        });
       }
       return updated;
     });
