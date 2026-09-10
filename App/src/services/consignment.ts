@@ -356,7 +356,7 @@ export async function distributeToWarehouseBin(data: {
   });
 
   // Check remaining quantity to distribute
-  const remainingQty = item.quantity - item.distributedQty;
+  const remainingQty = Number(item.quantity) - Number(item.distributedQty);
   if (data.quantity > remainingQty) {
     throw new Error(`Cannot distribute ${data.quantity}, only ${remainingQty} remaining`);
   }
@@ -387,7 +387,7 @@ export async function distributeToWarehouseBin(data: {
   });
 
   // Update distributed quantity on item
-  const newDistributedQty = item.distributedQty + data.quantity;
+  const newDistributedQty = Number(item.distributedQty) + data.quantity;
   await prisma.consignmentItem.update({
     where: { id: data.consignmentItemId },
     data: {
@@ -454,10 +454,10 @@ export async function markDistributionComplete(data: {
     data: {
       materialId: distribution.consignmentItem.materialId,
       warehouseId: distribution.bin.warehouse.id,
-      type: 'INBOUND',
+      eventType: 'PO_RECEIPT',
       quantity: distribution.quantity,
       unitOfMeasure: distribution.consignmentItem.unitOfMeasure,
-      reference: `CSN-${distribution.consignment.consignmentNumber}`,
+      referenceId: `CSN-${distribution.consignment.consignmentNumber}`,
       binId: distribution.binId,
       createdById: data.completedById,
     },
@@ -482,7 +482,7 @@ export async function calculateItemDistributionStatus(itemId: string) {
   });
 
   const totalDistributed = item.distributions.reduce(
-    (sum, dist) => sum + dist.quantity,
+    (sum, dist) => sum + Number(dist.quantity),
     0
   );
 
@@ -490,12 +490,12 @@ export async function calculateItemDistributionStatus(itemId: string) {
     return {
       status: 'PENDING',
       distributed: totalDistributed,
-      remaining: item.quantity,
+      remaining: Number(item.quantity),
       percentage: 0,
     };
   }
 
-  if (totalDistributed === item.quantity) {
+  if (totalDistributed === Number(item.quantity)) {
     return {
       status: 'COMPLETED',
       distributed: totalDistributed,
@@ -507,8 +507,8 @@ export async function calculateItemDistributionStatus(itemId: string) {
   return {
     status: 'IN_PROGRESS',
     distributed: totalDistributed,
-    remaining: item.quantity - totalDistributed,
-    percentage: Math.round((totalDistributed / item.quantity) * 100),
+    remaining: Number(item.quantity) - totalDistributed,
+    percentage: Math.round((totalDistributed / Number(item.quantity)) * 100),
   };
 }
 
@@ -537,14 +537,14 @@ export async function calculateConsignmentDistributionStatus(consignmentId: stri
   let totalDistributed = 0;
 
   for (const item of items) {
-    totalQtyToDistribute += item.quantity;
+    totalQtyToDistribute += Number(item.quantity);
     const itemDistributed = item.distributions.reduce(
-      (sum, dist) => sum + dist.quantity,
+      (sum, dist) => sum + Number(dist.quantity),
       0
     );
     totalDistributed += itemDistributed;
 
-    if (itemDistributed === item.quantity) {
+    if (itemDistributed === Number(item.quantity)) {
       itemsCompleted++;
     }
   }
@@ -641,7 +641,7 @@ export async function deleteConsignment(consignmentId: string) {
 
   // Prevent deletion of advanced statuses
   const blockedStatuses = [ConsignmentStatus.IN_TRANSIT, ConsignmentStatus.DISTRIBUTED, ConsignmentStatus.COMPLETED];
-  if (blockedStatuses.includes(consignment.status)) {
+  if (blockedStatuses.includes(consignment.status as any)) {
     throw new Error(`Cannot delete consignments in ${consignment.status} status`);
   }
 
