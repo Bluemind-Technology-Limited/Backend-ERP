@@ -93,11 +93,6 @@ export const machineService = {
           where,
           skip,
           take,
-          include: {
-            category: true,
-            department: true,
-            location: true,
-          },
           orderBy: { createdAt: "desc" },
         }),
         prisma.machine.count({ where }),
@@ -119,11 +114,6 @@ export const machineService = {
     try {
       const machine = await prisma.machine.findUnique({
         where: { id: machineId },
-        include: {
-          category: true,
-          department: true,
-          location: true,
-        },
       });
       console.log(`[machineService] getMachineById result:`, machine ? `Found machine ${machine.id}` : "Machine not found");
       return machine;
@@ -152,11 +142,6 @@ export const machineService = {
           ...data,
           status: data.status || "ACTIVE",
         },
-        include: {
-          category: true,
-          department: true,
-          location: true,
-        },
       });
       console.log(`[machineService] createMachine success: Created machine ${result.id}`);
       return result;
@@ -184,11 +169,6 @@ export const machineService = {
       const result = await prisma.machine.update({
         where: { id: machineId },
         data,
-        include: {
-          category: true,
-          department: true,
-          location: true,
-        },
       });
       console.log(`[machineService] updateMachine success: Updated machine ${machineId}`);
       return result;
