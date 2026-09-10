@@ -65,7 +65,6 @@ export async function allocateBatchToMachine(options: AllocateBatchOptions) {
     },
     include: {
       productionOrder: { include: { bom: true } },
-      machine: true,
       planItem: true,
       supervisor: { select: { id: true, fullName: true } },
     },
@@ -76,7 +75,7 @@ export async function allocateBatchToMachine(options: AllocateBatchOptions) {
     userId: supervisorId,
     activityType: 'CREATE',
     module: 'production',
-    description: `Allocated batch to machine ${machine.name}`,
+    description: `Allocated batch to machine (ID: ${machineId})`,
     entityType: 'BatchMachineAllocation',
     entityId: allocation.id,
     details: {
@@ -112,7 +111,6 @@ export async function getMachineWorkload(machineId: string, date: Date) {
       productionOrder: {
         include: { bom: { include: { finishedSku: { select: { name: true } } } } },
       },
-      machine: true,
     },
     orderBy: { scheduledStartTime: 'asc' },
   });
@@ -140,7 +138,7 @@ export async function startBatchProduction(
 ) {
   const allocation = await prisma.batchMachineAllocation.findUnique({
     where: { id: allocationId },
-    include: { productionOrder: { include: { bom: true } }, machine: true },
+    include: { productionOrder: { include: { bom: true } } },
   });
   if (!allocation) throw new Error(`Allocation ${allocationId} not found`);
   if (allocation.status !== 'ALLOCATED' && allocation.status !== 'SCHEDULED') {
@@ -155,7 +153,6 @@ export async function startBatchProduction(
     },
     include: {
       productionOrder: { include: { bom: true } },
-      machine: true,
       supervisor: { select: { fullName: true } },
     },
   });
@@ -165,7 +162,7 @@ export async function startBatchProduction(
     userId: supervisorId,
     activityType: 'UPDATE',
     module: 'production',
-    description: `Started batch production on ${allocation.machine.name}`,
+    description: `Started batch production (Machine ID: ${allocation.machineId})`,
     entityType: 'BatchMachineAllocation',
     entityId: allocationId,
     details: {
@@ -188,7 +185,7 @@ export async function completeBatchProduction(
 ) {
   const allocation = await prisma.batchMachineAllocation.findUnique({
     where: { id: allocationId },
-    include: { productionOrder: true, machine: true },
+    include: { productionOrder: true },
   });
   if (!allocation) throw new Error(`Allocation ${allocationId} not found`);
   if (allocation.status !== 'IN_PROGRESS') {
@@ -204,7 +201,6 @@ export async function completeBatchProduction(
     },
     include: {
       productionOrder: { include: { bom: true } },
-      machine: true,
       supervisor: { select: { fullName: true } },
     },
   });
@@ -214,7 +210,7 @@ export async function completeBatchProduction(
     userId: supervisorId,
     activityType: 'UPDATE',
     module: 'production',
-    description: `Completed batch production on ${allocation.machine.name}`,
+    description: `Completed batch production (Machine ID: ${allocation.machineId})`,
     entityType: 'BatchMachineAllocation',
     entityId: allocationId,
     details: {
@@ -234,7 +230,6 @@ export async function getPlanItemAllocations(planItemId: string) {
   const allocations = await prisma.batchMachineAllocation.findMany({
     where: { productionPlanItemId: planItemId },
     include: {
-      machine: true,
       productionOrder: { include: { bom: { include: { finishedSku: true } } } },
       supervisor: { select: { id: true, fullName: true } },
     },
@@ -260,7 +255,6 @@ export async function getSupervisorDailyAllocations(supervisorId: string, date: 
       createdAt: { gte: startOfDay, lte: endOfDay },
     },
     include: {
-      machine: true,
       productionOrder: { include: { bom: { include: { finishedSku: true } } } },
       planItem: { include: { bom: true } },
     },
@@ -298,7 +292,6 @@ export async function reallocateBatchToMachine(
       machineId: newMachineId,
     },
     include: {
-      machine: true,
       productionOrder: { include: { bom: true } },
     },
   });
@@ -327,7 +320,6 @@ export async function getAllocationDetails(allocationId: string) {
   const allocation = await prisma.batchMachineAllocation.findUnique({
     where: { id: allocationId },
     include: {
-      machine: true,
       productionOrder: {
         include: {
           bom: { include: { finishedSku: true, ingredients: true } },
@@ -369,7 +361,6 @@ export async function getPlanAllocations(productionPlanId: string) {
       productionPlanItemId: { in: itemIds },
     },
     include: {
-      machine: true,
       productionOrder: { include: { bom: { include: { finishedSku: true } } } },
       planItem: true,
       supervisor: { select: { fullName: true } },

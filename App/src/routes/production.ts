@@ -545,18 +545,6 @@ router.get("/machines", requirePermission("production", "read"), async (_req: Re
   }
 });
 
-router.post("/machines", requirePermission("production", "create"), async (req: Request, res: Response) => {
-  try {
-    const { name, code } = req.body;
-    if (!name || !code) return res.status(400).json({ error: "name and code are required" });
-    const machine = await prisma.machine.create({ data: { name, code } });
-    res.status(201).json({ machine });
-  } catch (error) {
-    console.error("POST /production/machines error:", error);
-    res.status(500).json({ error: "Database error" });
-  }
-});
-
 router.get("/shifts", requirePermission("production", "read"), async (_req: Request, res: Response) => {
   try {
     const shifts = await prisma.shift.findMany({ orderBy: { startTime: "asc" } });
@@ -578,7 +566,6 @@ router.get("/production-orders", requirePermission("production", "read"), async 
       where: status ? { status: status as ProductionOrderStatus } : {},
       include: {
         bom: { include: { finishedSku: { select: { name: true, sku: true } } } },
-        machine: { select: { name: true, code: true } },
         shift: { select: { name: true } },
         createdBy: { select: { fullName: true } },
         finishedBatch: { select: { batchNumber: true, status: true } },
