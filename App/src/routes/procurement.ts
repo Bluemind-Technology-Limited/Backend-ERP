@@ -3,6 +3,7 @@ import { requireAuth } from "../middleware/auth.js";
 import { requirePermission } from "../middleware/rbac.js";
 import { prisma } from "../lib/db.js";
 import { RequisitionStatus, PurchaseOrderStatus } from "@prisma/client";
+import * as consignmentService from "../services/consignment.js";
 
 const router: Router = Router();
 router.use(requireAuth);
@@ -242,6 +243,307 @@ router.delete("/purchase-orders/:id", requirePermission("procurement", "delete")
     res.json({ ok: true });
   } catch (error: any) {
     console.error("DELETE /procurement/purchase-orders/:id error:", error);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Consignments (Grouped shipments - warehouse stocking)
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /consignments — List all consignments with optional filtering
+ */
+router.get("/consignments", requirePermission("procurement", "read"), async (req: Request, res: Response) => {
+  try {
+    const { supplierId, warehouseId, status, skip, take } = req.query;
+    const consignments = await consignmentService.getConsignments({
+      supplierId: supplierId as string,
+      warehouseId: warehouseId as string,
+      status: status as any,
+      skip: skip ? parseInt(skip as string) : undefined,
+      take: take ? parseInt(take as string) : undefined,
+    });
+    res.json({ consignments });
+  } catch (error) {
+    console.error("GET /procurement/consignments error:", error);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+/**
+ * POST /consignments — Create new consignment
+ */
+router.post("/consignments", requirePermission("procurement", "create"), async (req: Request, res: Response) => {
+  try {
+    const { supplierId, warehouseId, poNumbers, shipDate, expectedDelivery } = req.body;
+    if (!supplierId || !warehouseId) {
+      return res.status(400).json({ error: "supplierId and warehouseId are required" });
+    }
+
+    const consignment = await consignmentService.createConsignment({
+      supplierId,
+      warehouseId,
+      createdById: req.user!.id,
+      poNumbers,
+      shipDate: shipDate ? new Date(shipDate) : undefined,
+      expectedDelivery: expectedDelivery ? new Date(expectedDelivery) : undefined,
+    });
+
+    res.status(201).json({ consignment });
+  } catch (error) {
+    console.error("POST /procurement/consignments error:", error);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+/**
+ * GET /consignments/:id — Get single consignment with all details
+ */
+router.get("/consignments/:id", requirePermission("procurement", "read"), async (req: Request, res: Response) => {
+  try {
+    const consignment = await consignmentService.getConsignment(req.params.id);
+    res.json({ consignment });
+  } catch (error: any) {
+    if (error.code === "P2025") {
+      return res.status(404).json({ error: "Consignment not found" });
+    }
+    console.error("GET /procurement/consignments/:id error:", error);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Consignment Items
+// ---------------------------------------------------------------------------
+
+/**
+ * POST /consignments/:id/items — Add item to consignment
+ */
+router.post("/consignments/:id/items", requirePermission("procurement", "create"), async (req: Request, res: Response) => {
+  try {
+    const { materialId, quantity, unitOfMeasure } = req.body;
+    if (!materialId || !quantity || !unitOfMeasure) {
+      return res.status(400).json({ error: "materialId, quantity, and unitOfMeasure are required" });
+    }
+
+    const item = await consignmentService.addItemToConsignment({
+      consignmentId: req.params.id,
+      materialId,
+      quantity,
+      unitOfMeasure,
+    });
+
+    res.status(201).json({ item });
+  } catch (error: any) {
+    console.error("POST /procurement/consignments/:id/items error:", error);
+    res.status(500).json({ error: error.message || "Database error" });
+  }
+});
+
+/**
+ * PATCH /consignments/items/:itemId — Update consignment item
+ */
+router.patch("/consignments/items/:itemId", requirePermission("procurement", "update"), async (req: Request, res: Response) => {
+  try {
+    const { quantity, unitOfMeasure } = req.body;
+    if (!quantity || !unitOfMeasure) {
+      return res.status(400).json({ error: "quantity and unitOfMeasure are required" });
+    }
+
+    const item = await consignmentService.updateConsignmentItem({
+      itemId: req.params.itemId,
+      quantity,
+      unitOfMeasure,
+    });
+
+    res.json({ item });
+  } catch (error: any) {
+    console.error("PATCH /procurement/consignments/items/:itemId error:", error);
+    res.status(500).json({ error: error.message || "Database error" });
+  }
+});
+
+/**
+ * DELETE /consignments/items/:itemId — Remove item from consignment
+ */
+router.delete("/consignments/items/:itemId", requirePermission("procurement", "delete"), async (req: Request, res: Response) => {
+  try {
+    const deleted = await consignmentService.removeItemFromConsignment(req.params.itemId);
+    res.json({ ok: true, item: deleted });
+  } catch (error: any) {
+    console.error("DELETE /procurement/consignments/items/:itemId error:", error);
+    res.status(500).json({ error: error.message || "Database error" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Consignment Status Transitions
+// ---------------------------------------------------------------------------
+
+/**
+ * PATCH /consignments/:id/ready-for-shipment — Mark consignment ready for shipment
+ */
+router.patch("/consignments/:id/ready-for-shipment", requirePermission("procurement", "update"), async (req: Request, res: Response) => {
+  try {
+    const { shipDate, expectedDelivery } = req.body;
+    if (!shipDate || !expectedDelivery) {
+      return res.status(400).json({ error: "shipDate and expectedDelivery are required" });
+    }
+
+    const consignment = await consignmentService.markReadyForShipment({
+      consignmentId: req.params.id,
+      shipDate: new Date(shipDate),
+      expectedDelivery: new Date(expectedDelivery),
+    });
+
+    res.json({ consignment });
+  } catch (error: any) {
+    console.error("PATCH /procurement/consignments/:id/ready-for-shipment error:", error);
+    res.status(500).json({ error: error.message || "Database error" });
+  }
+});
+
+/**
+ * PATCH /consignments/:id/in-transit — Mark consignment in transit
+ */
+router.patch("/consignments/:id/in-transit", requirePermission("procurement", "update"), async (req: Request, res: Response) => {
+  try {
+    const consignment = await consignmentService.markInTransit(req.params.id);
+    res.json({ consignment });
+  } catch (error: any) {
+    console.error("PATCH /procurement/consignments/:id/in-transit error:", error);
+    res.status(500).json({ error: error.message || "Database error" });
+  }
+});
+
+/**
+ * PATCH /consignments/:id/receive — Receive consignment at warehouse
+ */
+router.patch("/consignments/:id/receive", requirePermission("procurement", "update"), async (req: Request, res: Response) => {
+  try {
+    const consignment = await consignmentService.receiveConsignment({
+      consignmentId: req.params.id,
+      receivedById: req.user!.id,
+    });
+
+    res.json({ consignment });
+  } catch (error: any) {
+    console.error("PATCH /procurement/consignments/:id/receive error:", error);
+    res.status(500).json({ error: error.message || "Database error" });
+  }
+});
+
+/**
+ * PATCH /consignments/:id/distributed — Mark consignment as fully distributed
+ */
+router.patch("/consignments/:id/distributed", requirePermission("procurement", "update"), async (req: Request, res: Response) => {
+  try {
+    const consignment = await consignmentService.markAsDistributed(req.params.id);
+    res.json({ consignment });
+  } catch (error: any) {
+    console.error("PATCH /procurement/consignments/:id/distributed error:", error);
+    res.status(500).json({ error: error.message || "Database error" });
+  }
+});
+
+/**
+ * PATCH /consignments/:id/completed — Mark consignment as completed
+ */
+router.patch("/consignments/:id/completed", requirePermission("procurement", "update"), async (req: Request, res: Response) => {
+  try {
+    const consignment = await consignmentService.markAsCompleted(req.params.id);
+    res.json({ consignment });
+  } catch (error: any) {
+    console.error("PATCH /procurement/consignments/:id/completed error:", error);
+    res.status(500).json({ error: error.message || "Database error" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Consignment Distribution to Warehouse Bins
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /consignments/:id/distributions — Get all distributions for consignment
+ */
+router.get("/consignments/:id/distributions", requirePermission("procurement", "read"), async (req: Request, res: Response) => {
+  try {
+    const distributions = await consignmentService.getConsignmentDistributions(req.params.id);
+    res.json({ distributions });
+  } catch (error) {
+    console.error("GET /procurement/consignments/:id/distributions error:", error);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+/**
+ * POST /consignments/items/:itemId/distribute — Distribute item to warehouse bin
+ */
+router.post("/consignments/items/:itemId/distribute", requirePermission("procurement", "create"), async (req: Request, res: Response) => {
+  try {
+    const { binId, quantity } = req.body;
+    if (!binId || !quantity) {
+      return res.status(400).json({ error: "binId and quantity are required" });
+    }
+
+    const distribution = await consignmentService.distributeToWarehouseBin({
+      consignmentItemId: req.params.itemId,
+      binId,
+      quantity,
+      distributedById: req.user!.id,
+    });
+
+    res.status(201).json({ distribution });
+  } catch (error: any) {
+    console.error("POST /procurement/consignments/items/:itemId/distribute error:", error);
+    res.status(500).json({ error: error.message || "Database error" });
+  }
+});
+
+/**
+ * PATCH /consignments/distributions/:distributionId/complete — Mark distribution complete
+ */
+router.patch("/consignments/distributions/:distributionId/complete", requirePermission("procurement", "update"), async (req: Request, res: Response) => {
+  try {
+    const distribution = await consignmentService.markDistributionComplete({
+      distributionId: req.params.distributionId,
+      completedById: req.user!.id,
+    });
+
+    res.json({ distribution });
+  } catch (error: any) {
+    console.error("PATCH /procurement/consignments/distributions/:distributionId/complete error:", error);
+    res.status(500).json({ error: error.message || "Database error" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Consignment Status Tracking
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /consignments/:id/distribution-status — Get distribution status for consignment
+ */
+router.get("/consignments/:id/distribution-status", requirePermission("procurement", "read"), async (req: Request, res: Response) => {
+  try {
+    const status = await consignmentService.calculateConsignmentDistributionStatus(req.params.id);
+    res.json({ status });
+  } catch (error) {
+    console.error("GET /procurement/consignments/:id/distribution-status error:", error);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+/**
+ * GET /consignments/items/:itemId/distribution-status — Get distribution status for item
+ */
+router.get("/consignments/items/:itemId/distribution-status", requirePermission("procurement", "read"), async (req: Request, res: Response) => {
+  try {
+    const status = await consignmentService.calculateItemDistributionStatus(req.params.itemId);
+    res.json({ status });
+  } catch (error) {
+    console.error("GET /procurement/consignments/items/:itemId/distribution-status error:", error);
     res.status(500).json({ error: "Database error" });
   }
 });

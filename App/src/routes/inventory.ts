@@ -237,3 +237,72 @@ router.get("/finished-goods", requirePermission("inventory", "read"), async (req
 });
 
 export default router;
+
+/**
+ * PUT /stock/:materialId — update stock item (minimum quantity).
+ * Only updates the material's minQuantity field.
+ */
+router.put("/stock/:materialId", requirePermission("inventory", "update"), async (req: Request, res: Response) => {
+  try {
+    const { materialId } = req.params;
+    const { minQuantity } = req.body;
+
+    if (minQuantity === undefined) {
+      return res.status(400).json({ error: "minQuantity is required" });
+    }
+
+    const material = await prisma.material.update({
+      where: { id: materialId },
+      data: {
+        minQuantity: Number(minQuantity) || 0,
+      },
+      select: {
+        id: true,
+        name: true,
+        sku: true,
+        minQuantity: true,
+      },
+    });
+
+    console.log(`Updated material ${materialId} minQuantity to ${minQuantity}`);
+
+    res.json({ success: true, material });
+  } catch (error: any) {
+    console.error("PUT /stock/:materialId error:", error);
+    if (error.code === "P2025") {
+      return res.status(404).json({ error: "Material not found" });
+    }
+    res.status(500).json({ error: error?.message || "Failed to update stock item" });
+  }
+});
+
+/**
+ * DELETE /stock/history/:id — delete a ledger entry (reverses the transaction).
+ * Only deletes the single entry (inventory manager/admin role).
+ */
+router.delete("/stock/history/:id", requirePermission("inventory", "delete"), async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+
+    // Find the entry to verify it exists
+    const entry = await prisma.inventoryTransaction.findUnique({
+      where: { id },
+    });
+
+    if (!entry) {
+      return res.status(404).json({ error: "Ledger entry not found" });
+    }
+
+    // Delete the entry
+    await prisma.inventoryTransaction.delete({
+      where: { id },
+    });
+
+    console.log(`Deleted ledger entry ${id} (${entry.eventType}, quantity: ${entry.quantity})`);
+
+    res.json({ success: true, message: "Ledger entry deleted" });
+  } catch (error: any) {
+    console.error("DELETE /stock/history/:id error:", error);
+    res.status(500).json({ error: error?.message || "Failed to delete ledger entry" });
+  }
+});

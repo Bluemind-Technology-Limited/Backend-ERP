@@ -14,9 +14,9 @@ router.get("/production-efficiency", requirePermission("reports", "read"), async
   try {
     const orders = await prisma.productionOrder.findMany({
       include: {
-        bomVersion: {
-          include: {
-            bom: { select: { productName: true } },
+        bom: {
+          select: {
+            productName: true,
             finishedSku: { select: { name: true, sku: true } },
           },
         },
@@ -30,9 +30,8 @@ router.get("/production-efficiency", requirePermission("reports", "read"), async
       const yieldPct = actual !== null && target > 0 ? Math.round((actual / target) * 1000) / 10 : null;
       return {
         orderNumber: o.orderNumber,
-        productName: o.bomVersion.finishedSku?.name ?? o.bomVersion.bom.productName,
-        sku: o.bomVersion.finishedSku?.sku ?? "",
-        bomVersion: o.bomVersion.version,
+        productName: o.bom.finishedSku?.name ?? o.bom.productName,
+        sku: o.bom.finishedSku?.sku ?? "",
         status: o.status,
         targetQuantity: target,
         actualYield: actual,
