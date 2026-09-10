@@ -1,6 +1,6 @@
-import { prisma } from '../lib/db';
+import { prisma } from '../lib/db.js';
 import { ProductionIngredientStatus } from '@prisma/client';
-import { postLedgerEntry } from '../lib/ledger';
+import { postLedgerEntry } from '../lib/ledger.js';
 import { LedgerEventType } from '@prisma/client';
 
 /**
