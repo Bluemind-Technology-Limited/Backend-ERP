@@ -324,8 +324,8 @@ export async function getReconciliationStatistics(startDate: Date, endDate: Date
   for (const recon of reconciliations) {
     if (recon.status === 'VERIFIED') verifiedCount++;
     if (recon.status === 'FLAGGED') flaggedCount++;
-    if (Math.abs(recon.variancePercentage) > 5) {
-      totalVariance += recon.variancePercentage;
+    if (Math.abs(Number(recon.variancePercentage)) > 5) {
+      totalVariance += Number(recon.variancePercentage);
       totalVarianceCount++;
     }
   }
