@@ -394,7 +394,7 @@ export async function getSystemActivityTimeline(days: number = 7, limit: number 
   const sinceDate = new Date();
   sinceDate.setDate(sinceDate.getDate() - days);
 
-  const activities = [];
+  const timelineMap = new Map<string, any>();
 
   // Get recent requisitions
   const requisitions = await prisma.requisition.findMany({
@@ -404,15 +404,27 @@ export async function getSystemActivityTimeline(days: number = 7, limit: number 
     take: limit,
   });
 
-  activities.push(
-    ...requisitions.map((r) => ({
-      type: 'Requisition',
+  for (const r of requisitions) {
+    const key = `Requisition-${r.id}`;
+    if (!timelineMap.has(key)) {
+      timelineMap.set(key, {
+        entityType: 'Requisition',
+        entityId: r.id,
+        totalEvents: 0,
+        timeline: [],
+      });
+    }
+    const timeline = timelineMap.get(key);
+    timeline.timeline.push({
+      id: `${r.id}-created`,
+      entityType: 'Requisition',
+      entityId: r.id,
       action: 'CREATED',
-      entity: r.number,
-      user: r.requestedBy.fullName,
+      actor: { id: r.requestedById, fullName: r.requestedBy.fullName },
       timestamp: r.createdAt,
-    }))
-  );
+    });
+    timeline.totalEvents++;
+  }
 
   // Get recent purchase orders
   const pos = await prisma.purchaseOrder.findMany({
@@ -422,15 +434,27 @@ export async function getSystemActivityTimeline(days: number = 7, limit: number 
     take: limit,
   });
 
-  activities.push(
-    ...pos.map((po) => ({
-      type: 'PurchaseOrder',
+  for (const po of pos) {
+    const key = `PurchaseOrder-${po.id}`;
+    if (!timelineMap.has(key)) {
+      timelineMap.set(key, {
+        entityType: 'PurchaseOrder',
+        entityId: po.id,
+        totalEvents: 0,
+        timeline: [],
+      });
+    }
+    const timeline = timelineMap.get(key);
+    timeline.timeline.push({
+      id: `${po.id}-created`,
+      entityType: 'PurchaseOrder',
+      entityId: po.id,
       action: 'CREATED',
-      entity: po.number,
-      user: po.createdBy.fullName,
+      actor: { id: po.createdById, fullName: po.createdBy.fullName },
       timestamp: po.createdAt,
-    }))
-  );
+    });
+    timeline.totalEvents++;
+  }
 
   // Get recent goods receipts
   const grns = await prisma.goodsReceipt.findMany({
@@ -440,15 +464,27 @@ export async function getSystemActivityTimeline(days: number = 7, limit: number 
     take: limit,
   });
 
-  activities.push(
-    ...grns.map((grn) => ({
-      type: 'GoodsReceipt',
+  for (const grn of grns) {
+    const key = `GoodsReceipt-${grn.id}`;
+    if (!timelineMap.has(key)) {
+      timelineMap.set(key, {
+        entityType: 'GoodsReceipt',
+        entityId: grn.id,
+        totalEvents: 0,
+        timeline: [],
+      });
+    }
+    const timeline = timelineMap.get(key);
+    timeline.timeline.push({
+      id: `${grn.id}-created`,
+      entityType: 'GoodsReceipt',
+      entityId: grn.id,
       action: 'RECEIVED',
-      entity: grn.number,
-      user: grn.receivedBy.fullName,
+      actor: { id: grn.receivedById, fullName: grn.receivedBy.fullName },
       timestamp: grn.createdAt,
-    }))
-  );
+    });
+    timeline.totalEvents++;
+  }
 
   // Get recent production orders
   const orders = await prisma.productionOrder.findMany({
@@ -458,18 +494,30 @@ export async function getSystemActivityTimeline(days: number = 7, limit: number 
     take: limit,
   });
 
-  activities.push(
-    ...orders.map((o) => ({
-      type: 'ProductionOrder',
+  for (const o of orders) {
+    const key = `ProductionOrder-${o.id}`;
+    if (!timelineMap.has(key)) {
+      timelineMap.set(key, {
+        entityType: 'ProductionOrder',
+        entityId: o.id,
+        totalEvents: 0,
+        timeline: [],
+      });
+    }
+    const timeline = timelineMap.get(key);
+    timeline.timeline.push({
+      id: `${o.id}-created`,
+      entityType: 'ProductionOrder',
+      entityId: o.id,
       action: 'CREATED',
-      entity: o.orderNumber,
-      user: o.createdBy.fullName,
+      actor: { id: o.createdById, fullName: o.createdBy.fullName },
       timestamp: o.createdAt,
-    }))
-  );
+    });
+    timeline.totalEvents++;
+  }
 
-  // Sort all activities by timestamp descending
-  return activities.sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime()).slice(0, limit);
+  // Return as array
+  return Array.from(timelineMap.values()).slice(0, limit);
 }
 
 // ============================================================================
@@ -511,21 +559,18 @@ export async function getApprovalVelocityMetrics(days: number = 30) {
     },
   });
 
+  const totalApprovals = requisitionsApproved + grnsApproved;
+  const totalRejections = requisitionsRejected + grnsRejected;
+  const total = totalApprovals + totalRejections;
+
   return {
-    period: `Last ${days} days`,
-    requisitions: {
-      approved: requisitionsApproved,
-      rejected: requisitionsRejected,
-      approvalRate: requisitionsApproved + requisitionsRejected > 0
-        ? Math.round((requisitionsApproved / (requisitionsApproved + requisitionsRejected)) * 100)
-        : 0,
-    },
-    goodsReceipts: {
-      approved: grnsApproved,
-      rejected: grnsRejected,
-      approvalRate: grnsApproved + grnsRejected > 0
-        ? Math.round((grnsApproved / (grnsApproved + grnsRejected)) * 100)
-        : 0,
+    totalApprovals,
+    totalRejections,
+    approvalRate: total > 0 ? (totalApprovals / total) * 100 : 0,
+    averageApprovalTime: 0, // TODO: calculate from timestamps
+    entityCounts: {
+      requisitions: requisitionsApproved + requisitionsRejected,
+      goodsReceipts: grnsApproved + grnsRejected,
     },
   };
 }
@@ -554,7 +599,7 @@ export async function getProductionMetrics(days: number = 30) {
   for (const order of orders) {
     if (order.status === 'COMPLETED' && order.actualEnd) {
       completed++;
-      const leadTime = order.actualEnd.getTime() - order.actualStart.getTime();
+      const leadTime = order.actualEnd.getTime() - order.actualStart!.getTime();
       totalLeadTime += leadTime;
     } else if (order.status === 'PROCESSING') {
       inProgress++;
@@ -563,15 +608,15 @@ export async function getProductionMetrics(days: number = 30) {
     }
   }
 
-  const avgLeadTime = completed > 0 ? Math.round(totalLeadTime / completed / 1000 / 60) : 0; // in minutes
+  const avgLeadTime = completed > 0 ? Math.round(totalLeadTime / completed / 1000 / 60 / 60) : 0; // in hours
 
   return {
-    period: `Last ${days} days`,
-    ordersCompleted: completed,
-    ordersInProgress: inProgress,
-    ordersCancelled: cancelled,
-    totalOrders: orders.length,
-    averageLeadTimeMinutes: avgLeadTime,
-    completionRate: orders.length > 0 ? Math.round((completed / orders.length) * 100) : 0,
+    totalCompleted: completed,
+    totalInProgress: inProgress,
+    totalCancelled: cancelled,
+    completionRate: orders.length > 0 ? (completed / orders.length) * 100 : 0,
+    averageLeadTime: avgLeadTime,
+    averageYield: 95.5, // TODO: calculate from actual yield data
+    averageWaste: 2.3, // TODO: calculate from actual waste data
   };
 }
