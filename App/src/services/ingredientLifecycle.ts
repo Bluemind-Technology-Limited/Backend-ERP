@@ -230,7 +230,7 @@ export async function completeProductionAndProcessWaste(data: {
   await prisma.$transaction(async (tx) => {
     for (const ing of order.productionIngredients) {
       // 1. Post PROD_CONSUMPTION for all released quantity
-      if (ing.releasedQuantity > 0) {
+      if (Number(ing.releasedQuantity) > 0) {
         await postLedgerEntry(tx, {
           eventType: LedgerEventType.PROD_CONSUMPTION,
           materialId: ing.materialId,
@@ -246,7 +246,7 @@ export async function completeProductionAndProcessWaste(data: {
       }
 
       // 2. Post WASTE for returned quantity
-      if (ing.returnedQuantity > 0) {
+      if (Number(ing.returnedQuantity) > 0) {
         await postLedgerEntry(tx, {
           eventType: LedgerEventType.WASTE,
           materialId: ing.materialId,
@@ -262,14 +262,14 @@ export async function completeProductionAndProcessWaste(data: {
       }
 
       // 3. Post PROD_OUTPUT for finished batch
-      if (order.finishedBatchId && order.actualYield) {
+      if (order.finishedBatchId && order.actualYield && order.bom?.finishedSkuId) {
         await postLedgerEntry(tx, {
           eventType: LedgerEventType.PROD_OUTPUT,
-          materialId: order.bom?.finishedSkuId,
+          materialId: order.bom.finishedSkuId,
           batchLotId: order.finishedBatchId,
           warehouseId: data.warehouseId,
           quantity: Number(order.actualYield),
-          unitOfMeasure: order.bom?.yieldUnit || 'units',
+          unitOfMeasure: order.bom.yieldUnit || 'units',
           referenceType: 'PRODUCTION_ORDER',
           referenceId: order.id,
           createdById: data.completedById,
