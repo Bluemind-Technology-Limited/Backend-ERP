@@ -46,7 +46,7 @@ router.get(
 
       // Get execution status for each plan
       const plansWithStatus = await Promise.all(
-        plans.map(async (plan) => ({
+        plans.map(async (plan: any) => ({
           ...plan,
           executionStatus: await supervisorProductionService.getPlanExecutionStatus(plan.id),
         }))
