@@ -263,12 +263,12 @@ router.delete("/materials/:id", requirePermission("master_data", "delete"), asyn
       const batchIds = batches.map(b => b.id);
 
       // 2. Get all BOM Versions where this is the finished SKU
-      const bomVersions = await tx.bomVersion.findMany({ where: { finishedSkuId: id }, select: { id: true } });
-      const bomVersionIds = bomVersions.map(bv => bv.id);
+      const boms = await tx.bom.findMany({ where: { materialId: id }, select: { id: true } });
+      const bomIds = boms.map((bom: any) => bom.id);
 
       // 3. Cleanup Production Orders linked to these BOM Versions
       // (ProductionIngredient will be cleaned up in step 4 anyway)
-      await tx.productionOrder.deleteMany({ where: { bomVersionId: { in: bomVersionIds } } });
+      await tx.productionOrder.deleteMany({ where: { bomId: { in: bomIds } } });
 
       // 4. Cleanup references in other Production Orders (where this material was a finished batch)
       await tx.productionOrder.updateMany({ 
@@ -298,7 +298,7 @@ router.delete("/materials/:id", requirePermission("master_data", "delete"), asyn
       await tx.bomIngredient.deleteMany({ where: { materialId: id } });
 
       // 12. Cleanup BOM versions (where this is the output SKU)
-      await tx.bomVersion.deleteMany({ where: { finishedSkuId: id } });
+      await tx.bom.deleteMany({ where: { materialId: id } });
 
       // 13. Cleanup Material Supplier links
       await tx.materialSupplier.deleteMany({ where: { materialId: id } });
