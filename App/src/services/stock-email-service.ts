@@ -133,7 +133,7 @@ export async function sendDailyStockEmail() {
         to: user.email,
         subject: `Daily Stock Report - ${alertItems.length} Alert(s) 📦`,
         html: emailHTML,
-        replyTo: "inventory@kibgroup.com",
+        reply_to: "inventory@kibgroup.com",
       })
     );
 
