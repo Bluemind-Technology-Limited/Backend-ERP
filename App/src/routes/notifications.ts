@@ -1,7 +1,7 @@
 import { Router, type Request, type Response } from "express";
 import { requireAuth } from "../middleware/auth.js";
 import { prisma } from "../lib/db.js";
-import { generateNotifications } from "../services/notifications.js";
+import { generateNotifications, checkMinimumQuantities, generateDailyDigest } from "../services/notifications.js";
 
 const router: Router = Router();
 router.use(requireAuth);
@@ -42,6 +42,49 @@ router.get("/", async (req: Request, res: Response) => {
 });
 
 /**
+ * GET /notifications/alerts — Get all LOW_STOCK_ALERT notifications for current user.
+ * Paginated with limit/offset.
+ */
+router.get("/alerts", async (req: Request, res: Response) => {
+  try {
+    const limit = Math.min(Number(req.query.limit) || 50, 200);
+    const offset = Number(req.query.offset) || 0;
+
+    const [alerts, total] = await Promise.all([
+      prisma.notification.findMany({
+        where: {
+          userId: req.user!.id,
+          notificationType: "LOW_STOCK_ALERT",
+        },
+        orderBy: { createdAt: "desc" },
+        take: limit,
+        skip: offset,
+      }),
+      prisma.notification.count({
+        where: {
+          userId: req.user!.id,
+          notificationType: "LOW_STOCK_ALERT",
+        },
+      }),
+    ]);
+
+    const unreadCount = alerts.filter((n) => !n.isRead).length;
+
+    res.json({
+      alerts,
+      total,
+      unreadCount,
+      limit,
+      offset,
+      hasMore: offset + limit < total,
+    });
+  } catch (error) {
+    console.error("GET /notifications/alerts error:", error);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+/**
  * POST /notifications/:id/read — mark a single notification as read.
  */
 router.post("/:id/read", async (req: Request, res: Response) => {
@@ -69,6 +112,20 @@ router.post("/read-all", async (req: Request, res: Response) => {
     res.json({ ok: true, updated: result.count });
   } catch (error) {
     console.error("POST /notifications/read-all error:", error);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+/**
+ * GET /notifications/digest — Get daily digest of low-stock alerts.
+ * Shows all materials below minimum for current user's viewing.
+ */
+router.get("/digest", async (req: Request, res: Response) => {
+  try {
+    const digest = await generateDailyDigest();
+    res.json({ digest });
+  } catch (error) {
+    console.error("GET /notifications/digest error:", error);
     res.status(500).json({ error: "Database error" });
   }
 });

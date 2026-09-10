@@ -4,110 +4,531 @@ import { requirePermission } from "../middleware/rbac.js";
 import { prisma } from "../lib/db.js";
 import { postLedgerEntry } from "../lib/ledger.js";
 import { LedgerEventType, ProductionOrderStatus } from "@prisma/client";
+import {
+  createBatchFormulation,
+  getBatchFormulations,
+  getBatchFormulation,
+  updateBatchFormulation,
+  addIngredient,
+  removeIngredient,
+  approveBatchFormulation,
+  archiveBatchFormulation,
+  duplicateBatchFormulation,
+} from "../services/batchFormulation.js";
+import {
+  createProductionPlan,
+  getProductionPlans,
+  getProductionPlan,
+  addFormulationToPlan,
+  removeFormulationFromPlan,
+  aggregateIngredientsForPlan,
+  getPlanAggregatedIngredients,
+  scheduleProductionPlan,
+  startProductionPlan,
+  completeProductionPlan,
+  cancelProductionPlan,
+} from "../services/productionPlan.js";
+import * as ingredientLifecycle from "../services/ingredientLifecycle.js";
 
 const router: Router = Router();
 router.use(requireAuth);
 
 // ---------------------------------------------------------------------------
-// BOM / Recipes (version-controlled)
+// Batch Formulations (BOM - simplified, no versioning)
 // ---------------------------------------------------------------------------
 
-router.get("/boms", requirePermission("production", "read"), async (_req: Request, res: Response) => {
-  try {
-    const boms = await prisma.bom.findMany({
-      include: {
-        versions: {
-          orderBy: { version: "desc" },
-          include: {
-            finishedSku: { select: { id: true, name: true, sku: true } },
-            ingredients: {
-              include: { material: { select: { id: true, name: true, sku: true, type: true, unitOfMeasure: true } } },
-            },
-          },
-        },
-      },
-      orderBy: { updatedAt: "desc" },
-    });
-    res.json({ boms });
-  } catch (error) {
-    console.error("GET /production/boms error:", error);
-    res.status(500).json({ error: "Database error" });
+/**
+ * GET /batch-formulations — Get all batch formulations
+ */
+router.get(
+  "/batch-formulations",
+  requirePermission("production", "read"),
+  async (req: Request, res: Response) => {
+    try {
+      const { status, search, finishedSkuId } = req.query;
+      const boms = await getBatchFormulations({
+        status: status ? String(status) : undefined,
+        search: search ? String(search) : undefined,
+        finishedSkuId: finishedSkuId ? String(finishedSkuId) : undefined,
+      });
+      res.json({ batchFormulations: boms });
+    } catch (error) {
+      console.error("GET /production/batch-formulations error:", error);
+      res.status(500).json({ error: "Database error" });
+    }
   }
+);
+
+/**
+ * POST /batch-formulations — Create new batch formulation
+ */
+router.post(
+  "/batch-formulations",
+  requirePermission("production", "create"),
+  async (req: Request, res: Response) => {
+    try {
+      const { productName, description, expectedYield, yieldUnit, finishedSkuId, ingredients } = req.body;
+
+      if (!productName || !finishedSkuId || expectedYield === undefined || !yieldUnit) {
+        return res.status(400).json({
+          error: "productName, finishedSkuId, expectedYield, and yieldUnit are required",
+        });
+      }
+
+      if (!Array.isArray(ingredients) || ingredients.length === 0) {
+        return res.status(400).json({ error: "At least one ingredient is required" });
+      }
+
+      const bom = await createBatchFormulation({
+        productName,
+        description,
+        expectedYield: Number(expectedYield),
+        yieldUnit,
+        finishedSkuId,
+        ingredients: ingredients.map((ing: any) => ({
+          materialId: ing.materialId,
+          quantity: Number(ing.quantity),
+          unitOfMeasure: ing.unitOfMeasure,
+          isPercentage: ing.isPercentage ?? false,
+        })),
+        createdById: req.user!.id,
+      });
+
+      res.status(201).json({ batchFormulation: bom });
+    } catch (error: any) {
+      console.error("POST /production/batch-formulations error:", error);
+      res.status(500).json({ error: error?.message || "Database error" });
+    }
+  }
+);
+
+/**
+ * GET /batch-formulations/:id — Get single batch formulation
+ */
+router.get(
+  "/batch-formulations/:id",
+  requirePermission("production", "read"),
+  async (req: Request, res: Response) => {
+    try {
+      const bom = await getBatchFormulation(req.params.id);
+      res.json({ batchFormulation: bom });
+    } catch (error: any) {
+      if (error?.message?.includes("not found")) {
+        return res.status(404).json({ error: error.message });
+      }
+      console.error("GET /production/batch-formulations/:id error:", error);
+      res.status(500).json({ error: "Database error" });
+    }
+  }
+);
+
+/**
+ * PATCH /batch-formulations/:id — Update batch formulation (DRAFT only)
+ */
+router.patch(
+  "/batch-formulations/:id",
+  requirePermission("production", "update"),
+  async (req: Request, res: Response) => {
+    try {
+      const { productName, description, expectedYield, yieldUnit } = req.body;
+
+      const bom = await updateBatchFormulation(req.params.id, {
+        productName,
+        description,
+        expectedYield: expectedYield !== undefined ? Number(expectedYield) : undefined,
+        yieldUnit,
+        updatedById: req.user!.id,
+      });
+
+      res.json({ batchFormulation: bom });
+    } catch (error: any) {
+      if (error?.message?.includes("not found") || error?.message?.includes("Cannot update")) {
+        return res.status(400).json({ error: error.message });
+      }
+      console.error("PATCH /production/batch-formulations/:id error:", error);
+      res.status(500).json({ error: error?.message || "Database error" });
+    }
+  }
+);
+
+/**
+ * POST /batch-formulations/:id/ingredients — Add ingredient
+ */
+router.post(
+  "/batch-formulations/:id/ingredients",
+  requirePermission("production", "update"),
+  async (req: Request, res: Response) => {
+    try {
+      const { materialId, quantity, unitOfMeasure, isPercentage } = req.body;
+
+      if (!materialId || quantity === undefined || !unitOfMeasure) {
+        return res.status(400).json({ error: "materialId, quantity, and unitOfMeasure are required" });
+      }
+
+      const ingredient = await addIngredient(
+        req.params.id,
+        materialId,
+        Number(quantity),
+        unitOfMeasure,
+        isPercentage ?? false
+      );
+
+      res.status(201).json({ ingredient });
+    } catch (error: any) {
+      if (error?.message?.includes("not found") || error?.message?.includes("Cannot add")) {
+        return res.status(400).json({ error: error.message });
+      }
+      console.error("POST /production/batch-formulations/:id/ingredients error:", error);
+      res.status(500).json({ error: error?.message || "Database error" });
+    }
+  }
+);
+
+/**
+ * DELETE /batch-formulations/ingredients/:ingredientId — Remove ingredient
+ */
+router.delete(
+  "/batch-formulations/ingredients/:ingredientId",
+  requirePermission("production", "update"),
+  async (req: Request, res: Response) => {
+    try {
+      const result = await removeIngredient(req.params.ingredientId);
+      res.json(result);
+    } catch (error: any) {
+      if (error?.message?.includes("not found") || error?.message?.includes("Cannot remove")) {
+        return res.status(400).json({ error: error.message });
+      }
+      console.error("DELETE /production/batch-formulations/ingredients/:id error:", error);
+      res.status(500).json({ error: error?.message || "Database error" });
+    }
+  }
+);
+
+/**
+ * POST /batch-formulations/:id/approve — Approve batch formulation (DRAFT → ACTIVE)
+ */
+router.post(
+  "/batch-formulations/:id/approve",
+  requirePermission("production", "approve"),
+  async (req: Request, res: Response) => {
+    try {
+      const bom = await approveBatchFormulation(req.params.id, req.user!.id);
+      res.json({ batchFormulation: bom, message: `Batch formulation approved` });
+    } catch (error: any) {
+      if (error?.message?.includes("not found") || error?.message?.includes("Cannot approve")) {
+        return res.status(400).json({ error: error.message });
+      }
+      console.error("POST /production/batch-formulations/:id/approve error:", error);
+      res.status(500).json({ error: error?.message || "Database error" });
+    }
+  }
+);
+
+/**
+ * POST /batch-formulations/:id/archive — Archive batch formulation
+ */
+router.post(
+  "/batch-formulations/:id/archive",
+  requirePermission("production", "update"),
+  async (req: Request, res: Response) => {
+    try {
+      const bom = await archiveBatchFormulation(req.params.id);
+      res.json({ batchFormulation: bom, message: "Batch formulation archived" });
+    } catch (error: any) {
+      if (error?.message?.includes("not found") || error?.message?.includes("already archived")) {
+        return res.status(400).json({ error: error.message });
+      }
+      console.error("POST /production/batch-formulations/:id/archive error:", error);
+      res.status(500).json({ error: error?.message || "Database error" });
+    }
+  }
+);
+
+/**
+ * POST /batch-formulations/:id/duplicate — Duplicate batch formulation
+ */
+router.post(
+  "/batch-formulations/:id/duplicate",
+  requirePermission("production", "create"),
+  async (req: Request, res: Response) => {
+    try {
+      const { newProductName } = req.body;
+
+      if (!newProductName) {
+        return res.status(400).json({ error: "newProductName is required" });
+      }
+
+      const bom = await duplicateBatchFormulation(
+        req.params.id,
+        newProductName,
+        req.user!.id
+      );
+
+      res.status(201).json({ batchFormulation: bom, message: "Batch formulation duplicated" });
+    } catch (error: any) {
+      if (error?.message?.includes("not found")) {
+        return res.status(404).json({ error: error.message });
+      }
+      console.error("POST /production/batch-formulations/:id/duplicate error:", error);
+      res.status(500).json({ error: error?.message || "Database error" });
+    }
+  }
+);
+
+/**
+ * DELETE /batch-formulations/:id — Delete batch formulation
+ */
+router.delete(
+  "/batch-formulations/:id",
+  requirePermission("production", "delete"),
+  async (req: Request, res: Response) => {
+    try {
+      await prisma.bom.delete({ where: { id: req.params.id } });
+      res.json({ ok: true });
+    } catch (error: any) {
+      if (error?.code === "P2025") {
+        return res.status(404).json({ error: "Batch formulation not found" });
+      }
+      console.error("DELETE /production/batch-formulations/:id error:", error);
+      res.status(500).json({ error: "Database error" });
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Production Plans (Multi-Product Planning)
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /production-plans — Get all production plans
+ */
+router.get(
+  "/production-plans",
+  requirePermission("production", "read"),
+  async (req: Request, res: Response) => {
+    try {
+      const { status, search } = req.query;
+      const plans = await getProductionPlans({
+        status: status ? String(status) : undefined,
+        search: search ? String(search) : undefined,
+      });
+      res.json({ productionPlans: plans });
+    } catch (error) {
+      console.error("GET /production/production-plans error:", error);
+      res.status(500).json({ error: "Database error" });
+    }
+  }
+);
+
+/**
+ * POST /production-plans — Create new production plan
+ */
+router.post(
+  "/production-plans",
+  requirePermission("production", "create"),
+  async (req: Request, res: Response) => {
+    try {
+      const { description, scheduledFor } = req.body;
+
+      const plan = await createProductionPlan({
+        description,
+        scheduledFor: scheduledFor ? new Date(scheduledFor) : undefined,
+        createdById: req.user!.id,
+      });
+
+      res.status(201).json({ productionPlan: plan });
+    } catch (error: any) {
+      console.error("POST /production/production-plans error:", error);
+      res.status(500).json({ error: error?.message || "Database error" });
+    }
+  }
+);
+
+/**
+ * GET /production-plans/:id — Get single production plan with all details
+ */
+router.get(
+  "/production-plans/:id",
+  requirePermission("production", "read"),
+  async (req: Request, res: Response) => {
+    try {
+      const plan = await getProductionPlan(req.params.id);
+      res.json({ productionPlan: plan });
+    } catch (error: any) {
+      if (error?.message?.includes("not found")) {
+        return res.status(404).json({ error: error.message });
+      }
+      console.error("GET /production/production-plans/:id error:", error);
+      res.status(500).json({ error: "Database error" });
+    }
+  }
+);
+
+/**
+ * POST /production-plans/:id/formulations — Add batch formulation to plan
+ */
+router.post(
+  "/production-plans/:id/formulations",
+  requirePermission("production", "update"),
+  async (req: Request, res: Response) => {
+    try {
+      const { bomId, targetQuantity, sequence } = req.body;
+
+      if (!bomId || targetQuantity === undefined) {
+        return res.status(400).json({ error: "bomId and targetQuantity are required" });
+      }
+
+      const item = await addFormulationToPlan(
+        req.params.id,
+        bomId,
+        Number(targetQuantity),
+        sequence ? Number(sequence) : undefined
+      );
+
+      res.status(201).json({ item, message: "Formulation added to production plan" });
+    } catch (error: any) {
+      if (error?.message?.includes("not found") || error?.message?.includes("Cannot modify")) {
+        return res.status(400).json({ error: error.message });
+      }
+      console.error("POST /production/production-plans/:id/formulations error:", error);
+      res.status(500).json({ error: error?.message || "Database error" });
+    }
+  }
+);
+
+/**
+ * DELETE /production-plans/:id/formulations/:itemId — Remove formulation from plan
+ */
+router.delete(
+  "/production-plans/:planId/formulations/:itemId",
+  requirePermission("production", "update"),
+  async (req: Request, res: Response) => {
+    try {
+      const result = await removeFormulationFromPlan(req.params.planId, req.params.itemId);
+      res.json({ ...result, message: "Formulation removed from production plan" });
+    } catch (error: any) {
+      if (error?.message?.includes("not found") || error?.message?.includes("Cannot modify")) {
+        return res.status(400).json({ error: error.message });
+      }
+      console.error("DELETE /production/production-plans/:planId/formulations/:itemId error:", error);
+      res.status(500).json({ error: error?.message || "Database error" });
+    }
+  }
+);
+
+/**
+ * GET /production-plans/:id/aggregated-ingredients — Get aggregated ingredients for plan
+ */
+router.get(
+  "/production-plans/:id/aggregated-ingredients",
+  requirePermission("production", "read"),
+  async (req: Request, res: Response) => {
+    try {
+      const ingredients = await getPlanAggregatedIngredients(req.params.id);
+      res.json({ aggregatedIngredients: ingredients });
+    } catch (error: any) {
+      console.error("GET /production/production-plans/:id/aggregated-ingredients error:", error);
+      res.status(500).json({ error: error?.message || "Database error" });
+    }
+  }
+);
+
+/**
+ * POST /production-plans/:id/schedule — Schedule production plan (DRAFT → SCHEDULED)
+ */
+router.post(
+  "/production-plans/:id/schedule",
+  requirePermission("production", "update"),
+  async (req: Request, res: Response) => {
+    try {
+      const { scheduledFor } = req.body;
+
+      if (!scheduledFor) {
+        return res.status(400).json({ error: "scheduledFor date is required" });
+      }
+
+      const plan = await scheduleProductionPlan(req.params.id, new Date(scheduledFor));
+      res.json({ productionPlan: plan, message: "Production plan scheduled" });
+    } catch (error: any) {
+      if (error?.message?.includes("not found") || error?.message?.includes("Cannot schedule")) {
+        return res.status(400).json({ error: error.message });
+      }
+      console.error("POST /production/production-plans/:id/schedule error:", error);
+      res.status(500).json({ error: error?.message || "Database error" });
+    }
+  }
+);
+
+/**
+ * POST /production-plans/:id/start — Start production (SCHEDULED → IN_PROGRESS)
+ */
+router.post(
+  "/production-plans/:id/start",
+  requirePermission("production", "update"),
+  async (req: Request, res: Response) => {
+    try {
+      const plan = await startProductionPlan(req.params.id);
+      res.json({ productionPlan: plan, message: "Production plan started" });
+    } catch (error: any) {
+      if (error?.message?.includes("not found") || error?.message?.includes("Can only start")) {
+        return res.status(400).json({ error: error.message });
+      }
+      console.error("POST /production/production-plans/:id/start error:", error);
+      res.status(500).json({ error: error?.message || "Database error" });
+    }
+  }
+);
+
+/**
+ * POST /production-plans/:id/complete — Complete production (IN_PROGRESS → COMPLETED)
+ */
+router.post(
+  "/production-plans/:id/complete",
+  requirePermission("production", "update"),
+  async (req: Request, res: Response) => {
+    try {
+      const plan = await completeProductionPlan(req.params.id);
+      res.json({ productionPlan: plan, message: "Production plan completed" });
+    } catch (error: any) {
+      if (error?.message?.includes("not found") || error?.message?.includes("Can only complete")) {
+        return res.status(400).json({ error: error.message });
+      }
+      console.error("POST /production/production-plans/:id/complete error:", error);
+      res.status(500).json({ error: error?.message || "Database error" });
+    }
+  }
+);
+
+/**
+ * POST /production-plans/:id/cancel — Cancel production plan
+ */
+router.post(
+  "/production-plans/:id/cancel",
+  requirePermission("production", "update"),
+  async (req: Request, res: Response) => {
+    try {
+      const plan = await cancelProductionPlan(req.params.id);
+      res.json({ productionPlan: plan, message: "Production plan cancelled" });
+    } catch (error: any) {
+      if (error?.message?.includes("not found") || error?.message?.includes("Cannot cancel")) {
+        return res.status(400).json({ error: error.message });
+      }
+      console.error("POST /production/production-plans/:id/cancel error:", error);
+      res.status(500).json({ error: error?.message || "Database error" });
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Legacy BOM endpoints (for backward compatibility) - redirect to batch-formulations
+// ---------------------------------------------------------------------------
+
+router.get("/boms", requirePermission("production", "read"), async (req: Request, res: Response) => {
+  res.redirect(307, "/api/production/batch-formulations");
 });
 
 router.post("/boms", requirePermission("production", "create"), async (req: Request, res: Response) => {
-  try {
-    const { productName, description, version, expectedYield, yieldUnit, finishedSkuId, ingredients } = req.body;
-    if (!productName || !finishedSkuId || !expectedYield || !yieldUnit) {
-      return res.status(400).json({ error: "productName, finishedSkuId, expectedYield and yieldUnit are required" });
-    }
-    if (!Array.isArray(ingredients) || ingredients.length === 0) {
-      return res.status(400).json({ error: "At least one ingredient is required" });
-    }
-
-    const bom = await prisma.$transaction(async (tx) => {
-      const created = await tx.bom.create({
-        data: { productName, description: description ?? null },
-      });
-      await tx.bomVersion.create({
-        data: {
-          bomId: created.id,
-          version: version ?? 1,
-          description: description ?? null,
-          expectedYield: Number(expectedYield),
-          yieldUnit,
-          finishedSkuId,
-          ingredients: {
-            create: ingredients.map((ing: any) => ({
-              materialId: ing.materialId,
-              quantity: Number(ing.quantity),
-              unitOfMeasure: ing.unitOfMeasure,
-              isPercentage: ing.isPercentage ?? false,
-            })),
-          },
-        },
-      });
-      return created;
-    });
-
-    res.status(201).json({ bom });
-  } catch (error) {
-    console.error("POST /production/boms error:", error);
-    res.status(500).json({ error: "Database error" });
-  }
-});
-
-/**
- * DELETE /boms/:id — delete a BOM and all its versions
- */
-router.delete("/boms/:id", requirePermission("production", "delete"), async (req: Request, res: Response) => {
-  try {
-    await prisma.bom.delete({ where: { id: req.params.id } });
-    res.json({ ok: true });
-  } catch (error: any) {
-    if (error?.code === "P2025") {
-      return res.status(404).json({ error: "BOM not found" });
-    }
-    console.error("DELETE /production/boms/:id error:", error);
-    res.status(500).json({ error: "Database error" });
-  }
-});
-
-router.patch("/boms/:id/versions/:version/status", requirePermission("production", "approve"), async (req: Request, res: Response) => {
-  try {
-    const { status } = req.body;
-    if (!["DRAFT", "ACTIVE", "APPROVED", "ARCHIVED"].includes(status)) {
-      return res.status(400).json({ error: "Invalid BOM status" });
-    }
-    const bomVersion = await prisma.bomVersion.update({
-      where: { bomId_version: { bomId: req.params.id, version: Number(req.params.version) } },
-      data: { status },
-    });
-    res.json({ bomVersion });
-  } catch (error) {
-    console.error("PATCH /production/boms/:id/versions/:version/status error:", error);
-    res.status(500).json({ error: "Database error" });
-  }
+  res.redirect(307, "/api/production/batch-formulations");
 });
 
 // ---------------------------------------------------------------------------
@@ -156,7 +577,7 @@ router.get("/production-orders", requirePermission("production", "read"), async 
     const orders = await prisma.productionOrder.findMany({
       where: status ? { status: status as ProductionOrderStatus } : {},
       include: {
-        bomVersion: { include: { bom: true, finishedSku: { select: { name: true, sku: true } } } },
+        bom: { include: { finishedSku: { select: { name: true, sku: true } } } },
         machine: { select: { name: true, code: true } },
         shift: { select: { name: true } },
         createdBy: { select: { fullName: true } },
@@ -182,17 +603,17 @@ router.get("/production-orders", requirePermission("production", "read"), async 
 
 router.post("/production-orders", requirePermission("production", "create"), async (req: Request, res: Response) => {
   try {
-    const { bomVersionId, targetQuantity, scheduledStart, machineId, shiftId } = req.body;
-    if (!bomVersionId || !targetQuantity) {
-      return res.status(400).json({ error: "bomVersionId and targetQuantity are required" });
+    const { bomId, targetQuantity, scheduledStart, machineId, shiftId } = req.body;
+    if (!bomId || !targetQuantity) {
+      return res.status(400).json({ error: "bomId and targetQuantity are required" });
     }
-    const bomVersion = await prisma.bomVersion.findUnique({
-      where: { id: bomVersionId },
+    const bom = await prisma.bom.findUnique({
+      where: { id: bomId },
       include: { ingredients: true },
     });
-    if (!bomVersion) return res.status(404).json({ error: "BOM version not found" });
-    if (bomVersion.status === "DRAFT") {
-      return res.status(400).json({ error: "BOM must be APPROVED/ACTIVE before creating a production order" });
+    if (!bom) return res.status(404).json({ error: "Batch formulation not found" });
+    if (bom.status !== "ACTIVE") {
+      return res.status(400).json({ error: "Batch formulation must be ACTIVE before creating a production order" });
     }
 
     const orderNumber = `PRD-${Date.now().toString().slice(-8)}`;
@@ -201,7 +622,7 @@ router.post("/production-orders", requirePermission("production", "create"), asy
       const order = await tx.productionOrder.create({
         data: {
           orderNumber,
-          bomVersionId,
+          bomId,
           targetQuantity: Number(targetQuantity),
           status: "SCHEDULED",
           scheduledStart: scheduledStart ? new Date(scheduledStart) : null,
@@ -209,14 +630,14 @@ router.post("/production-orders", requirePermission("production", "create"), asy
           shiftId: shiftId ?? null,
           createdById: req.user!.id,
         },
-        include: { bomVersion: true },
+        include: { bom: true },
       });
 
       // Pre-populate ingredients list
-      for (const ing of bomVersion.ingredients) {
-        const scale = Number(targetQuantity) / Number(bomVersion.expectedYield);
+      for (const ing of bom.ingredients) {
+        const scale = Number(targetQuantity) / Number(bom.expectedYield ?? 1);
         const projectedQty = ing.isPercentage
-          ? (Number(ing.quantity) / 100) * scale * Number(bomVersion.expectedYield)
+          ? (Number(ing.quantity) / 100) * scale * Number(bom.expectedYield ?? 1)
           : Number(ing.quantity) * scale;
 
         await tx.productionIngredient.create({
@@ -437,12 +858,12 @@ router.post("/production-orders/:id/complete", requirePermission("production", "
 
     const order = await prisma.productionOrder.findUnique({
       where: { id: req.params.id },
-      include: { bomVersion: true },
+      include: { bom: true },
     });
     if (!order) return res.status(404).json({ error: "Production order not found" });
     if (order.status !== "PROCESSING") return res.status(400).json({ error: "Order must be PROCESSING to complete" });
 
-    const finishedSkuId = order.bomVersion.finishedSkuId;
+    const finishedSkuId = order.bom.finishedSkuId;
     const yieldQty = Number(actualYield);
 
     const targetQty = Number(order.targetQuantity);
@@ -454,7 +875,7 @@ router.post("/production-orders/:id/complete", requirePermission("production", "
     const result = await prisma.$transaction(async (tx) => {
       const batchLot = await tx.batchLot.create({
         data: {
-          materialId: finishedSkuId,
+          materialId: finishedSkuId!,
           batchNumber,
           manufacturingDate: new Date(),
           expiryDate: expiryDate,
@@ -464,11 +885,11 @@ router.post("/production-orders/:id/complete", requirePermission("production", "
 
       await postLedgerEntry(tx, {
         eventType: LedgerEventType.PROD_OUTPUT,
-        materialId: finishedSkuId,
+        materialId: finishedSkuId!,
         batchLotId: batchLot.id,
         warehouseId,
         quantity: yieldQty,
-        unitOfMeasure: order.bomVersion.yieldUnit,
+        unitOfMeasure: order.bom.yieldUnit || "kg",
         referenceType: "PROD_ORDER",
         referenceId: order.id,
         createdById: req.user!.id,
@@ -478,7 +899,7 @@ router.post("/production-orders/:id/complete", requirePermission("production", "
       await tx.inspectionRecord.create({
         data: {
           inspectionType: "FINISHED_BATCH",
-          materialId: finishedSkuId,
+          materialId: finishedSkuId!,
           batchLotId: batchLot.id,
           referenceId: order.id,
           result: "PENDING",
@@ -551,9 +972,8 @@ async function buildTraceTree(batchId: string) {
   const prodOrder = await prisma.productionOrder.findFirst({
     where: { finishedBatchId: batch.id },
     include: {
-      bomVersion: {
+      bom: {
         include: {
-          bom: { select: { id: true, productName: true } },
           ingredients: {
             include: { material: { select: { id: true, name: true, sku: true, type: true } } },
           },
@@ -570,9 +990,8 @@ async function buildTraceTree(batchId: string) {
       targetQuantity: Number(prodOrder.targetQuantity),
       actualYield: prodOrder.actualYield ? Number(prodOrder.actualYield) : null,
       completedAt: prodOrder.actualEnd,
-      bomId: prodOrder.bomVersion.bom.id,
-      bomProductName: prodOrder.bomVersion.bom.productName,
-      bomVersion: prodOrder.bomVersion.version,
+      bomId: prodOrder.bom.id,
+      bomProductName: prodOrder.bom.productName,
     };
 
     // Raw batches consumed by this order (from the immutable ledger)
@@ -587,7 +1006,7 @@ async function buildTraceTree(batchId: string) {
     });
 
     ingredients = await Promise.all(
-      prodOrder.bomVersion.ingredients.map(async (ing) => {
+      prodOrder.bom.ingredients.map(async (ing) => {
         const rawBatchIds = consumption
           .filter((t) => t.materialId === ing.materialId)
           .map((t) => t.batchLotId as string);
@@ -714,5 +1133,167 @@ router.delete("/production-orders/:id", requirePermission("production", "delete"
     res.status(500).json({ error: "Database error" });
   }
 });
+
+// ---------------------------------------------------------------------------
+// Ingredient Lifecycle (Non-Depleting Production Flow)
+// ---------------------------------------------------------------------------
+
+/**
+ * POST /production-orders/:id/ingredients/release — Release ingredients for production.
+ * Transitions from RESERVED → RELEASED when production starts.
+ */
+router.post(
+  "/production-orders/:id/ingredients/release",
+  requirePermission("production", "update"),
+  async (req: Request, res: Response) => {
+    try {
+      const result = await ingredientLifecycle.releaseIngredients({
+        productionOrderId: req.params.id,
+        releasedById: req.user!.id,
+      });
+      res.json({ result });
+    } catch (error: any) {
+      console.error("POST /production/production-orders/:id/ingredients/release error:", error);
+      res.status(500).json({ error: error?.message || "Database error" });
+    }
+  }
+);
+
+/**
+ * PATCH /production-orders/ingredients/:ingredientId/released-quantity — Update released quantity.
+ * Tracks consumption as ingredients are used during production.
+ */
+router.patch(
+  "/production-orders/ingredients/:ingredientId/released-quantity",
+  requirePermission("production", "update"),
+  async (req: Request, res: Response) => {
+    try {
+      const { releasedQuantity } = req.body;
+      if (releasedQuantity === undefined) {
+        return res.status(400).json({ error: "releasedQuantity is required" });
+      }
+
+      const ingredient = await ingredientLifecycle.updateReleasedQuantity({
+        ingredientId: req.params.ingredientId,
+        releasedQuantity: Number(releasedQuantity),
+        updatedById: req.user!.id,
+      });
+
+      res.json({ ingredient });
+    } catch (error: any) {
+      console.error("PATCH /production/production-orders/ingredients/:ingredientId/released-quantity error:", error);
+      res.status(500).json({ error: error?.message || "Database error" });
+    }
+  }
+);
+
+/**
+ * POST /production-orders/:id/ingredients/return — Return unused ingredients.
+ * Called on production order completion to calculate returned/waste quantities.
+ */
+router.post(
+  "/production-orders/:id/ingredients/return",
+  requirePermission("production", "update"),
+  async (req: Request, res: Response) => {
+    try {
+      const result = await ingredientLifecycle.returnIngredients({
+        productionOrderId: req.params.id,
+        returnedById: req.user!.id,
+      });
+      res.json({ result });
+    } catch (error: any) {
+      console.error("POST /production/production-orders/:id/ingredients/return error:", error);
+      res.status(500).json({ error: error?.message || "Database error" });
+    }
+  }
+);
+
+/**
+ * GET /production-orders/:id/ingredients/lifecycle-status — Get ingredient lifecycle status.
+ */
+router.get(
+  "/production-orders/:id/ingredients/lifecycle-status",
+  requirePermission("production", "read"),
+  async (req: Request, res: Response) => {
+    try {
+      const status = await ingredientLifecycle.getIngredientLifecycleStatus(req.params.id);
+      res.json({ status });
+    } catch (error: any) {
+      console.error("GET /production/production-orders/:id/ingredients/lifecycle-status error:", error);
+      res.status(500).json({ error: error?.message || "Database error" });
+    }
+  }
+);
+
+/**
+ * GET /production-orders/:id/waste-metrics — Get waste and efficiency metrics.
+ */
+router.get(
+  "/production-orders/:id/waste-metrics",
+  requirePermission("production", "read"),
+  async (req: Request, res: Response) => {
+    try {
+      const metrics = await ingredientLifecycle.calculateWasteMetrics(req.params.id);
+      res.json({ metrics });
+    } catch (error: any) {
+      console.error("GET /production/production-orders/:id/waste-metrics error:", error);
+      res.status(500).json({ error: error?.message || "Database error" });
+    }
+  }
+);
+
+/**
+ * POST /production-orders/:id/complete — Complete production order with waste calculation.
+ * Key endpoint that:
+ *   1. Calls completeProductionAndProcessWaste()
+ *   2. Posts all ledger entries (PROD_CONSUMPTION, WASTE, PROD_OUTPUT)
+ *   3. Marks order as COMPLETED
+ *   4. Finalizes ingredient lifecycle
+ */
+router.post(
+  "/production-orders/:id/complete",
+  requirePermission("production", "update"),
+  async (req: Request, res: Response) => {
+    try {
+      const { warehouseId } = req.body;
+      if (!warehouseId) {
+        return res.status(400).json({ error: "warehouseId is required" });
+      }
+
+      const order = await prisma.productionOrder.findUnique({
+        where: { id: req.params.id },
+      });
+
+      if (!order) {
+        return res.status(404).json({ error: "Production order not found" });
+      }
+
+      // First return any unused ingredients
+      await ingredientLifecycle.returnIngredients({
+        productionOrderId: req.params.id,
+        returnedById: req.user!.id,
+      });
+
+      // Then complete and process waste/consumption
+      const result = await ingredientLifecycle.completeProductionAndProcessWaste({
+        productionOrderId: req.params.id,
+        warehouseId,
+        completedById: req.user!.id,
+      });
+
+      // Get final waste metrics
+      const metrics = await ingredientLifecycle.calculateWasteMetrics(req.params.id);
+
+      res.json({
+        order: result,
+        metrics,
+        message: `Production order ${order.orderNumber} completed with ${metrics.wastePercentage}% waste`,
+      });
+    } catch (error: any) {
+      console.error("POST /production/production-orders/:id/complete error:", error);
+      res.status(500).json({ error: error?.message || "Database error" });
+    }
+  }
+);
 
 export default router;
