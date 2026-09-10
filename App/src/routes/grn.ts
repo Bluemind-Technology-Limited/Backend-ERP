@@ -283,4 +283,121 @@ router.post("/consignment", requirePermission("procurement", "create"), async (r
   }
 });
 
+/**
+ * DELETE /grn/:grnId
+ * Delete a goods receipt (all statuses allowed)
+ * Removes ledger entries and related records
+ */
+router.delete("/:grnId", requirePermission("procurement", "delete"), async (req: Request, res: Response) => {
+  try {
+    const { grnId } = req.params;
+
+    const grn = await prisma.goodsReceipt.findUnique({
+      where: { id: grnId },
+      include: { items: true },
+    });
+
+    if (!grn) {
+      return res.status(404).json({ error: "Goods receipt not found" });
+    }
+
+    // Delete in transaction to maintain data integrity
+    await prisma.$transaction(async (tx) => {
+      // 1. Delete ledger entries for this GRN
+      await tx.inventoryTransaction.deleteMany({
+        where: {
+          referenceType: "PO_RECEIPT",
+          referenceId: grnId,
+        },
+      });
+
+      // 2. Get GRN items to calculate received quantity reversal
+      const grnItems = await tx.goodsReceiptItem.findMany({
+        where: { grnId },
+      });
+
+      // 3. Update PO items to reduce received quantity
+      if (grn.poId) {
+        for (const item of grnItems) {
+          // Find the PO item by material and update receivedQty
+          const poItem = await tx.purchaseOrderItem.findFirst({
+            where: {
+              poId: grn.poId,
+              materialId: item.materialId,
+            },
+          });
+
+          if (poItem) {
+            await tx.purchaseOrderItem.update({
+              where: { id: poItem.id },
+              data: {
+                receivedQty: {
+                  decrement: Number(item.quantity),
+                },
+              },
+            });
+          }
+        }
+      }
+
+      // 4. Delete GRN items
+      await tx.goodsReceiptItem.deleteMany({
+        where: { grnId },
+      });
+
+      // 5. Delete inspection records for this GRN
+      await tx.inspectionRecord.deleteMany({
+        where: {
+          inspectionType: "GRN",
+          referenceId: grnId,
+        },
+      });
+
+      // 6. If PO exists, check if we need to update its status
+      if (grn.poId) {
+        const po = await tx.purchaseOrder.findUnique({
+          where: { id: grn.poId },
+          include: { items: true },
+        });
+
+        if (po) {
+          // Calculate total received quantity for the PO
+          const totalReceived = po.items.reduce((sum, item) => sum + Number(item.receivedQty || 0), 0);
+          const totalQuantity = po.items.reduce((sum, item) => sum + Number(item.quantity), 0);
+
+          // Update PO status based on receipt progress
+          let newStatus = po.status;
+          if (totalReceived === 0) {
+            newStatus = "DRAFT"; // No items received, back to DRAFT
+          } else if (totalReceived < totalQuantity) {
+            newStatus = "PARTIAL"; // Some items received
+          }
+
+          if (newStatus !== po.status) {
+            await tx.purchaseOrder.update({
+              where: { id: grn.poId },
+              data: { status: newStatus },
+            });
+          }
+        }
+      }
+
+      // 7. Delete the GRN itself
+      await tx.goodsReceipt.delete({
+        where: { id: grnId },
+      });
+    });
+
+    res.json({ success: true, message: "Goods receipt deleted successfully" });
+  } catch (error: any) {
+    console.error("DELETE /grn/:grnId error:", error);
+    
+    if (error.message.includes("not found")) {
+      return res.status(404).json({ error: error.message });
+    }
+    
+    res.status(500).json({ error: error?.message || "Failed to delete goods receipt" });
+  }
+});
+
 export default router;

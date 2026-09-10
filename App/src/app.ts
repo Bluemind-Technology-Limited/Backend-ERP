@@ -3,6 +3,7 @@ import express, { type Express, type Request, type Response } from "express";
 import cors from "cors";
 import { prisma } from "./lib/db.js";
 import apiRouter from "./routes/index.js";
+import { activityLoggerMiddleware } from "./middleware/activityLogger.js";
 
 /**
  * Express app — created here (without app.listen) so the same instance can be
@@ -14,6 +15,7 @@ export const app: Express = express();
 // Middleware
 app.use(cors());
 app.use(express.json());
+app.use(activityLoggerMiddleware());
 
 // Basic root check
 app.get("/", (req: Request, res: Response) => {

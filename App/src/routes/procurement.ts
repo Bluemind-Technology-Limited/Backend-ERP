@@ -210,6 +210,7 @@ router.delete("/requisitions/:id", requirePermission("procurement", "delete"), a
   try {
     const requisition = await prisma.requisition.findUnique({
       where: { id: req.params.id },
+      include: { items: true },
     });
     if (!requisition) {
       return res.status(404).json({ error: "Requisition not found" });
@@ -217,8 +218,21 @@ router.delete("/requisitions/:id", requirePermission("procurement", "delete"), a
     if (requisition.status !== "DRAFT") {
       return res.status(409).json({ error: "Can only delete DRAFT requisitions" });
     }
-    await prisma.requisition.delete({ where: { id: req.params.id } });
-    res.json({ ok: true });
+
+    // Delete in transaction to maintain integrity
+    await prisma.$transaction(async (tx) => {
+      // 1. Delete requisition items
+      await tx.requisitionItem.deleteMany({
+        where: { requisitionId: req.params.id },
+      });
+
+      // 2. Delete the requisition
+      await tx.requisition.delete({
+        where: { id: req.params.id },
+      });
+    });
+
+    res.json({ ok: true, message: "Requisition deleted successfully" });
   } catch (error: any) {
     console.error("DELETE /procurement/requisitions/:id error:", error);
     res.status(500).json({ error: "Database error" });
@@ -226,21 +240,40 @@ router.delete("/requisitions/:id", requirePermission("procurement", "delete"), a
 });
 
 /**
- * DELETE /purchase-orders/:id — delete a purchase order (only DRAFT status)
+ * DELETE /purchase-orders/:id — delete a purchase order (DRAFT or CLOSED status)
  */
 router.delete("/purchase-orders/:id", requirePermission("procurement", "delete"), async (req: Request, res: Response) => {
   try {
     const purchaseOrder = await prisma.purchaseOrder.findUnique({
       where: { id: req.params.id },
+      include: { items: true },
     });
     if (!purchaseOrder) {
       return res.status(404).json({ error: "Purchase order not found" });
     }
-    if (purchaseOrder.status !== "DRAFT") {
-      return res.status(409).json({ error: "Can only delete DRAFT purchase orders" });
+    
+    // Only allow deletion of DRAFT (not yet sent) or CLOSED (finished) orders
+    const allowedStatuses = ["DRAFT", "CLOSED"];
+    if (!allowedStatuses.includes(purchaseOrder.status)) {
+      return res.status(409).json({ 
+        error: `Can only delete DRAFT or CLOSED purchase orders. Current status: ${purchaseOrder.status}` 
+      });
     }
-    await prisma.purchaseOrder.delete({ where: { id: req.params.id } });
-    res.json({ ok: true });
+
+    // Delete in transaction to maintain integrity
+    await prisma.$transaction(async (tx) => {
+      // 1. Delete purchase order items
+      await tx.purchaseOrderItem.deleteMany({
+        where: { poId: req.params.id },
+      });
+
+      // 2. Delete the purchase order
+      await tx.purchaseOrder.delete({
+        where: { id: req.params.id },
+      });
+    });
+
+    res.json({ ok: true, message: "Purchase order deleted successfully" });
   } catch (error: any) {
     console.error("DELETE /procurement/purchase-orders/:id error:", error);
     res.status(500).json({ error: "Database error" });
@@ -547,5 +580,37 @@ router.get("/consignments/items/:itemId/distribution-status", requirePermission(
     res.status(500).json({ error: "Database error" });
   }
 });
+
+/**
+ * DELETE /consignments/:id
+ * Delete a consignment (only DRAFT, RECEIVED, or QUALITY_PENDING)
+ */
+router.delete(
+  "/consignments/:id",
+  requirePermission("procurement", "delete"),
+  async (req: Request, res: Response) => {
+    try {
+      const { id } = req.params;
+
+      if (!id) {
+        return res.status(400).json({ error: "Consignment ID is required" });
+      }
+
+      const result = await consignmentService.deleteConsignment(id);
+      res.json(result);
+    } catch (error: any) {
+      console.error("DELETE /consignments/:id error:", error);
+
+      if (error.message.includes("not found")) {
+        return res.status(404).json({ error: error.message });
+      }
+      if (error.message.includes("Cannot delete")) {
+        return res.status(403).json({ error: error.message });
+      }
+
+      res.status(500).json({ error: error?.message || "Failed to delete consignment" });
+    }
+  }
+);
 
 export default router;

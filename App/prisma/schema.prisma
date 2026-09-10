@@ -19,8 +19,11 @@ enum UserRole {
   EXECUTIVE_ADMIN // dashboards, KPIs, approves high-value adjustments
   STORE_OFFICER // requisitions, GRN receiving, issues to production, transfers
   PRODUCTION_MANAGER // BOMs, production orders, machines/staff allocation
+  PRODUCTION_SUPERVISOR // views plans, allocates batches to machines, reconciles daily output
   PROCUREMENT_OFFICER // suppliers, requisition -> purchase orders
   QA_INSPECTOR // block/release batches, lab tests, GRN approval
+  OPERATOR // operates machines, logs breakdowns, records performance
+  TECHNICIAN // maintains machines, manages spare parts, resolves breakdowns
 }
 
 enum MaterialType {
@@ -88,8 +91,28 @@ enum ConsignmentStatus {
   READY_FOR_SHIPMENT
   IN_TRANSIT
   RECEIVED
+  QUALITY_PENDING
+  QUALITY_APPROVED
   DISTRIBUTED
   COMPLETED
+}
+
+enum QualityApprovalStatus {
+  PENDING
+  IN_PROGRESS
+  PASSED
+  FAILED
+  APPROVED
+  REJECTED
+}
+
+enum QualityCheckType {
+  PHYSICAL_INSPECTION
+  QUANTITY_VERIFICATION
+  EXPIRY_CHECK
+  PACKAGING_INSPECTION
+  DOCUMENTATION_REVIEW
+  LABORATORY_TEST
 }
 
 enum ProductionIngredientStatus {
@@ -155,6 +178,12 @@ model User {
   consignmentsCreated       Consignment[]          @relation("consignment_creator")
   consignmentsReceived      Consignment[]          @relation("consignment_receiver")
   consignmentDistributions  ConsignmentDistribution[]
+  userActivities            UserActivity[]
+  batchMachineAllocations   BatchMachineAllocation[]
+  reconciliations           DailyProductionReconciliation[]
+  qualityApprovalsStarted   QualityApproval[]      @relation("quality_approval_started")
+  qualityApprovalsApproved  QualityApproval[]      @relation("quality_approval_approved")
+  qualityCheckItems         QualityCheckItem[]     @relation("quality_check_performed")
 
   @@map("users")
 }
@@ -498,14 +527,69 @@ model BomIngredient {
   @@map("bom_ingredients")
 }
 
+// ---------------------------------------------------------------------------
+// Machines Module - Clean Rebuild
+// ---------------------------------------------------------------------------
+
+model MachineCategory {
+  id        String    @id @default(uuid())
+  name      String    @unique
+  code      String    @unique
+  isActive  Boolean   @default(true) @map("is_active")
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+
+  machines Machine[]
+
+  @@map("machine_categories")
+}
+
+model MachineDepartment {
+  id        String    @id @default(uuid())
+  name      String    @unique
+  code      String    @unique
+  isActive  Boolean   @default(true) @map("is_active")
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+
+  machines Machine[]
+
+  @@map("machine_departments")
+}
+
+model MachineLocation {
+  id        String    @id @default(uuid())
+  name      String    @unique
+  code      String    @unique
+  isActive  Boolean   @default(true) @map("is_active")
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+
+  machines Machine[]
+
+  @@map("machine_locations")
+}
+
 model Machine {
-  id     String       @id @default(uuid())
-  name   String
-  code   String       @unique
-  status RecordStatus @default(ACTIVE)
+  id               String   @id @default(uuid())
+  name             String
+  code             String   @unique
+  serialNumber     String   @unique @map("serial_number")
+  categoryId       String   @map("category_id")
+  departmentId     String   @map("department_id")
+  locationId       String?  @map("location_id")
+  status           String   @default("ACTIVE") // ACTIVE, IDLE, UNDER_MAINTENANCE, OUT_OF_SERVICE
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
 
-  productionOrders ProductionOrder[]
+  category    MachineCategory   @relation(fields: [categoryId], references: [id])
+  department  MachineDepartment @relation(fields: [departmentId], references: [id])
+  location    MachineLocation?  @relation(fields: [locationId], references: [id])
 
+  @@index([status])
+  @@index([categoryId])
+  @@index([departmentId])
+  @@index([locationId])
   @@map("machines")
 }
 
@@ -545,14 +629,14 @@ model ProductionOrder {
   createdAt               DateTime              @default(now()) @map("created_at")
   updatedAt               DateTime              @updatedAt @map("updated_at")
 
-  bom                   Bom                @relation(fields: [bomId], references: [id])
-  machine               Machine?           @relation(fields: [machineId], references: [id])
-  shift                 Shift?             @relation(fields: [shiftId], references: [id])
-  createdBy             User               @relation("order_creator", fields: [createdById], references: [id])
-  ingredientsReleasedBy User?              @relation("order_ingredients_releaser", fields: [ingredientsReleasedById], references: [id])
-  yieldLoggedBy         User?              @relation("yield_logger", fields: [yieldLoggedById], references: [id])
-  finishedBatch         BatchLot?          @relation("finished_batch", fields: [finishedBatchId], references: [id])
-  productionIngredients ProductionIngredient[]
+  bom                      Bom                    @relation(fields: [bomId], references: [id])
+  shift                    Shift?                 @relation(fields: [shiftId], references: [id])
+  createdBy                User                   @relation("order_creator", fields: [createdById], references: [id])
+  ingredientsReleasedBy    User?                  @relation("order_ingredients_releaser", fields: [ingredientsReleasedById], references: [id])
+  yieldLoggedBy            User?                  @relation("yield_logger", fields: [yieldLoggedById], references: [id])
+  finishedBatch            BatchLot?              @relation("finished_batch", fields: [finishedBatchId], references: [id])
+  productionIngredients    ProductionIngredient[]
+  batchMachineAllocations  BatchMachineAllocation[]
 
   @@map("production_orders")
 }
@@ -593,9 +677,10 @@ model ProductionPlan {
   createdAt    DateTime              @default(now()) @map("created_at")
   updatedAt    DateTime              @updatedAt @map("updated_at")
 
-  createdBy        User                   @relation(fields: [createdById], references: [id])
-  items            ProductionPlanItem[]
-  aggregatedIngredients PlanAggregatedIngredient[]
+  createdBy                 User                          @relation(fields: [createdById], references: [id])
+  items                     ProductionPlanItem[]
+  aggregatedIngredients     PlanAggregatedIngredient[]
+  reconciliations           DailyProductionReconciliation[]
 
   @@index([status])
   @@index([scheduledFor])
@@ -610,8 +695,9 @@ model ProductionPlanItem {
   actualYield      Decimal? @map("actual_yield") @db.Decimal(15, 4)
   sequence         Int     @default(1) // Order in which products are produced
 
-  productionPlan ProductionPlan @relation(fields: [productionPlanId], references: [id], onDelete: Cascade)
-  bom            Bom            @relation(fields: [bomId], references: [id])
+  productionPlan           ProductionPlan        @relation(fields: [productionPlanId], references: [id], onDelete: Cascade)
+  bom                      Bom                   @relation(fields: [bomId], references: [id])
+  batchMachineAllocations  BatchMachineAllocation[]
 
   @@index([productionPlanId])
   @@index([bomId])
@@ -660,6 +746,7 @@ model Consignment {
   receivedBy         User?               @relation("consignment_receiver", fields: [receivedById], references: [id])
   items              ConsignmentItem[]
   distributions      ConsignmentDistribution[]
+  qualityApproval    QualityApproval?
 
   @@index([status])
   @@index([supplierId])
@@ -679,6 +766,7 @@ model ConsignmentItem {
   consignment    Consignment @relation(fields: [consignmentId], references: [id], onDelete: Cascade)
   material       Material    @relation("consignment_items", fields: [materialId], references: [id])
   distributions  ConsignmentDistribution[]
+  qualityChecks  QualityCheckItem[]         @relation("quality_checks")
 
   @@index([consignmentId])
   @@index([materialId])
@@ -706,6 +794,61 @@ model ConsignmentDistribution {
 }
 
 // ---------------------------------------------------------------------------
+// 5B. Quality Approval Workflow
+// ---------------------------------------------------------------------------
+
+model QualityApproval {
+  id                String                    @id @default(uuid())
+  consignmentId     String                    @unique @map("consignment_id")
+  status            QualityApprovalStatus     @default(PENDING)
+  totalItems        Int                       @default(0) @map("total_items")
+  passedItems       Int                       @default(0) @map("passed_items")
+  failedItems       Int                       @default(0) @map("failed_items")
+  startedAt         DateTime?                 @map("started_at")
+  completedAt       DateTime?                 @map("completed_at")
+  approvedAt        DateTime?                 @map("approved_at")
+  rejectedAt        DateTime?                 @map("rejected_at")
+  startedById       String?                   @map("started_by_id")
+  approvedById      String?                   @map("approved_by_id")
+  rejectionReason   String?                   @map("rejection_reason")
+  notes             String?
+  createdAt         DateTime                  @default(now()) @map("created_at")
+  updatedAt         DateTime                  @updatedAt @map("updated_at")
+
+  consignment      Consignment              @relation(fields: [consignmentId], references: [id], onDelete: Cascade)
+  startedBy        User?                    @relation("quality_approval_started", fields: [startedById], references: [id])
+  approvedBy       User?                    @relation("quality_approval_approved", fields: [approvedById], references: [id])
+  checkItems       QualityCheckItem[]
+  
+  @@index([status])
+  @@index([consignmentId])
+  @@map("quality_approvals")
+}
+
+model QualityCheckItem {
+  id                      String                @id @default(uuid())
+  qualityApprovalId       String                @map("quality_approval_id")
+  consignmentItemId       String                @map("consignment_item_id")
+  checkType               QualityCheckType      @map("check_type")
+  status                  QualityApprovalStatus @default(PENDING)
+  result                  String?               // "PASS" | "FAIL"
+  remarks                 String?
+  checkedAt               DateTime?             @map("checked_at")
+  checkedById             String?               @map("checked_by_id")
+  createdAt               DateTime              @default(now()) @map("created_at")
+  updatedAt               DateTime              @updatedAt @map("updated_at")
+
+  qualityApproval   QualityApproval  @relation(fields: [qualityApprovalId], references: [id], onDelete: Cascade)
+  consignmentItem   ConsignmentItem  @relation("quality_checks", fields: [consignmentItemId], references: [id], onDelete: Cascade)
+  checkedBy         User?            @relation("quality_check_performed", fields: [checkedById], references: [id])
+
+  @@index([qualityApprovalId])
+  @@index([consignmentItemId])
+  @@index([status])
+  @@map("quality_check_items")
+}
+
+// ---------------------------------------------------------------------------
 // 6. QA
 // ---------------------------------------------------------------------------
 
@@ -726,6 +869,88 @@ model InspectionRecord {
   inspector User?     @relation(fields: [inspectedById], references: [id])
 
   @@map("inspection_records")
+}
+
+// ---------------------------------------------------------------------------
+// 7. User Activity Tracking
+// ---------------------------------------------------------------------------
+
+model UserActivity {
+  id            String   @id @default(uuid())
+  userId        String   @map("user_id")
+  activityType  String   @map("activity_type") // PAGE_VISIT, CREATE, UPDATE, DELETE, APPROVE, REJECT, TRANSFER, ADJUST
+  module        String   // inventory, procurement, production, qa, audit, admin
+  description   String?
+  entityType    String?  @map("entity_type") // Material, Requisition, PurchaseOrder, etc.
+  entityId      String?  @map("entity_id")
+  details       Json?    // Additional context (before/after values, IP, user agent, etc.)
+  ipAddress     String?  @map("ip_address")
+  userAgent     String?  @map("user_agent")
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([activityType, createdAt])
+  @@index([module, createdAt])
+  @@index([entityType, entityId])
+  @@map("user_activities")
+}
+
+// ---------------------------------------------------------------------------
+// 8. Production Supervisor Workflow
+// ---------------------------------------------------------------------------
+
+model BatchMachineAllocation {
+  id                    String    @id @default(uuid())
+  productionPlanItemId  String    @map("production_plan_item_id")
+  productionOrderId     String    @map("production_order_id")
+  machineId             String    @map("machine_id")
+  scheduledStartTime    DateTime? @map("scheduled_start_time")
+  scheduledEndTime      DateTime? @map("scheduled_end_time")
+  actualStartTime       DateTime? @map("actual_start_time")
+  actualEndTime         DateTime? @map("actual_end_time")
+  batchNumber           String?   @map("batch_number")
+  status                String    @default("ALLOCATED") // ALLOCATED, SCHEDULED, IN_PROGRESS, COMPLETED
+  supervisorId          String    @map("supervisor_id")
+  notes                 String?
+  createdAt             DateTime  @default(now()) @map("created_at")
+  updatedAt             DateTime  @updatedAt @map("updated_at")
+
+  planItem          ProductionPlanItem @relation(fields: [productionPlanItemId], references: [id], onDelete: Cascade)
+  productionOrder   ProductionOrder    @relation(fields: [productionOrderId], references: [id], onDelete: Cascade)
+  supervisor        User               @relation(fields: [supervisorId], references: [id])
+
+  @@index([productionPlanItemId, machineId])
+  @@index([supervisorId, createdAt])
+  @@index([status])
+  @@map("batch_machine_allocations")
+}
+
+model DailyProductionReconciliation {
+  id                    String    @id @default(uuid())
+  productionPlanId      String    @map("production_plan_id")
+  reconciliationDate    DateTime  @map("reconciliation_date")
+  supervisorId          String    @map("supervisor_id")
+  plannedItemCount      Int       @map("planned_item_count")
+  plannedTotalQuantity  Decimal   @map("planned_total_quantity") @db.Decimal(15, 4)
+  actualItemCount       Int       @map("actual_item_count")
+  actualTotalQuantity   Decimal   @map("actual_total_quantity") @db.Decimal(15, 4)
+  quantityVariance      Decimal   @map("quantity_variance") @db.Decimal(15, 4)
+  variancePercentage    Decimal   @map("variance_percentage") @db.Decimal(5, 2)
+  discrepancyNotes      String?   @map("discrepancy_notes")
+  status                String    @default("PENDING") // PENDING, VERIFIED, FLAGGED
+  verifiedAt            DateTime? @map("verified_at")
+  createdAt             DateTime  @default(now()) @map("created_at")
+  updatedAt             DateTime  @updatedAt @map("updated_at")
+
+  productionPlan ProductionPlan @relation(fields: [productionPlanId], references: [id], onDelete: Cascade)
+  supervisor     User           @relation(fields: [supervisorId], references: [id])
+
+  @@index([productionPlanId, reconciliationDate])
+  @@index([supervisorId, createdAt])
+  @@index([status])
+  @@map("daily_production_reconciliations")
 }
 
 // ---------------------------------------------------------------------------

@@ -345,8 +345,9 @@ export async function distributeToWarehouseBin(data: {
     include: { consignment: true },
   });
 
-  if (item.consignment.status !== ConsignmentStatus.RECEIVED) {
-    throw new Error(`Can only distribute items from RECEIVED consignments, current status: ${item.consignment.status}`);
+  // Quality Approval Check: Consignment must be QUALITY_APPROVED before distribution
+  if (item.consignment.status !== ConsignmentStatus.QUALITY_APPROVED) {
+    throw new Error(`Consignment requires QA approval before distribution. Current status: ${item.consignment.status}`);
   }
 
   // Verify bin exists
@@ -618,4 +619,61 @@ export async function markAsCompleted(consignmentId: string) {
   });
 
   return updated;
+}
+
+/**
+ * Delete a consignment and all related records
+ * Only allows deletion of DRAFT, RECEIVED, or QUALITY_PENDING consignments
+ */
+export async function deleteConsignment(consignmentId: string) {
+  const consignment = await prisma.consignment.findUnique({
+    where: { id: consignmentId },
+    include: {
+      items: true,
+      distributions: true,
+      qualityApproval: { include: { checkItems: true } },
+    },
+  });
+
+  if (!consignment) {
+    throw new Error('Consignment not found');
+  }
+
+  // Prevent deletion of advanced statuses
+  const blockedStatuses = [ConsignmentStatus.IN_TRANSIT, ConsignmentStatus.DISTRIBUTED, ConsignmentStatus.COMPLETED];
+  if (blockedStatuses.includes(consignment.status)) {
+    throw new Error(`Cannot delete consignments in ${consignment.status} status`);
+  }
+
+  // Delete in transaction
+  await prisma.$transaction(async (tx) => {
+    // 1. Delete quality approval check items
+    if (consignment.qualityApproval) {
+      await tx.qualityCheckItem.deleteMany({
+        where: { qualityApprovalId: consignment.qualityApproval.id },
+      });
+
+      // 2. Delete quality approval record
+      await tx.qualityApproval.delete({
+        where: { id: consignment.qualityApproval.id },
+      });
+    }
+
+    // 3. Delete consignment distributions
+    await tx.consignmentDistribution.deleteMany({
+      where: { consignmentId },
+    });
+
+    // 4. Delete consignment items
+    await tx.consignmentItem.deleteMany({
+      where: { consignmentId },
+    });
+
+    // 5. Delete the consignment
+    await tx.consignment.delete({
+      where: { id: consignmentId },
+    });
+  });
+
+  return { success: true, message: 'Consignment deleted successfully' };
 }

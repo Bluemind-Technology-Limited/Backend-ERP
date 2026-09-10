@@ -333,53 +333,43 @@ export async function getUserActivity(userId: string, days: number = 30) {
   const sinceDate = new Date();
   sinceDate.setDate(sinceDate.getDate() - days);
 
-  const activities = {
-    requisitionsCreated: 0,
-    requisitionsApproved: 0,
-    purchaseOrdersCreated: 0,
-    goodsReceiptsCreated: 0,
-    goodsReceiptsApproved: 0,
-    productionOrdersCreated: 0,
-    productionOrdersCompleted: 0,
-  };
-
-  // Count requisitions created by user
-  activities.requisitionsCreated = await prisma.requisition.count({
-    where: {
-      requestedById: userId,
-      createdAt: { gte: sinceDate },
-    },
+  // Get user info
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { fullName: true },
   });
 
-  // Count purchase orders created by user
-  activities.purchaseOrdersCreated = await prisma.purchaseOrder.count({
+  // Get user activities
+  const activities = await prisma.userActivity.findMany({
     where: {
-      createdById: userId,
+      userId,
       createdAt: { gte: sinceDate },
     },
+    orderBy: { createdAt: 'desc' },
   });
 
-  // Count goods receipts created by user
-  activities.goodsReceiptsCreated = await prisma.goodsReceipt.count({
-    where: {
-      receivedById: userId,
-      createdAt: { gte: sinceDate },
-    },
-  });
-
-  // Count production orders created by user
-  activities.productionOrdersCreated = await prisma.productionOrder.count({
-    where: {
-      createdById: userId,
-      createdAt: { gte: sinceDate },
-    },
-  });
+  // Group by date
+  const dayMap = new Map<string, { date: string; actionCount: number; actions: string[] }>();
+  for (const activity of activities) {
+    const dateStr = activity.createdAt.toISOString().split('T')[0];
+    if (!dayMap.has(dateStr)) {
+      dayMap.set(dateStr, {
+        date: dateStr,
+        actionCount: 0,
+        actions: [],
+      });
+    }
+    const day = dayMap.get(dateStr)!;
+    day.actionCount++;
+    day.actions.push(activity.activityType);
+  }
 
   return {
     userId,
-    period: `Last ${days} days`,
-    sinceDate,
-    activities,
+    userName: user?.fullName || 'Unknown',
+    actionsCount: activities.length,
+    lastAction: activities.length > 0 ? activities[0].createdAt.toISOString() : null,
+    days: Array.from(dayMap.values()).slice(-7), // Last 7 days
   };
 }
 
