@@ -138,7 +138,7 @@ router.post("/trigger", async (req: Request, res: Response) => {
     console.log("→ Stock email trigger received from GitHub Workflow");
 
     // Queue the email job on QStash with retry policy
-    const jobId = await qstashClient.publishJSON({
+    const qstashPayload: any = {
       api: {
         name: "stock-email",
         baseUrl: process.env.API_BASE_URL || "http://localhost:3002",
@@ -146,11 +146,12 @@ router.post("/trigger", async (req: Request, res: Response) => {
       topic: "stock-email",
       body: {
         timestamp: new Date().toISOString(),
-        source: "github-workflow",
+        source: "email",
       },
       retries: 3,
       delay: "0s", // Process immediately
-    });
+    };
+    const jobId = await qstashClient.publishJSON(qstashPayload);
 
     res.json({
       success: true,
