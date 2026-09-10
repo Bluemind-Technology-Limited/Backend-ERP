@@ -56,7 +56,7 @@ export async function getSupervisorDashboard(supervisorId: string, date: Date) {
     })),
     todaysAllocations: todaysAllocations.map((alloc) => ({
       id: alloc.id,
-      machine: alloc.machine.name,
+      machine: `Machine ${alloc.machineId}`,
       product: alloc.productionOrder.bom.finishedSku?.name || 'Unknown',
       targetQuantity: alloc.productionOrder.targetQuantity,
       scheduledStartTime: alloc.scheduledStartTime,
@@ -153,16 +153,37 @@ export async function getMachineSchedule(machineId: string, date: Date) {
  * Get all machines with their daily workloads
  */
 export async function getAllMachinesSchedule(date: Date) {
-  const machines = await prisma.machine.findMany({
-    where: { status: 'ACTIVE' },
-    include: { batchMachineAllocations: { where: {} } }, // Will filter in loop
+  // Get all batch machine allocations for the given date
+  const allocations = await prisma.batchMachineAllocation.findMany({
+    where: {
+      scheduledStartTime: {
+        gte: new Date(date.getFullYear(), date.getMonth(), date.getDate()),
+        lt: new Date(date.getFullYear(), date.getMonth(), date.getDate() + 1),
+      },
+    },
+    include: {
+      productionOrder: { include: { bom: { include: { finishedSku: true } } } },
+      planItem: true,
+      supervisor: { select: { fullName: true } },
+    },
   });
 
+  // Group by machineId
+  const machineMap = new Map<string, typeof allocations>();
+  for (const alloc of allocations) {
+    if (!machineMap.has(alloc.machineId)) {
+      machineMap.set(alloc.machineId, []);
+    }
+    machineMap.get(alloc.machineId)!.push(alloc);
+  }
+
   const schedules = await Promise.all(
-    machines.map(async (machine) => {
-      const workload = await batchMachineAllocationService.getMachineWorkload(machine.id, date);
+    Array.from(machineMap.entries()).map(async ([machineId, machineAllocations]) => {
+      const workload = await batchMachineAllocationService.getMachineWorkload(machineId, date);
       return {
-        machine,
+        machineId,
+        date,
+        allocations: machineAllocations.length,
         workload,
       };
     })
@@ -223,8 +244,8 @@ export async function getSupervisorMetrics(supervisorId: string, days: number = 
   let totalVariance = 0;
   let significantVarianceCount = 0;
   for (const recon of reconciliations) {
-    totalVariance += recon.variancePercentage;
-    if (Math.abs(recon.variancePercentage) > 5) significantVarianceCount++;
+    totalVariance += Number(recon.variancePercentage);
+    if (Math.abs(Number(recon.variancePercentage)) > 5) significantVarianceCount++;
   }
   const avgVariancePercentage = totalReconciliations > 0 ? totalVariance / totalReconciliations : 0;
 
@@ -277,7 +298,6 @@ export async function getPlanSummaryReport(productionPlanId: string) {
       },
     },
     include: {
-      machine: true,
       productionOrder: true,
       supervisor: { select: { fullName: true } },
     },
@@ -299,7 +319,7 @@ export async function getPlanSummaryReport(productionPlanId: string) {
       variancePercentage: Number(item.targetQuantity) > 0 ? (variance / Number(item.targetQuantity)) * 100 : 0,
       allocations: itemAllocations.length,
       completedAllocations: completedAllocations.length,
-      machines: [...new Set(itemAllocations.map((a) => a.machine.name))],
+      machines: [...new Set(itemAllocations.map((a) => `Machine ${a.machineId}`))],
     };
   });
 
