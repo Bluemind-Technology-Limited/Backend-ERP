@@ -10,7 +10,7 @@ import type { UserRole } from "@prisma/client";
 
 type Matrix = Partial<Record<"create" | "read" | "update" | "delete" | "approve", boolean>>;
 
-const MODULES = ["master_data", "procurement", "inventory", "production", "qa", "machines", "reports", "admin"] as const;
+const MODULES = ["master_data", "procurement", "inventory", "production", "qa", "machines", "reports", "admin", "audit"] as const;
 
 const MATRIX: Record<UserRole, Record<(typeof MODULES)[number], Matrix>> = {
   SUPER_ADMIN: {
@@ -22,6 +22,7 @@ const MATRIX: Record<UserRole, Record<(typeof MODULES)[number], Matrix>> = {
     machines: { create: true, read: true, update: true, delete: true, approve: true },
     reports: { create: false, read: true, update: false, delete: false, approve: false },
     admin: { create: true, read: true, update: true, delete: true, approve: true },
+    audit: { read: true },
   },
   EXECUTIVE_ADMIN: {
     master_data: { read: true },
@@ -32,6 +33,7 @@ const MATRIX: Record<UserRole, Record<(typeof MODULES)[number], Matrix>> = {
     machines: { read: true }, // dashboards, KPIs
     reports: { read: true, create: true },
     admin: { read: true },
+    audit: { read: true },
   },
   STORE_OFFICER: {
     master_data: { read: true },
@@ -42,6 +44,7 @@ const MATRIX: Record<UserRole, Record<(typeof MODULES)[number], Matrix>> = {
     machines: { read: true }, // view machines register
     reports: {},
     admin: {},
+    audit: { read: true },
   },
   PRODUCTION_MANAGER: {
     master_data: { read: true },
@@ -52,6 +55,7 @@ const MATRIX: Record<UserRole, Record<(typeof MODULES)[number], Matrix>> = {
     machines: { read: true, create: true, update: true }, // register machines, assign staff
     reports: { read: true },
     admin: {},
+    audit: { read: true },
   },
   PRODUCTION_SUPERVISOR: {
     master_data: { read: true },
@@ -62,6 +66,7 @@ const MATRIX: Record<UserRole, Record<(typeof MODULES)[number], Matrix>> = {
     machines: { read: true, create: true }, // view machines, log performance
     reports: { read: true },
     admin: {},
+    audit: { read: true },
   },
   PROCUREMENT_OFFICER: {
     master_data: { create: true, read: true, update: true }, // suppliers
@@ -72,6 +77,7 @@ const MATRIX: Record<UserRole, Record<(typeof MODULES)[number], Matrix>> = {
     machines: { read: true },
     reports: {},
     admin: {},
+    audit: { read: true },
   },
   QA_INSPECTOR: {
     master_data: { read: true },
@@ -82,6 +88,7 @@ const MATRIX: Record<UserRole, Record<(typeof MODULES)[number], Matrix>> = {
     machines: { read: true },
     reports: {},
     admin: {},
+    audit: { read: true },
   },
   OPERATOR: {
     master_data: {},
@@ -92,6 +99,7 @@ const MATRIX: Record<UserRole, Record<(typeof MODULES)[number], Matrix>> = {
     machines: { read: true, create: true }, // view machines, log breakdowns, record performance
     reports: {},
     admin: {},
+    audit: {},
   },
   TECHNICIAN: {
     master_data: {},
@@ -102,6 +110,7 @@ const MATRIX: Record<UserRole, Record<(typeof MODULES)[number], Matrix>> = {
     machines: { read: true, create: true, update: true }, // manage maintenance, spare parts, resolve breakdowns
     reports: { read: true },
     admin: {},
+    audit: {},
   },
 };
 
