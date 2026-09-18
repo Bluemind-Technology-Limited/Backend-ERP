@@ -3,6 +3,7 @@ import { requireAuth } from "../middleware/auth.js";
 import { requirePermission } from "../middleware/rbac.js";
 import { prisma } from "../lib/db.js";
 import { getStock } from "../lib/ledger.js";
+import * as auditReportService from "../services/auditReportService.js";
 
 const router: Router = Router();
 router.use(requireAuth);
@@ -118,6 +119,47 @@ router.get("/inventory-valuation", requirePermission("reports", "read"), async (
   } catch (error) {
     console.error("GET /reports/inventory-valuation error:", error);
     res.status(500).json({ error: "Database error" });
+  }
+});
+
+/**
+ * GET /reports/production-flow
+ * Date-filtered whole-flow report: plan -> issue -> grinding -> finishing -> QA,
+ * with ledger movements, remainders and target-vs-achieved variance.
+ */
+router.get("/production-flow", requirePermission("reports", "read"), async (req: Request, res: Response) => {
+  try {
+    const report = await auditReportService.getProductionFlowReport({
+      dateFrom: req.query.dateFrom as string | undefined,
+      dateTo: req.query.dateTo as string | undefined,
+      planId: req.query.planId as string | undefined,
+      status: req.query.status as string | undefined,
+      limit: req.query.limit ? parseInt(String(req.query.limit)) : undefined,
+    });
+    res.json(report);
+  } catch (error: any) {
+    console.error("GET /reports/production-flow error:", error);
+    res.status(500).json({ error: error?.message || "Database error" });
+  }
+});
+
+/**
+ * GET /reports/erp-activity
+ * Unified activity feed across inventory, production, QA and procurement.
+ */
+router.get("/erp-activity", requirePermission("reports", "read"), async (req: Request, res: Response) => {
+  try {
+    const report = await auditReportService.getErpActivityReport({
+      dateFrom: req.query.dateFrom as string | undefined,
+      dateTo: req.query.dateTo as string | undefined,
+      entity: req.query.entity as string | undefined,
+      userId: req.query.userId as string | undefined,
+      limit: req.query.limit ? parseInt(String(req.query.limit)) : undefined,
+    });
+    res.json(report);
+  } catch (error: any) {
+    console.error("GET /reports/erp-activity error:", error);
+    res.status(500).json({ error: error?.message || "Database error" });
   }
 });
 

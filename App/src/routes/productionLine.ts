@@ -208,6 +208,7 @@ router.post(
       const {
         achievedQuantity,
         remainderQuantity,
+        carryoverUsedQuantity,
         warehouseId,
         batchNumber,
         expiryDate,
@@ -226,6 +227,8 @@ router.post(
         achievedQuantity: Number(achievedQuantity),
         remainderQuantity:
           remainderQuantity === undefined ? undefined : Number(remainderQuantity),
+        carryoverUsedQuantity:
+          carryoverUsedQuantity === undefined ? undefined : Number(carryoverUsedQuantity),
         warehouseId,
         batchNumber,
         expiryDate,
@@ -239,6 +242,33 @@ router.post(
     } catch (error: any) {
       console.error("POST /production-line/plans/:planId/items/:itemId/finishing error:", error);
       sendError(res, error, "Failed to record finished output");
+    }
+  }
+);
+
+/**
+ * PATCH /production-line/stage-records/:id/status
+ * Manager sign-off on a submitted grinding/finishing record.
+ */
+router.patch(
+  "/stage-records/:id/status",
+  requirePermission("production", "approve"),
+  async (req: Request, res: Response) => {
+    try {
+      const { status, notes } = req.body;
+      if (!status) return res.status(400).json({ error: "status is required" });
+
+      const record = await productionLineService.setStageRecordStatus(
+        req.params.id,
+        status,
+        req.user!.id,
+        notes
+      );
+
+      res.json({ message: `Stage record ${status.toLowerCase()}`, data: record });
+    } catch (error: any) {
+      console.error("PATCH /production-line/stage-records/:id/status error:", error);
+      sendError(res, error, "Failed to update stage record");
     }
   }
 );

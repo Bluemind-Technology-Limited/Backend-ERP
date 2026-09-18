@@ -67,6 +67,8 @@ export interface StockRow {
   unitOfMeasure: string;
   batchLotId: string | null;
   batchNumber: string | null;
+  manufacturingDate?: Date | null;
+  expiryDate?: Date | null;
   warehouseId: string;
   warehouseName: string;
   binId: string | null;
@@ -98,7 +100,7 @@ export async function getStock(
     prisma.material.findMany({ where: { id: { in: materialIds } }, select: { id: true, name: true, sku: true, unitOfMeasure: true, minQuantity: true } }),
     prisma.warehouse.findMany({ where: { id: { in: warehouseIds } }, select: { id: true, name: true } }),
     batchIds.length
-      ? prisma.batchLot.findMany({ where: { id: { in: batchIds } }, select: { id: true, batchNumber: true } })
+      ? prisma.batchLot.findMany({ where: { id: { in: batchIds } }, select: { id: true, batchNumber: true, manufacturingDate: true, expiryDate: true } })
       : Promise.resolve([]),
   ]);
 
@@ -116,6 +118,8 @@ export async function getStock(
         unitOfMeasure: g.unitOfMeasure,
         batchLotId: g.batchLotId,
         batchNumber: g.batchLotId ? batchMap.get(g.batchLotId)?.batchNumber ?? null : null,
+        manufacturingDate: g.batchLotId ? batchMap.get(g.batchLotId)?.manufacturingDate ?? null : null,
+        expiryDate: g.batchLotId ? batchMap.get(g.batchLotId)?.expiryDate ?? null : null,
         warehouseId: g.warehouseId,
         warehouseName: whMap.get(g.warehouseId)?.name ?? g.warehouseId,
         binId: g.binId,

@@ -21,6 +21,36 @@ import { logActivity } from './userActivityLogger.js';
 const ISSUABLE_PLAN_STATUSES = ['SCHEDULED', 'IN_PROGRESS'];
 const ACTIVE_PLAN_STATUSES = ['SCHEDULED', 'IN_PROGRESS', 'COMPLETED'];
 
+/**
+ * WIP carryover pool per BOM: unused ground output from prior finishing records,
+ * minus whatever later batches already drew on. Purely computed — no ledger.
+ */
+async function computeCarryoverByBom(bomIds: string[]): Promise<Map<string, number>> {
+  const unique = [...new Set(bomIds.filter(Boolean))];
+  const map = new Map<string, number>();
+  if (unique.length === 0) return map;
+
+  const records = await prisma.productionStageRecord.findMany({
+    where: { stage: 'FINISHING', planItem: { bomId: { in: unique } } },
+    select: {
+      remainderQuantity: true,
+      carryoverUsedQuantity: true,
+      planItem: { select: { bomId: true } },
+    },
+  });
+
+  for (const r of records) {
+    const bomId = r.planItem?.bomId;
+    if (!bomId) continue;
+    map.set(
+      bomId,
+      (map.get(bomId) ?? 0) + Number(r.remainderQuantity) - Number(r.carryoverUsedQuantity)
+    );
+  }
+  for (const [k, v] of [...map.entries()]) map.set(k, Math.max(0, v));
+  return map;
+}
+
 // ---------------------------------------------------------------------------
 // Serialization / progress
 // ---------------------------------------------------------------------------
@@ -53,7 +83,7 @@ function summarize(plan: any) {
 }
 
 /** Per-item view: how much was ground (available to finish) and what was output. */
-function enrichItems(plan: any) {
+function enrichItems(plan: any, carryover?: Map<string, number>) {
   const items: any[] = plan.items ?? [];
   return items.map((item) => {
     const stageRecords: any[] = item.stageRecords ?? [];
@@ -65,11 +95,13 @@ function enrichItems(plan: any) {
       finishingRecord: finishing[0] ?? null,
       groundQuantity: grinding.reduce((sum, r) => sum + Number(r.achievedQuantity), 0),
       achievedQuantity: finishing.reduce((sum, r) => sum + Number(r.achievedQuantity), 0),
+      // Unfinished output from earlier batches of this product.
+      carryoverAvailable: carryover?.get(item.bomId) ?? 0,
     };
   });
 }
 
-function serializePlan(plan: any) {
+function serializePlan(plan: any, carryover?: Map<string, number>) {
   return {
     id: plan.id,
     planNumber: plan.planNumber,
@@ -79,7 +111,7 @@ function serializePlan(plan: any) {
     startedAt: plan.startedAt,
     completedAt: plan.completedAt,
     createdBy: plan.createdBy ?? null,
-    items: enrichItems(plan),
+    items: enrichItems(plan, carryover),
     aggregatedIngredients: plan.aggregatedIngredients ?? [],
     progress: summarize(plan),
   };
@@ -116,7 +148,8 @@ export async function getProductionLinePlans(filters?: { status?: string }) {
     include: PLAN_INCLUDE,
     orderBy: { scheduledFor: 'desc' },
   });
-  return plans.map(serializePlan);
+  const carryover = await computeCarryoverByBom(plans.flatMap((p) => p.items.map((i) => i.bomId)));
+  return plans.map((plan) => serializePlan(plan, carryover));
 }
 
 export async function getPlanStationView(planId: string) {
@@ -125,7 +158,8 @@ export async function getPlanStationView(planId: string) {
     include: PLAN_INCLUDE,
   });
   if (!plan) throw new Error('Production plan not found');
-  return serializePlan(plan);
+  const carryover = await computeCarryoverByBom(plan.items.map((i) => i.bomId));
+  return serializePlan(plan, carryover);
 }
 
 /**
@@ -408,6 +442,7 @@ export async function submitFinishingRecord(data: {
   planItemId: string;
   achievedQuantity: number;
   remainderQuantity?: number;
+  carryoverUsedQuantity?: number;
   warehouseId: string;
   batchNumber: string;
   expiryDate?: string;
@@ -439,6 +474,16 @@ export async function submitFinishingRecord(data: {
 
   const required = Number(item.targetQuantity);
   const planId = item.productionPlanId;
+
+  // WIP carryover: how much unused ground output from earlier batches this one draws on.
+  const carryoverUsed = Number(data.carryoverUsedQuantity ?? 0);
+  if (carryoverUsed < 0) throw new Error('Carryover used cannot be negative');
+  const carryoverAvailable = (await computeCarryoverByBom([item.bomId])).get(item.bomId) ?? 0;
+  if (carryoverUsed > carryoverAvailable + 0.0001) {
+    throw new Error(
+      `Only ${carryoverAvailable} unfinished quantity is available from previous batches`
+    );
+  }
 
   const record = await prisma.$transaction(async (tx) => {
     let finishedBatchLotId: string | null = null;
@@ -489,6 +534,7 @@ export async function submitFinishingRecord(data: {
         inputQuantity: required,
         achievedQuantity: achieved,
         remainderQuantity: Number(data.remainderQuantity ?? 0),
+        carryoverUsedQuantity: carryoverUsed,
         unitOfMeasure: data.unitOfMeasure ?? finishedSku.unitOfMeasure ?? 'kg',
         batchNumber: data.batchNumber,
         warehouseId: data.warehouseId,
@@ -532,4 +578,41 @@ export async function submitFinishingRecord(data: {
   });
 
   return getPlanStationView(planId);
+}
+
+// ---------------------------------------------------------------------------
+// Station sign-off (manager)
+// ---------------------------------------------------------------------------
+
+const STAGE_REVIEW_STATUSES = ['SUBMITTED', 'VERIFIED', 'FLAGGED'];
+
+/** Verify or flag a submitted grinding/finishing record. */
+export async function setStageRecordStatus(
+  recordId: string,
+  status: string,
+  userId: string,
+  notes?: string
+) {
+  if (!STAGE_REVIEW_STATUSES.includes(status)) {
+    throw new Error(`status must be one of: ${STAGE_REVIEW_STATUSES.join(', ')}`);
+  }
+
+  const record = await prisma.productionStageRecord.findUnique({ where: { id: recordId } });
+  if (!record) throw new Error('Stage record not found');
+
+  const updated = await prisma.productionStageRecord.update({
+    where: { id: recordId },
+    data: { status: status as never, ...(notes !== undefined ? { remarks: notes } : {}) },
+  });
+
+  await logActivity({
+    userId,
+    activityType: status === 'FLAGGED' ? 'REJECT' : 'APPROVE',
+    module: 'production',
+    description: `${record.stage} record ${status.toLowerCase()}`,
+    entityType: 'ProductionStageRecord',
+    entityId: recordId,
+  });
+
+  return updated;
 }

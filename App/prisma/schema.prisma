@@ -787,6 +787,7 @@ model ProductionStageRecord {
   inputQuantity         Decimal               @map("input_quantity") @db.Decimal(15, 4)
   achievedQuantity      Decimal               @map("achieved_quantity") @db.Decimal(15, 4)
   remainderQuantity     Decimal               @default(0) @map("remainder_quantity") @db.Decimal(15, 4)
+  carryoverUsedQuantity Decimal               @default(0) @map("carryover_used_quantity") @db.Decimal(15, 4)
   unitOfMeasure         String                @map("unit_of_measure")
   batchNumber           String?               @map("batch_number")
   machineId             String?               @map("machine_id")
