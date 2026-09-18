@@ -10,7 +10,7 @@ import type { UserRole } from "@prisma/client";
 
 type Matrix = Partial<Record<"create" | "read" | "update" | "delete" | "approve", boolean>>;
 
-const MODULES = ["master_data", "procurement", "inventory", "production", "qa", "machines", "reports", "admin", "audit"] as const;
+const MODULES = ["master_data", "procurement", "inventory", "production", "qa", "machines", "reports", "admin", "audit", "cost_management"] as const;
 
 const MATRIX: Record<UserRole, Record<(typeof MODULES)[number], Matrix>> = {
   SUPER_ADMIN: {
@@ -23,6 +23,7 @@ const MATRIX: Record<UserRole, Record<(typeof MODULES)[number], Matrix>> = {
     reports: { create: false, read: true, update: false, delete: false, approve: false },
     admin: { create: true, read: true, update: true, delete: true, approve: true },
     audit: { read: true },
+    cost_management: { create: true, read: true, update: true, approve: true },
   },
   EXECUTIVE_ADMIN: {
     master_data: { read: true },
@@ -34,6 +35,7 @@ const MATRIX: Record<UserRole, Record<(typeof MODULES)[number], Matrix>> = {
     reports: { read: true, create: true },
     admin: { read: true },
     audit: { read: true },
+    cost_management: { read: true, approve: true }, // Approves high-value cost changes
   },
   STORE_OFFICER: {
     master_data: { read: true },
@@ -45,6 +47,7 @@ const MATRIX: Record<UserRole, Record<(typeof MODULES)[number], Matrix>> = {
     reports: {},
     admin: {},
     audit: { read: true },
+    cost_management: { read: true, update: true }, // Can update PO item costs
   },
   PRODUCTION_MANAGER: {
     master_data: { read: true },
@@ -56,6 +59,7 @@ const MATRIX: Record<UserRole, Record<(typeof MODULES)[number], Matrix>> = {
     reports: { read: true },
     admin: {},
     audit: { read: true },
+    cost_management: { read: true, create: true, update: true }, // Can update BOM and production costs
   },
   PRODUCTION_SUPERVISOR: {
     master_data: { read: true },
@@ -67,6 +71,19 @@ const MATRIX: Record<UserRole, Record<(typeof MODULES)[number], Matrix>> = {
     reports: { read: true },
     admin: {},
     audit: { read: true },
+    cost_management: { read: true, create: true }, // Can log actual production costs
+  },
+  GRINDING_SUPERVISOR: {
+    master_data: { read: true },
+    procurement: { read: true },
+    inventory: { read: true },
+    production: { create: true, read: true, update: true }, // grinding throughput + input remainders
+    qa: { read: true },
+    machines: { read: true, create: true },
+    reports: { read: true },
+    admin: {},
+    audit: { read: true },
+    cost_management: { read: true },
   },
   PROCUREMENT_OFFICER: {
     master_data: { create: true, read: true, update: true }, // suppliers
@@ -78,17 +95,31 @@ const MATRIX: Record<UserRole, Record<(typeof MODULES)[number], Matrix>> = {
     reports: {},
     admin: {},
     audit: { read: true },
+    cost_management: { read: true, create: true, update: true }, // Primary role for cost management
   },
-  QA_INSPECTOR: {
+  QC: {
     master_data: { read: true },
     procurement: { read: true, delete: true }, // GRN inspection, can delete GRNs
     inventory: { read: true, update: true }, // block/release batches
     production: { read: true },
-    qa: { create: true, read: true, update: true, approve: true }, // inspections, block/release
+    qa: { create: true, read: true, update: true, approve: true }, // inspections, block/release, propose quantity changes
     machines: { read: true },
-    reports: {},
+    reports: { read: true },
     admin: {},
     audit: { read: true },
+    cost_management: { read: true }, // View costs only
+  },
+  HEAD_OF_QC: {
+    master_data: { read: true },
+    procurement: { read: true },
+    inventory: { read: true },
+    production: { read: true },
+    qa: { read: true, approve: true }, // approves quantity changes proposed by QC
+    machines: { read: true },
+    reports: { read: true },
+    admin: {},
+    audit: { read: true },
+    cost_management: { read: true },
   },
   OPERATOR: {
     master_data: {},
@@ -100,6 +131,7 @@ const MATRIX: Record<UserRole, Record<(typeof MODULES)[number], Matrix>> = {
     reports: {},
     admin: {},
     audit: {},
+    cost_management: {}, // No cost access
   },
   TECHNICIAN: {
     master_data: {},
@@ -111,6 +143,7 @@ const MATRIX: Record<UserRole, Record<(typeof MODULES)[number], Matrix>> = {
     reports: { read: true },
     admin: {},
     audit: {},
+    cost_management: {}, // No cost access
   },
 };
 

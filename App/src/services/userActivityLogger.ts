@@ -22,7 +22,8 @@ export type Module =
   | 'audit' 
   | 'admin'
   | 'reports'
-  | 'dashboard';
+  | 'dashboard'
+  | 'cost_management';
 
 export interface LogActivityOptions {
   userId: string;

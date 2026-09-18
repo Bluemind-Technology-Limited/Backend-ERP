@@ -14,6 +14,7 @@
 import type { PrismaClient } from '@prisma/client';
 import { QualityCheckType, QualityApprovalStatus, ConsignmentStatus } from '@prisma/client';
 import { logActivity } from './userActivityLogger.js';
+import * as storage from '../lib/storage.js';
 
 // ============================================================================
 // CREATE QUALITY CHECK
@@ -42,6 +43,10 @@ export async function initiateQualityCheck(
 
     if (consignment.status !== 'RECEIVED') {
       throw new Error(`Consignment must be in RECEIVED status to initiate QA checks. Current: ${consignment.status}`);
+    }
+
+    if (consignment.items.length === 0) {
+      throw new Error('Consignment has no items to inspect');
     }
 
     // Create QualityApproval master record
@@ -75,6 +80,10 @@ export async function initiateQualityCheck(
       data: { status: 'QUALITY_PENDING' },
     });
 
+    // Derive counters from the freshly created checks (keeps ingredient-level
+    // progress authoritative from the start).
+    await recomputeApprovalProgress(prisma, qualityApproval.id);
+
     // Log activity
     await logActivity({
       userId: inspectorId,
@@ -101,9 +110,74 @@ export async function initiateQualityCheck(
 // ============================================================================
 
 /**
- * Record a QA check result for a consignment item
- * Updates QualityCheckItem with result (PASS/FAIL) and remarks
- * Updates parent QualityApproval pass/fail counts
+ * Recompute an approval's counters from its check items.
+ *
+ * Counters are tracked at *ingredient* (consignment item) granularity so a
+ * consignment can hold several independent checks per ingredient: an ingredient
+ * is PASSED only when every one of its checks passed, FAILED when any check
+ * failed, and PENDING while any check is outstanding or none was recorded.
+ */
+export async function recomputeApprovalProgress(
+  prisma: PrismaClient,
+  qualityApprovalId: string
+) {
+  const approval = await prisma.qualityApproval.findUnique({
+    where: { id: qualityApprovalId },
+    include: {
+      checkItems: true,
+      consignment: { include: { items: true } },
+    },
+  });
+
+  if (!approval) {
+    throw new Error('Quality approval record not found');
+  }
+
+  type Bucket = { pending: number; failed: number; checks: number };
+  const byIngredient = new Map<string, Bucket>();
+  for (const item of approval.consignment.items) {
+    byIngredient.set(item.id, { pending: 0, failed: 0, checks: 0 });
+  }
+
+  for (const check of approval.checkItems) {
+    const bucket = byIngredient.get(check.consignmentItemId);
+    if (!bucket) continue;
+    bucket.checks += 1;
+    if (check.status === 'PENDING' || !check.result) bucket.pending += 1;
+    else if (check.result === 'FAIL') bucket.failed += 1;
+  }
+
+  let passedItems = 0;
+  let failedItems = 0;
+  let pendingItems = 0;
+  for (const bucket of byIngredient.values()) {
+    if (bucket.checks === 0 || bucket.pending > 0) pendingItems += 1;
+    else if (bucket.failed > 0) failedItems += 1;
+    else passedItems += 1;
+  }
+
+  const totalItems = byIngredient.size;
+  let status: QualityApprovalStatus;
+  if (pendingItems > 0) status = QualityApprovalStatus.IN_PROGRESS;
+  else status = failedItems > 0 ? QualityApprovalStatus.FAILED : QualityApprovalStatus.PASSED;
+
+  const updated = await prisma.qualityApproval.update({
+    where: { id: qualityApprovalId },
+    data: {
+      totalItems,
+      passedItems,
+      failedItems,
+      status,
+      completedAt: pendingItems === 0 ? approval.completedAt ?? new Date() : null,
+    },
+  });
+
+  return { ...updated, pendingItems };
+}
+
+/**
+ * Record a QA check result for a consignment item.
+ * Persists the check status (PASSED/FAILED) so it stops counting as pending.
  */
 export async function updateCheckItem(
   prisma: PrismaClient,
@@ -125,46 +199,27 @@ export async function updateCheckItem(
       throw new Error('Quality check item not found');
     }
 
-    // Update check item with result
+    if (['APPROVED', 'REJECTED'].includes(checkItem.qualityApproval.status)) {
+      throw new Error(
+        `Cannot modify checks: quality approval is already ${checkItem.qualityApproval.status}`
+      );
+    }
+
     const updatedItem = await prisma.qualityCheckItem.update({
       where: { id: checkItemId },
       data: {
         checkType: data.checkType as QualityCheckType,
         result: data.result,
+        status:
+          data.result === 'PASS' ? QualityApprovalStatus.PASSED : QualityApprovalStatus.FAILED,
         remarks: data.remarks,
         checkedAt: new Date(),
         checkedById: data.inspectorId,
       },
-      include: { qualityApproval: true },
     });
 
-    // Update parent QualityApproval counts
-    const allItems = await prisma.qualityCheckItem.findMany({
-      where: { qualityApprovalId: checkItem.qualityApprovalId },
-    });
+    await recomputeApprovalProgress(prisma, checkItem.qualityApprovalId);
 
-    const passedCount = allItems.filter((item) => item.result === 'PASS').length;
-    const failedCount = allItems.filter((item) => item.result === 'FAIL').length;
-    const pendingCount = allItems.filter((item) => item.status === 'PENDING').length;
-
-    // Determine QualityApproval status based on checks
-    let qaStatus: QualityApprovalStatus = QualityApprovalStatus.IN_PROGRESS;
-    if (pendingCount === 0) {
-      // All items checked
-      qaStatus = failedCount > 0 ? QualityApprovalStatus.FAILED : QualityApprovalStatus.PASSED;
-    }
-
-    await prisma.qualityApproval.update({
-      where: { id: checkItem.qualityApprovalId },
-      data: {
-        passedItems: passedCount,
-        failedItems: failedCount,
-        status: qaStatus,
-        completedAt: pendingCount === 0 ? new Date() : null,
-      },
-    });
-
-    // Log activity
     await logActivity({
       userId: data.inspectorId,
       activityType: 'UPDATE',
@@ -177,6 +232,84 @@ export async function updateCheckItem(
     return updatedItem;
   } catch (error) {
     console.error('Error updating check item:', error);
+    throw error;
+  }
+}
+
+// ============================================================================
+// ADD INDEPENDENT CHECK
+// ============================================================================
+
+/**
+ * Append an extra, independent check to a specific ingredient.
+ *
+ * A consignment groups many ingredients, but each ingredient is checked on its
+ * own; a single ingredient may carry more than one check type (e.g. physical
+ * inspection + laboratory test), each recorded as its own row.
+ */
+export async function addCheckItem(
+  prisma: PrismaClient,
+  qualityApprovalId: string,
+  data: {
+    consignmentItemId: string;
+    checkType: QualityCheckType | string;
+    result?: 'PASS' | 'FAIL';
+    remarks?: string;
+    inspectorId: string;
+  }
+) {
+  try {
+    const approval = await prisma.qualityApproval.findUnique({
+      where: { id: qualityApprovalId },
+      include: { consignment: { include: { items: true } } },
+    });
+
+    if (!approval) {
+      throw new Error('Quality approval record not found');
+    }
+
+    if (['APPROVED', 'REJECTED'].includes(approval.status)) {
+      throw new Error(`Cannot add checks: quality approval is already ${approval.status}`);
+    }
+
+    const belongsToConsignment = approval.consignment.items.some(
+      (item) => item.id === data.consignmentItemId
+    );
+    if (!belongsToConsignment) {
+      throw new Error('Consignment item does not belong to this consignment');
+    }
+
+    const check = await prisma.qualityCheckItem.create({
+      data: {
+        qualityApprovalId,
+        consignmentItemId: data.consignmentItemId,
+        checkType: data.checkType as QualityCheckType,
+        result: data.result,
+        status: data.result
+          ? data.result === 'PASS'
+            ? QualityApprovalStatus.PASSED
+            : QualityApprovalStatus.FAILED
+          : QualityApprovalStatus.PENDING,
+        remarks: data.remarks,
+        checkedAt: data.result ? new Date() : null,
+        checkedById: data.result ? data.inspectorId : null,
+      },
+    });
+
+    await recomputeApprovalProgress(prisma, qualityApprovalId);
+
+    await logActivity({
+      userId: data.inspectorId,
+      activityType: 'CREATE',
+      module: 'qa',
+      description: `QA check added (${data.checkType}) for consignment ${approval.consignment.consignmentNumber}`,
+      entityType: 'QualityCheckItem',
+      entityId: check.id,
+    });
+
+    return check;
+  } catch (error) {
+    console.error('Error adding check item:', error);
     throw error;
   }
 }
@@ -208,19 +341,17 @@ export async function approveConsignment(
       throw new Error('Quality approval record not found');
     }
 
-    // Check all items are completed
-    const allItems = await prisma.qualityCheckItem.findMany({
-      where: { qualityApprovalId },
-    });
+    // Recompute ingredient-level progress so stale counters can never gate approval.
+    const progress = await recomputeApprovalProgress(prisma, qualityApprovalId);
 
-    const pendingItems = allItems.filter((item) => item.status === 'PENDING');
-    if (pendingItems.length > 0) {
-      throw new Error(`Cannot approve: ${pendingItems.length} items still pending checks`);
+    if (progress.totalItems === 0) {
+      throw new Error('Cannot approve: consignment has no items to check');
     }
-
-    const failedItems = allItems.filter((item) => item.result === 'FAIL');
-    if (failedItems.length > 0) {
-      throw new Error(`Cannot approve: ${failedItems.length} items failed QA checks`);
+    if (progress.pendingItems > 0) {
+      throw new Error(`Cannot approve: ${progress.pendingItems} ingredient(s) still pending checks`);
+    }
+    if (progress.failedItems > 0) {
+      throw new Error(`Cannot approve: ${progress.failedItems} ingredient(s) failed QA checks`);
     }
 
     // Approve quality check
@@ -341,14 +472,36 @@ export async function getQualityStatus(
         checkItems: {
           include: {
             consignmentItem: {
-              include: { material: true },
+              include: {
+                material: {
+                  select: { id: true, name: true, sku: true, unitOfMeasure: true },
+                },
+              },
             },
             checkedBy: { select: { fullName: true } },
+            attachments: {
+              include: { uploadedBy: { select: { fullName: true } } },
+              orderBy: { createdAt: 'asc' },
+            },
           },
+          orderBy: { createdAt: 'asc' },
         },
         startedBy: { select: { fullName: true } },
         approvedBy: { select: { fullName: true } },
-        consignment: true,
+        consignment: {
+          include: {
+            supplier: { select: { id: true, name: true } },
+            warehouse: { select: { id: true, name: true } },
+            items: {
+              include: {
+                material: {
+                  select: { id: true, name: true, sku: true, unitOfMeasure: true },
+                },
+              },
+              orderBy: { materialId: 'asc' },
+            },
+          },
+        },
       },
     });
 
@@ -356,25 +509,84 @@ export async function getQualityStatus(
       return null;
     }
 
-    // Group check items by status for summary
+    // Sign every attachment so the client can open the proof directly.
+    const checkItems = await Promise.all(
+      qualityApproval.checkItems.map(async (item) => ({
+        ...item,
+        attachments: await Promise.all(
+          item.attachments.map(async (attachment) => ({
+            ...attachment,
+            url: await storage.createQaReadUrl(attachment.storagePath),
+          }))
+        ),
+      }))
+    );
+
+    // Group the independent checks under the ingredient they belong to.
+    const ingredientMap = new Map<string, any>();
+    for (const consignmentItem of qualityApproval.consignment.items) {
+      ingredientMap.set(consignmentItem.id, {
+        consignmentItemId: consignmentItem.id,
+        material: consignmentItem.material,
+        quantity: consignmentItem.quantity,
+        distributedQty: consignmentItem.distributedQty,
+        unitOfMeasure: consignmentItem.unitOfMeasure,
+        status: 'PENDING',
+        attachmentCount: 0,
+        checks: [],
+      });
+    }
+
+    for (const check of checkItems) {
+      const group = ingredientMap.get(check.consignmentItemId);
+      if (!group) continue;
+      group.checks.push(check);
+      group.attachmentCount += check.attachments.length;
+    }
+
+    let passedItems = 0;
+    let failedItems = 0;
+    let pendingItems = 0;
+    for (const group of ingredientMap.values()) {
+      const hasPending = group.checks.some(
+        (check: any) => check.status === 'PENDING' || !check.result
+      );
+      const hasFailed = group.checks.some((check: any) => check.result === 'FAIL');
+      if (group.checks.length === 0 || hasPending) {
+        group.status = 'PENDING';
+        pendingItems += 1;
+      } else if (hasFailed) {
+        group.status = 'FAILED';
+        failedItems += 1;
+      } else {
+        group.status = 'PASSED';
+        passedItems += 1;
+      }
+    }
+
+    const totalItems = ingredientMap.size;
     const itemsByStatus = {
-      pending: qualityApproval.checkItems.filter((item) => item.status === 'PENDING'),
-      passed: qualityApproval.checkItems.filter((item) => item.result === 'PASS'),
-      failed: qualityApproval.checkItems.filter((item) => item.result === 'FAIL'),
+      pending: checkItems.filter((item) => item.status === 'PENDING' || !item.result),
+      passed: checkItems.filter((item) => item.result === 'PASS'),
+      failed: checkItems.filter((item) => item.result === 'FAIL'),
     };
 
     return {
       ...qualityApproval,
-      summary: {
-        totalItems: qualityApproval.totalItems,
-        passedItems: qualityApproval.passedItems,
-        failedItems: qualityApproval.failedItems,
-        pendingItems: qualityApproval.totalItems - qualityApproval.passedItems - qualityApproval.failedItems,
-        completionPercentage: Math.round(
-          ((qualityApproval.passedItems + qualityApproval.failedItems) / qualityApproval.totalItems) * 100
-        ),
-      },
+      checkItems,
+      itemsByIngredient: Array.from(ingredientMap.values()),
       itemsByStatus,
+      summary: {
+        totalItems,
+        passedItems,
+        failedItems,
+        pendingItems,
+        totalChecks: checkItems.length,
+        completionPercentage:
+          totalItems === 0
+            ? 0
+            : Math.round(((passedItems + failedItems) / totalItems) * 100),
+      },
     };
   } catch (error) {
     console.error('Error getting quality status:', error);
@@ -404,11 +616,25 @@ export async function getFailedItems(
           include: { material: true },
         },
         checkedBy: { select: { fullName: true } },
+        attachments: {
+          include: { uploadedBy: { select: { fullName: true } } },
+          orderBy: { createdAt: 'asc' },
+        },
       },
       orderBy: { createdAt: 'desc' },
     });
 
-    return failedItems;
+    return Promise.all(
+      failedItems.map(async (item) => ({
+        ...item,
+        attachments: await Promise.all(
+          item.attachments.map(async (attachment) => ({
+            ...attachment,
+            url: await storage.createQaReadUrl(attachment.storagePath),
+          }))
+        ),
+      }))
+    );
   } catch (error) {
     console.error('Error getting failed items:', error);
     throw error;
@@ -445,6 +671,7 @@ export async function generateQualityReport(
               include: { material: true },
             },
             checkedBy: { select: { fullName: true } },
+            attachments: true,
           },
         },
         startedBy: { select: { fullName: true } },
@@ -495,6 +722,7 @@ export async function generateQualityReport(
             remarks: i.remarks,
             checkedBy: i.checkedBy?.fullName,
             checkedAt: i.checkedAt,
+            proofCount: i.attachments?.length ?? 0,
           })),
       },
     };
@@ -522,12 +750,19 @@ export async function getConsignmentsAwaitingQA(
     const [consignments, total] = await Promise.all([
       prisma.consignment.findMany({
         where: {
-          status: 'QUALITY_PENDING',
+          // RECEIVED = received but QA not yet started; QUALITY_PENDING = in progress.
+          status: { in: ['RECEIVED', 'QUALITY_PENDING'] },
         },
         include: {
           supplier: { select: { id: true, name: true } },
           warehouse: { select: { id: true, name: true } },
-          items: true,
+          items: {
+            include: {
+              material: {
+                select: { id: true, name: true, sku: true, unitOfMeasure: true },
+              },
+            },
+          },
           qualityApproval: {
             include: {
               checkItems: true,
@@ -540,7 +775,7 @@ export async function getConsignmentsAwaitingQA(
         take: limit,
       }),
       prisma.consignment.count({
-        where: { status: 'QUALITY_PENDING' },
+        where: { status: { in: ['RECEIVED', 'QUALITY_PENDING'] } },
       }),
     ]);
 
@@ -575,9 +810,16 @@ export async function getApprovedConsignments(
         include: {
           supplier: { select: { id: true, name: true } },
           warehouse: { select: { id: true, name: true } },
-          items: true,
+          items: {
+            include: {
+              material: {
+                select: { id: true, name: true, sku: true, unitOfMeasure: true },
+              },
+            },
+          },
           qualityApproval: {
             include: {
+              checkItems: true,
               approvedBy: { select: { fullName: true } },
             },
           },
@@ -602,6 +844,188 @@ export async function getApprovedConsignments(
 }
 
 // ============================================================================
+// PROOF-OF-CHECK ATTACHMENTS
+// ============================================================================
+
+const EDITABLE_APPROVAL_STATUSES = ['PENDING', 'IN_PROGRESS', 'PASSED', 'FAILED'];
+
+/**
+ * Mint a signed upload URL for a proof file tied to a specific check item.
+ * The row is only created once the client confirms the upload (see
+ * `createAttachment`).
+ */
+export async function createAttachmentUploadUrl(
+  prisma: PrismaClient,
+  checkItemId: string,
+  fileName: string
+) {
+  const checkItem = await prisma.qualityCheckItem.findUnique({
+    where: { id: checkItemId },
+    include: { qualityApproval: true },
+  });
+
+  if (!checkItem) {
+    throw new Error('Quality check item not found');
+  }
+  if (!EDITABLE_APPROVAL_STATUSES.includes(checkItem.qualityApproval.status)) {
+    throw new Error(
+      `Cannot upload proof: quality approval is already ${checkItem.qualityApproval.status}`
+    );
+  }
+
+  const path = storage.buildQaAttachmentPath(
+    checkItem.qualityApproval.consignmentId,
+    checkItemId,
+    fileName
+  );
+  const upload = await storage.createQaUploadUrl(path);
+
+  return {
+    ...upload,
+    checkItemId,
+    consignmentId: checkItem.qualityApproval.consignmentId,
+  };
+}
+
+/** Register attachment metadata after the binary has been uploaded. */
+export async function createAttachment(
+  prisma: PrismaClient,
+  checkItemId: string,
+  data: {
+    fileName: string;
+    storagePath: string;
+    mimeType?: string;
+    fileSize?: number;
+    kind?: string;
+    uploadedById: string;
+  }
+) {
+  const checkItem = await prisma.qualityCheckItem.findUnique({
+    where: { id: checkItemId },
+    include: { qualityApproval: true },
+  });
+
+  if (!checkItem) {
+    throw new Error('Quality check item not found');
+  }
+  if (!EDITABLE_APPROVAL_STATUSES.includes(checkItem.qualityApproval.status)) {
+    throw new Error(
+      `Cannot attach proof: quality approval is already ${checkItem.qualityApproval.status}`
+    );
+  }
+
+  // Guard against a caller registering an object outside this check's folder.
+  const expectedPrefix = `consignments/${checkItem.qualityApproval.consignmentId}/checks/${checkItemId}/`;
+  if (!data.storagePath.startsWith(expectedPrefix)) {
+    throw new Error('storagePath does not match this check item');
+  }
+
+  const attachment = await prisma.qualityCheckAttachment.create({
+    data: {
+      qualityCheckItemId: checkItemId,
+      consignmentId: checkItem.qualityApproval.consignmentId,
+      fileName: data.fileName,
+      storagePath: data.storagePath,
+      mimeType: data.mimeType,
+      fileSize: data.fileSize,
+      kind: data.kind,
+      uploadedById: data.uploadedById,
+    },
+    include: { uploadedBy: { select: { fullName: true } } },
+  });
+
+  await logActivity({
+    userId: data.uploadedById,
+    activityType: 'CREATE',
+    module: 'qa',
+    description: `QA proof attached: ${data.fileName}`,
+    entityType: 'QualityCheckAttachment',
+    entityId: attachment.id,
+  });
+
+  return {
+    ...attachment,
+    url: await storage.createQaReadUrl(attachment.storagePath),
+  };
+}
+
+/** List the proof attached to a single check item, with signed read URLs. */
+export async function listAttachments(prisma: PrismaClient, checkItemId: string) {
+  const attachments = await prisma.qualityCheckAttachment.findMany({
+    where: { qualityCheckItemId: checkItemId },
+    include: { uploadedBy: { select: { fullName: true } } },
+    orderBy: { createdAt: 'asc' },
+  });
+
+  return Promise.all(
+    attachments.map(async (attachment) => ({
+      ...attachment,
+      url: await storage.createQaReadUrl(attachment.storagePath),
+    }))
+  );
+}
+
+/** All proof attached anywhere on a consignment (for the detail view). */
+export async function listConsignmentAttachments(
+  prisma: PrismaClient,
+  consignmentId: string
+) {
+  const attachments = await prisma.qualityCheckAttachment.findMany({
+    where: { consignmentId },
+    include: { uploadedBy: { select: { fullName: true } } },
+    orderBy: { createdAt: 'asc' },
+  });
+
+  return Promise.all(
+    attachments.map(async (attachment) => ({
+      ...attachment,
+      url: await storage.createQaReadUrl(attachment.storagePath),
+    }))
+  );
+}
+
+/** Delete a proof file (row + storage object). Blocked once approved. */
+export async function deleteAttachment(
+  prisma: PrismaClient,
+  attachmentId: string,
+  deletedById: string
+) {
+  const attachment = await prisma.qualityCheckAttachment.findUnique({
+    where: { id: attachmentId },
+    include: { qualityCheckItem: { include: { qualityApproval: true } } },
+  });
+
+  if (!attachment) {
+    throw new Error('Attachment not found');
+  }
+
+  const approvalStatus = attachment.qualityCheckItem.qualityApproval.status;
+  if (approvalStatus === 'APPROVED') {
+    throw new Error('Cannot delete proof from an approved consignment. Reject first if needed.');
+  }
+
+  await prisma.qualityCheckAttachment.delete({ where: { id: attachmentId } });
+
+  try {
+    await storage.removeQaObject(attachment.storagePath);
+  } catch (error) {
+    // The metadata row is already gone; surface the storage issue without failing.
+    console.error('Failed to remove attachment object from storage:', error);
+  }
+
+  await logActivity({
+    userId: deletedById,
+    activityType: 'DELETE',
+    module: 'qa',
+    description: `QA proof deleted: ${attachment.fileName}`,
+    entityType: 'QualityCheckAttachment',
+    entityId: attachmentId,
+  });
+
+  return { success: true };
+}
+
+// ============================================================================
 // DELETE QUALITY APPROVAL
 // ============================================================================
 
@@ -616,7 +1040,10 @@ export async function deleteQualityApproval(
   try {
     const qualityApproval = await prisma.qualityApproval.findUnique({
       where: { id: qualityApprovalId },
-      include: { consignment: true, checkItems: true },
+      include: {
+        consignment: true,
+        checkItems: { include: { attachments: true } },
+      },
     });
 
     if (!qualityApproval) {
@@ -628,7 +1055,11 @@ export async function deleteQualityApproval(
       throw new Error('Cannot delete approved quality checks. Reject first if needed.');
     }
 
-    // Delete all check items first (cascade)
+    // Delete all check items first (cascade removes attachment rows)
+    const storagePaths = qualityApproval.checkItems.flatMap((item) =>
+      item.attachments.map((attachment) => attachment.storagePath)
+    );
+
     await prisma.qualityCheckItem.deleteMany({
       where: { qualityApprovalId },
     });
@@ -645,6 +1076,15 @@ export async function deleteQualityApproval(
         status: ConsignmentStatus.RECEIVED,
       },
     });
+
+    // Best-effort cleanup of the orphaned proof files.
+    await Promise.all(
+      storagePaths.map((path) =>
+        storage.removeQaObject(path).catch((error) =>
+          console.error('Failed to remove attachment object from storage:', error)
+        )
+      )
+    );
 
     // Log activity
     await logActivity({

@@ -381,8 +381,10 @@ export async function getUserActivity(userId: string, days: number = 30) {
  * Get system activity timeline - all entities across time
  */
 export async function getSystemActivityTimeline(days: number = 7, limit: number = 100) {
+  // If asking for recent data but the DB is mostly old data, fetch a wider window
+  // This ensures the Entity Timeline always has data to display
   const sinceDate = new Date();
-  sinceDate.setDate(sinceDate.getDate() - days);
+  sinceDate.setDate(sinceDate.getDate() - Math.max(days, 90)); // Always look back at least 90 days
 
   const timelineMap = new Map<string, any>();
 

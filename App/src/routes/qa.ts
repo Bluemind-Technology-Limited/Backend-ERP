@@ -32,23 +32,40 @@ router.get("/inspections", requirePermission("qa", "read"), async (req: Request,
     // Resolve the reference (GRN or Production Order) for context
     const grnIds = inspections.filter((i) => i.inspectionType === "GRN").map((i) => i.referenceId).filter(Boolean) as string[];
     const prodIds = inspections.filter((i) => i.inspectionType === "FINISHED_BATCH").map((i) => i.referenceId).filter(Boolean) as string[];
-    const [grns, prodOrders] = await Promise.all([
+    const [grns, prodOrders, planItems] = await Promise.all([
       grnIds.length
         ? prisma.goodsReceipt.findMany({ where: { id: { in: grnIds } }, select: { id: true, number: true } })
         : Promise.resolve([]),
       prodIds.length
         ? prisma.productionOrder.findMany({ where: { id: { in: prodIds } }, select: { id: true, orderNumber: true } })
         : Promise.resolve([]),
+      // Finished batches also originate from production-plan line items.
+      prodIds.length
+        ? prisma.productionPlanItem.findMany({
+            where: { id: { in: prodIds } },
+            select: {
+              id: true,
+              bom: { select: { productName: true } },
+              productionPlan: { select: { planNumber: true } },
+            },
+          })
+        : Promise.resolve([]),
     ]);
     const grnMap = new Map(grns.map((g) => [g.id, g.number]));
     const prodMap = new Map(prodOrders.map((p) => [p.id, p.orderNumber]));
+    const planItemMap = new Map(
+      planItems.map((p) => [
+        p.id,
+        `${p.productionPlan?.planNumber ?? "PLAN"} · ${p.bom?.productName ?? "batch"}`,
+      ])
+    );
 
     const rows = inspections.map((i) => ({
       ...i,
       referenceLabel:
         i.inspectionType === "GRN"
           ? grnMap.get(i.referenceId ?? "") ?? i.referenceId
-          : prodMap.get(i.referenceId ?? "") ?? i.referenceId,
+          : prodMap.get(i.referenceId ?? "") ?? planItemMap.get(i.referenceId ?? "") ?? i.referenceId,
     }));
 
     res.json({ inspections: rows });

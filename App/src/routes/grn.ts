@@ -197,7 +197,9 @@ router.post("/consignment", requirePermission("procurement", "create"), async (r
       const receipt = await tx.goodsReceipt.create({
         data: {
           number,
-          poId: "consignment-based", // Mark as consignment-based (alternative: nullable field)
+          // Consignment-based receipts have no Purchase Order behind them.
+          poId: null,
+          consignmentId,
           receivedById: req.user!.id,
           status: "PENDING_QA",
           receivedAt: new Date(),
@@ -253,6 +255,7 @@ router.post("/consignment", requirePermission("procurement", "create"), async (r
           materialId,
           batchLotId: batchLot.id,
           warehouseId,
+          consignmentItemId: consignmentItem.id,
           quantity: Number(quantity),
           unitOfMeasure,
           referenceType: "GRN",
@@ -306,7 +309,7 @@ router.delete("/:grnId", requirePermission("procurement", "delete"), async (req:
       // 1. Delete ledger entries for this GRN
       await tx.inventoryTransaction.deleteMany({
         where: {
-          referenceType: "PO_RECEIPT",
+          referenceType: "GRN",
           referenceId: grnId,
         },
       });

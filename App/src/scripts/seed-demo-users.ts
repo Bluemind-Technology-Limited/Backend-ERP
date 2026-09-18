@@ -15,7 +15,10 @@ const DEMO_USERS = [
   { email: "store@kib.group", password: "demopass123", fullName: "Store Officer", role: "STORE_OFFICER" },
   { email: "production@kib.group", password: "demopass123", fullName: "Sarah Connor", role: "PRODUCTION_MANAGER" },
   { email: "procurement@kib.group", password: "demopass123", fullName: "Procurement Officer", role: "PROCUREMENT_OFFICER" },
-  { email: "qa@kib.group", password: "demopass123", fullName: "QA Inspector", role: "QA_INSPECTOR" },
+  { email: "qa@kib.group", password: "demopass123", fullName: "QC Officer", role: "QC" },
+  { email: "headqc@kib.group", password: "demopass123", fullName: "Head of QC", role: "HEAD_OF_QC" },
+  { email: "grinding@kib.group", password: "demopass123", fullName: "Grinding Supervisor", role: "GRINDING_SUPERVISOR" },
+  { email: "supervisor@kib.group", password: "demopass123", fullName: "Production Supervisor", role: "PRODUCTION_SUPERVISOR" },
 ] as const;
 
 async function main() {

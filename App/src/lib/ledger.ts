@@ -18,6 +18,7 @@ export interface LedgerEntryInput {
   batchLotId?: string | null;
   warehouseId: string;
   binId?: string | null;
+  consignmentItemId?: string | null; // links consignment stock to its ingredient
   quantity: number; // signed: + in, - out
   unitOfMeasure: string;
   referenceType?: string | null; // PO, GRN, PROD_ORDER, ADJUSTMENT, TRANSFER
@@ -47,6 +48,7 @@ export async function postLedgerEntry(tx: LedgerDb, input: LedgerEntryInput) {
       batchLotId: input.batchLotId ?? null,
       warehouseId: input.warehouseId,
       binId: input.binId ?? null,
+      consignmentItemId: input.consignmentItemId ?? null,
       quantity: input.quantity,
       unitOfMeasure: input.unitOfMeasure,
       referenceType: input.referenceType ?? null,

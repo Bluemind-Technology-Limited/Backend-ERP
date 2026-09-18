@@ -7,6 +7,10 @@ export default defineConfig({
     path: "prisma/migrations",
   },
   datasource: {
-    url: env("DATABASE_URL"),
+    // Migrations/introspection need the direct (session) connection. The
+    // transaction pooler (pgbouncer, :6543) cannot run DDL, which is why
+    // `DATABASE_URL` (the pooler) fails here. App runtime is unaffected —
+    // it connects through its own `pg` adapter using DATABASE_URL.
+    url: env("DIRECT_URL"),
   },
 });

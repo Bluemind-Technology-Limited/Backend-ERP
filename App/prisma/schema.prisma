@@ -20,8 +20,10 @@ enum UserRole {
   STORE_OFFICER // requisitions, GRN receiving, issues to production, transfers
   PRODUCTION_MANAGER // BOMs, production orders, machines/staff allocation
   PRODUCTION_SUPERVISOR // views plans, allocates batches to machines, reconciles daily output
+  GRINDING_SUPERVISOR // runs the grinding station: batch throughput, actual output, input remainders
   PROCUREMENT_OFFICER // suppliers, requisition -> purchase orders
-  QA_INSPECTOR // block/release batches, lab tests, GRN approval
+  QC // quality checks on consignments/batches, proposes quantity changes
+  HEAD_OF_QC // approves QC quantity changes, owns the QA report
   OPERATOR // operates machines, logs breakdowns, records performance
   TECHNICIAN // maintains machines, manages spare parts, resolves breakdowns
 }
@@ -86,6 +88,17 @@ enum ProductionPlanStatus {
   CANCELLED
 }
 
+enum ProductionStage {
+  GRINDING
+  FINISHING
+}
+
+enum ProductionStageStatus {
+  SUBMITTED
+  VERIFIED
+  FLAGGED
+}
+
 enum ConsignmentStatus {
   DRAFT
   READY_FOR_SHIPMENT
@@ -113,6 +126,18 @@ enum QualityCheckType {
   PACKAGING_INSPECTION
   DOCUMENTATION_REVIEW
   LABORATORY_TEST
+}
+
+enum CostChangeStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum QuantityAdjustmentStatus {
+  PENDING
+  APPROVED
+  REJECTED
 }
 
 enum ProductionIngredientStatus {
@@ -184,6 +209,11 @@ model User {
   qualityApprovalsStarted   QualityApproval[]      @relation("quality_approval_started")
   qualityApprovalsApproved  QualityApproval[]      @relation("quality_approval_approved")
   qualityCheckItems         QualityCheckItem[]     @relation("quality_check_performed")
+  qualityCheckAttachments   QualityCheckAttachment[]
+  quantityAdjustmentsRequested QuantityAdjustment[] @relation("qty_adj_requested")
+  quantityAdjustmentsApproved  QuantityAdjustment[] @relation("qty_adj_approved")
+  costAuditsCreated         CostAudit[]            @relation("cost_changed_by")
+  costAuditsApproved        CostAudit[]            @relation("cost_approved_by")
 
   @@map("users")
 }
@@ -218,6 +248,9 @@ model Material {
   defaultExpiryDate DateTime?    @map("default_expiry_date") // Default expiry (e.g., 2 years out)
   requiresLot       Boolean      @default(true) @map("requires_lot")
   minQuantity       Decimal?     @default(0) @map("min_quantity") @db.Decimal(15, 4)
+  standardCost      Decimal?     @default(0) @map("standard_cost") @db.Decimal(15, 4)
+  lastCostUpdateAt  DateTime?    @map("last_cost_update_at")
+  lastCostUpdatedBy String?      @map("last_cost_updated_by")
   attachments       Json? // [{name, url, kind: NAFDAC|MSDS|COA}]
   status            RecordStatus @default(ACTIVE)
   createdAt         DateTime     @default(now()) @map("created_at")
@@ -235,6 +268,8 @@ model Material {
   bomFinishedSku        Bom[]                  @relation("finished_sku")
   planAggregatedIngredients PlanAggregatedIngredient[] @relation("plan_ingredients")
   consignmentItems      ConsignmentItem[]      @relation("consignment_items")
+  quantityAdjustments   QuantityAdjustment[]
+  grindingInputs        ProductionGrindingInput[]
 
   @@map("materials")
 }
@@ -336,6 +371,7 @@ model BatchLot {
   grnItems              GoodsReceiptItem[]
   inspections           InspectionRecord[]
   productionIngredients ProductionIngredient[]
+  grindingInputs        ProductionGrindingInput[]
 
   @@unique([materialId, batchNumber])
   @@map("batch_lots")
@@ -350,6 +386,7 @@ model InventoryTransaction {
   batchLotId    String?         @map("batch_lot_id")
   warehouseId   String          @map("warehouse_id")
   binId         String?         @map("bin_id")
+  consignmentItemId String?     @map("consignment_item_id") // links consignment stock to its ingredient
   quantity      Decimal         @db.Decimal(15, 4) // signed: + in, - out
   unitOfMeasure String          @map("unit_of_measure")
   referenceType String?         @map("reference_type") // PO, GRN, PROD_ORDER, ADJUSTMENT
@@ -361,8 +398,9 @@ model InventoryTransaction {
 
   material   Material      @relation(fields: [materialId], references: [id])
   batchLot   BatchLot?     @relation(fields: [batchLotId], references: [id])
-  warehouse  Warehouse     @relation(fields: [warehouseId], references: [id])
-  bin        WarehouseBin? @relation(fields: [binId], references: [id])
+  warehouse  Warehouse       @relation(fields: [warehouseId], references: [id])
+  bin        WarehouseBin?   @relation(fields: [binId], references: [id])
+  consignmentItem ConsignmentItem? @relation(fields: [consignmentItemId], references: [id], onDelete: SetNull)
   createdBy  User          @relation("transaction_creator", fields: [createdById], references: [id])
   approvedBy User?         @relation("adjustment_approver", fields: [approvedById], references: [id])
 
@@ -449,7 +487,8 @@ model PurchaseOrderItem {
 model GoodsReceipt {
   id           String             @id @default(uuid())
   number       String             @unique
-  poId         String             @map("po_id")
+  poId         String?            @map("po_id")
+  consignmentId String?           @map("consignment_id")
   receivedById String             @map("received_by_id")
   status       GoodsReceiptStatus @default(PENDING_QA)
   receivedAt   DateTime           @default(now()) @map("received_at")
@@ -459,7 +498,8 @@ model GoodsReceipt {
   createdAt    DateTime           @default(now()) @map("created_at")
   updatedAt    DateTime           @updatedAt @map("updated_at")
 
-  po         PurchaseOrder      @relation(fields: [poId], references: [id])
+  po         PurchaseOrder?     @relation(fields: [poId], references: [id])
+  consignment Consignment?       @relation(fields: [consignmentId], references: [id])
   receivedBy User               @relation(fields: [receivedById], references: [id])
   items      GoodsReceiptItem[]
 
@@ -473,6 +513,7 @@ model GoodsReceiptItem {
   batchLotId    String  @map("batch_lot_id")
   quantity      Decimal @db.Decimal(15, 4)
   unitOfMeasure String  @map("unit_of_measure")
+  unitCost      Decimal @default(0) @map("unit_cost") @db.Decimal(15, 4)
 
   grn      GoodsReceipt @relation(fields: [grnId], references: [id], onDelete: Cascade)
   material Material     @relation(fields: [materialId], references: [id])
@@ -519,6 +560,8 @@ model BomIngredient {
   quantity      Decimal @db.Decimal(15, 4)
   unitOfMeasure String  @map("unit_of_measure")
   isPercentage  Boolean @default(false) @map("is_percentage") // % vs absolute weight
+  estimatedCost Decimal @default(0) @map("estimated_cost") @db.Decimal(15, 4)
+  costUpdatedAt DateTime? @map("cost_updated_at")
 
   bom      Bom      @relation(fields: [bomId], references: [id], onDelete: Cascade)
   material Material @relation(fields: [materialId], references: [id])
@@ -626,6 +669,9 @@ model ProductionOrder {
   ingredientsReleasedById String?               @map("ingredients_released_by_id")
   yieldLoggedAt           DateTime?             @map("yield_logged_at")
   yieldLoggedById         String?               @map("yield_logged_by_id")
+  estimatedCost           Decimal?              @default(0) @map("estimated_cost") @db.Decimal(15, 4)
+  actualCost              Decimal?              @map("actual_cost") @db.Decimal(15, 4)
+  costVariance            Decimal?              @map("cost_variance") @db.Decimal(15, 4)
   createdAt               DateTime              @default(now()) @map("created_at")
   updatedAt               DateTime              @updatedAt @map("updated_at")
 
@@ -680,6 +726,7 @@ model ProductionPlan {
   createdBy                 User                          @relation(fields: [createdById], references: [id])
   items                     ProductionPlanItem[]
   aggregatedIngredients     PlanAggregatedIngredient[]
+  stageRecords              ProductionStageRecord[]
   reconciliations           DailyProductionReconciliation[]
 
   @@index([status])
@@ -698,6 +745,7 @@ model ProductionPlanItem {
   productionPlan           ProductionPlan        @relation(fields: [productionPlanId], references: [id], onDelete: Cascade)
   bom                      Bom                   @relation(fields: [bomId], references: [id])
   batchMachineAllocations  BatchMachineAllocation[]
+  stageRecords             ProductionStageRecord[]
 
   @@index([productionPlanId])
   @@index([bomId])
@@ -712,12 +760,97 @@ model PlanAggregatedIngredient {
   unitOfMeasure    String  @map("unit_of_measure")
   status           String  @default("PENDING") // PENDING, RELEASED, COMPLETED
 
+  // Stock Manager issuance (station 1). Scalar ids keep this model decoupled.
+  issuedQuantity    Decimal?  @map("issued_quantity") @db.Decimal(15, 4)
+  issuedWarehouseId String?   @map("issued_warehouse_id")
+  issuedBatchLotId  String?   @map("issued_batch_lot_id")
+  issuedAt          DateTime? @map("issued_at")
+  issuedById        String?   @map("issued_by_id")
+  returnedQuantity  Decimal   @default(0) @map("returned_quantity") @db.Decimal(15, 4)
+
   productionPlan ProductionPlan @relation(fields: [productionPlanId], references: [id], onDelete: Cascade)
   material       Material       @relation("plan_ingredients", fields: [materialId], references: [id])
 
   @@index([productionPlanId])
   @@index([materialId])
   @@map("plan_aggregated_ingredients")
+}
+
+/// A station's daily result for one plan item: grinding throughput (station 2)
+/// or finished-goods output (station 3). Remainders are captured per material in
+/// `ProductionStageRemainder` so unused raw material can be returned to stock.
+model ProductionStageRecord {
+  id                    String                @id @default(uuid())
+  productionPlanId      String                @map("production_plan_id")
+  planItemId            String                @map("plan_item_id")
+  stage                 ProductionStage
+  inputQuantity         Decimal               @map("input_quantity") @db.Decimal(15, 4)
+  achievedQuantity      Decimal               @map("achieved_quantity") @db.Decimal(15, 4)
+  remainderQuantity     Decimal               @default(0) @map("remainder_quantity") @db.Decimal(15, 4)
+  unitOfMeasure         String                @map("unit_of_measure")
+  batchNumber           String?               @map("batch_number")
+  machineId             String?               @map("machine_id")
+  warehouseId           String?               @map("warehouse_id")
+  finishedBatchLotId    String?               @map("finished_batch_lot_id")
+  returnedTransactionId String?               @map("returned_transaction_id")
+  productionDate        DateTime              @map("production_date")
+  status                ProductionStageStatus @default(SUBMITTED)
+  remarks               String?
+  recordedById          String                @map("recorded_by_id")
+  recordedAt            DateTime              @default(now()) @map("recorded_at")
+  createdAt             DateTime              @default(now()) @map("created_at")
+  updatedAt             DateTime              @updatedAt @map("updated_at")
+
+  productionPlan ProductionPlan             @relation(fields: [productionPlanId], references: [id], onDelete: Cascade)
+  planItem       ProductionPlanItem         @relation(fields: [planItemId], references: [id], onDelete: Cascade)
+  remainders     ProductionStageRemainder[]
+  grindingInputs ProductionGrindingInput[]
+
+  @@index([productionPlanId, stage])
+  @@index([planItemId, stage])
+  @@index([productionDate])
+  @@map("production_stage_records")
+}
+
+/// Unused material handed back from a station (per ingredient), returned to stock.
+model ProductionStageRemainder {
+  id                 String   @id @default(uuid())
+  stageRecordId      String   @map("stage_record_id")
+  materialId         String   @map("material_id")
+  quantity           Decimal  @db.Decimal(15, 4)
+  unitOfMeasure      String   @map("unit_of_measure")
+  warehouseId        String?  @map("warehouse_id")
+  batchLotId         String?  @map("batch_lot_id")
+  inventoryTransactionId String? @map("inventory_transaction_id")
+  createdAt          DateTime @default(now()) @map("created_at")
+
+  stageRecord ProductionStageRecord @relation(fields: [stageRecordId], references: [id], onDelete: Cascade)
+
+  @@index([stageRecordId])
+  @@index([materialId])
+  @@map("production_stage_remainders")
+}
+
+/// The exact batch lots a grinding station consumed for a batch. This is what
+/// makes a plan-produced finished batch traceable to *specific* raw batches
+/// (rather than just "whatever was issued to the plan").
+model ProductionGrindingInput {
+  id            String   @id @default(uuid())
+  stageRecordId String   @map("stage_record_id")
+  materialId    String   @map("material_id")
+  batchLotId    String?  @map("batch_lot_id")
+  quantity      Decimal  @db.Decimal(15, 4)
+  unitOfMeasure String   @map("unit_of_measure")
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  stageRecord ProductionStageRecord @relation(fields: [stageRecordId], references: [id], onDelete: Cascade)
+  material    Material             @relation(fields: [materialId], references: [id])
+  batchLot    BatchLot?            @relation(fields: [batchLotId], references: [id])
+
+  @@index([stageRecordId])
+  @@index([materialId])
+  @@index([batchLotId])
+  @@map("production_grinding_inputs")
 }
 
 // ---------------------------------------------------------------------------
@@ -744,9 +877,12 @@ model Consignment {
   warehouse          Warehouse           @relation(fields: [warehouseId], references: [id])
   createdBy          User                @relation("consignment_creator", fields: [createdById], references: [id])
   receivedBy         User?               @relation("consignment_receiver", fields: [receivedById], references: [id])
-  items              ConsignmentItem[]
-  distributions      ConsignmentDistribution[]
-  qualityApproval    QualityApproval?
+  items               ConsignmentItem[]
+  distributions       ConsignmentDistribution[]
+  qualityApproval     QualityApproval?
+  qualityAttachments  QualityCheckAttachment[]
+  quantityAdjustments QuantityAdjustment[]
+  goodsReceipts       GoodsReceipt[]
 
   @@index([status])
   @@index([supplierId])
@@ -767,6 +903,8 @@ model ConsignmentItem {
   material       Material    @relation("consignment_items", fields: [materialId], references: [id])
   distributions  ConsignmentDistribution[]
   qualityChecks  QualityCheckItem[]         @relation("quality_checks")
+  quantityAdjustments QuantityAdjustment[]
+  inventoryTransactions InventoryTransaction[]
 
   @@index([consignmentId])
   @@index([materialId])
@@ -841,11 +979,73 @@ model QualityCheckItem {
   qualityApproval   QualityApproval  @relation(fields: [qualityApprovalId], references: [id], onDelete: Cascade)
   consignmentItem   ConsignmentItem  @relation("quality_checks", fields: [consignmentItemId], references: [id], onDelete: Cascade)
   checkedBy         User?            @relation("quality_check_performed", fields: [checkedById], references: [id])
+  attachments       QualityCheckAttachment[]
 
   @@index([qualityApprovalId])
   @@index([consignmentItemId])
   @@index([status])
   @@map("quality_check_items")
+}
+
+/// Proof of a quality check (photo, certificate, lab report, ...). One check
+/// item may carry several attachments. Files live in Supabase Storage; only the
+/// object path is stored here, and signed URLs are minted on read.
+model QualityCheckAttachment {
+  id                 String   @id @default(uuid())
+  qualityCheckItemId String   @map("quality_check_item_id")
+  consignmentId      String   @map("consignment_id")
+  fileName           String   @map("file_name")
+  storagePath        String   @map("storage_path")
+  mimeType           String?  @map("mime_type")
+  fileSize           Int?     @map("file_size")
+  kind               String? // PHOTO | COA | LAB_REPORT | DOCUMENT
+  uploadedById       String   @map("uploaded_by_id")
+  createdAt          DateTime @default(now()) @map("created_at")
+
+  qualityCheckItem QualityCheckItem @relation(fields: [qualityCheckItemId], references: [id], onDelete: Cascade)
+  consignment      Consignment     @relation(fields: [consignmentId], references: [id], onDelete: Cascade)
+  uploadedBy       User            @relation(fields: [uploadedById], references: [id])
+
+  @@index([qualityCheckItemId])
+  @@index([consignmentId])
+  @@map("quality_check_attachments")
+}
+
+/// QC-proposed change to a consignment ingredient's quantity, approved by the
+/// Head of QC. Approval makes the new quantity authoritative and posts only the
+/// delta not already reflected in the inventory ledger.
+model QuantityAdjustment {
+  id                     String                   @id @default(uuid())
+  consignmentId          String                   @map("consignment_id")
+  consignmentItemId      String                   @map("consignment_item_id")
+  materialId             String                   @map("material_id")
+  oldQuantity            Decimal                  @map("old_quantity") @db.Decimal(15, 4)
+  newQuantity            Decimal                  @map("new_quantity") @db.Decimal(15, 4)
+  difference             Decimal                  @db.Decimal(15, 4)
+  reasonCode             String?                  @map("reason_code") // SHORTAGE | DAMAGE | OVERAGE | QUALITY_REJECT | RECOUNT
+  reason                 String?
+  status                 QuantityAdjustmentStatus @default(PENDING)
+  requestedById          String                   @map("requested_by_id")
+  requestedAt            DateTime                 @default(now()) @map("requested_at")
+  approvedById           String?                  @map("approved_by_id")
+  decidedAt              DateTime?                @map("decided_at")
+  rejectionReason        String?                  @map("rejection_reason")
+  appliedAt              DateTime?                @map("applied_at")
+  inventoryTransactionId String?                  @map("inventory_transaction_id")
+  createdAt              DateTime                 @default(now()) @map("created_at")
+  updatedAt              DateTime                 @updatedAt @map("updated_at")
+
+  consignment     Consignment     @relation(fields: [consignmentId], references: [id], onDelete: Cascade)
+  consignmentItem ConsignmentItem @relation(fields: [consignmentItemId], references: [id], onDelete: Cascade)
+  material        Material        @relation(fields: [materialId], references: [id])
+  requestedBy     User            @relation("qty_adj_requested", fields: [requestedById], references: [id])
+  approvedBy      User?           @relation("qty_adj_approved", fields: [approvedById], references: [id])
+
+  @@index([consignmentId])
+  @@index([consignmentItemId])
+  @@index([status])
+  @@index([requestedById])
+  @@map("quantity_adjustments")
 }
 
 // ---------------------------------------------------------------------------
@@ -954,7 +1154,37 @@ model DailyProductionReconciliation {
 }
 
 // ---------------------------------------------------------------------------
-// 7. Notifications / Alerts
+// 7. Cost Management & Audit
+// ---------------------------------------------------------------------------
+
+model CostAudit {
+  id             String            @id @default(uuid())
+  entityType     String            @map("entity_type") // Material, PurchaseOrderItem, BomIngredient, ProductionOrder, GoodsReceiptItem
+  entityId       String            @map("entity_id")
+  fieldName      String            @map("field_name") // unitCost, standardCost, estimatedCost, actualCost
+  oldValue       Decimal?          @map("old_value") @db.Decimal(15, 4)
+  newValue       Decimal           @map("new_value") @db.Decimal(15, 4)
+  reason         String?           // Why the cost was changed
+  changeType     String            @map("change_type") // MANUAL, APPROVED, BULK_UPDATE
+  status         CostChangeStatus  @default(PENDING)
+  changedById    String            @map("changed_by_id")
+  approvedById   String?           @map("approved_by_id")
+  approvedAt     DateTime?         @map("approved_at")
+  rejectionReason String?          @map("rejection_reason")
+  changedAt      DateTime          @default(now()) @map("changed_at")
+  updatedAt      DateTime          @updatedAt @map("updated_at")
+
+  changedBy  User  @relation("cost_changed_by", fields: [changedById], references: [id])
+  approvedBy User? @relation("cost_approved_by", fields: [approvedById], references: [id])
+
+  @@index([entityType, entityId])
+  @@index([changedById, changedAt])
+  @@index([status, changedAt])
+  @@map("cost_audits")
+}
+
+// ---------------------------------------------------------------------------
+// 8. Notifications / Alerts
 // ---------------------------------------------------------------------------
 
 model Notification {

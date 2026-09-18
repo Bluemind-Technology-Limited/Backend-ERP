@@ -3,7 +3,7 @@
  * Run with: pnpm tsx src/scripts/add-user.ts YOUR_EMAIL YOUR_FULL_NAME YOUR_ROLE
  *
  * Example: pnpm tsx src/scripts/add-user.ts myemail@example.com "John Doe" SUPER_ADMIN
- * Roles: SUPER_ADMIN, EXECUTIVE_ADMIN, STORE_OFFICER, PRODUCTION_MANAGER, PROCUREMENT_OFFICER, QA_INSPECTOR, OPERATOR, TECHNICIAN
+ * Roles: SUPER_ADMIN, EXECUTIVE_ADMIN, STORE_OFFICER, PRODUCTION_MANAGER, PRODUCTION_SUPERVISOR, GRINDING_SUPERVISOR, PROCUREMENT_OFFICER, QC, HEAD_OF_QC, OPERATOR, TECHNICIAN
  */
 import "dotenv/config";
 import { createClient } from "@supabase/supabase-js";

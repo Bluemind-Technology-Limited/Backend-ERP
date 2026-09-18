@@ -674,6 +674,19 @@ router.post("/production-orders/:id/release", requirePermission("production", "u
     });
     if (!order) return res.status(404).json({ error: "Production order not found" });
 
+    // Canonical consumption: when this order is allocated to a production plan,
+    // the plan's Stock Issue station is the single path that deducts stock.
+    // Release still records the order's own ingredient tracking + status, but
+    // posts no ledger entry (avoids the historical double deduction).
+    const allocation = await prisma.batchMachineAllocation.findFirst({
+      where: { productionOrderId: order.id },
+      include: {
+        planItem: { include: { productionPlan: { select: { planNumber: true } } } },
+      },
+    });
+    const planLinked = Boolean(allocation);
+    const planNumber = allocation?.planItem.productionPlan.planNumber ?? null;
+
     await prisma.$transaction(async (tx) => {
       for (const ingReq of ingredients) {
         const matchingIng = order.productionIngredients.find(i => i.id === ingReq.id);
@@ -921,151 +934,13 @@ router.post("/production-orders/:id/complete", requirePermission("production", "
 // -> consumed raw batches -> GRN -> PO -> Supplier
 // ---------------------------------------------------------------------------
 
-async function getBatchInbound(batchLotId: string) {
-  const grnItem = await prisma.goodsReceiptItem.findFirst({
-    where: { batchLotId },
-    include: {
-      grn: {
-        include: {
-          po: { include: { supplier: { select: { id: true, name: true, contactPerson: true } } } },
-        },
-      },
-    },
-  });
-  if (!grnItem) return null;
-  return {
-    grnNumber: grnItem.grn.number,
-    receivedAt: grnItem.grn.receivedAt,
-    quantity: Number(grnItem.quantity),
-    unitOfMeasure: grnItem.unitOfMeasure,
-    poNumber: grnItem.grn.po.number,
-    orderDate: grnItem.grn.po.orderDate,
-    supplier: grnItem.grn.po.supplier,
-  };
-}
+// (trace helpers removed — see services/traceabilityService.ts)
 
-async function buildTraceTree(batchId: string) {
-  const batch = await prisma.batchLot.findUnique({
-    where: { id: batchId },
-    include: {
-      material: { select: { id: true, name: true, sku: true, type: true, unitOfMeasure: true } },
-    },
-  });
-  if (!batch) return null;
+// (buildTraceTree removed — see services/traceabilityService.ts)
 
-  const inbound = await getBatchInbound(batch.id);
-
-  // Was this batch produced by a production order (finished good)?
-  const prodOrder = await prisma.productionOrder.findFirst({
-    where: { finishedBatchId: batch.id },
-    include: {
-      bom: {
-        include: {
-          ingredients: {
-            include: { material: { select: { id: true, name: true, sku: true, type: true } } },
-          },
-        },
-      },
-    },
-  });
-
-  let producedBy: any = null;
-  let ingredients: any[] = [];
-  if (prodOrder) {
-    producedBy = {
-      orderNumber: prodOrder.orderNumber,
-      targetQuantity: Number(prodOrder.targetQuantity),
-      actualYield: prodOrder.actualYield ? Number(prodOrder.actualYield) : null,
-      completedAt: prodOrder.actualEnd,
-      bomId: prodOrder.bom.id,
-      bomProductName: prodOrder.bom.productName,
-    };
-
-    // Raw batches consumed by this order (from the immutable ledger)
-    const consumption = await prisma.inventoryTransaction.findMany({
-      where: {
-        referenceType: "PROD_ORDER",
-        referenceId: prodOrder.id,
-        eventType: LedgerEventType.PROD_CONSUMPTION,
-        batchLotId: { not: null },
-      },
-      select: { materialId: true, batchLotId: true },
-    });
-
-    ingredients = await Promise.all(
-      prodOrder.bom.ingredients.map(async (ing) => {
-        const rawBatchIds = consumption
-          .filter((t) => t.materialId === ing.materialId)
-          .map((t) => t.batchLotId as string);
-        const distinct = [...new Set(rawBatchIds)];
-        const rawBatches = distinct.length
-          ? await prisma.batchLot.findMany({
-              where: { id: { in: distinct } },
-              select: { id: true, batchNumber: true, status: true, expiryDate: true, manufacturingDate: true },
-            })
-          : [];
-        const rawBatchesWithInbound = await Promise.all(
-          rawBatches.map(async (rb) => ({ batch: rb, inbound: await getBatchInbound(rb.id) }))
-        );
-        return {
-          materialId: ing.materialId,
-          materialName: ing.material.name,
-          sku: ing.material.sku,
-          type: ing.material.type,
-          quantity: Number(ing.quantity),
-          unitOfMeasure: ing.unitOfMeasure,
-          isPercentage: ing.isPercentage,
-          rawBatches: rawBatchesWithInbound,
-        };
-      })
-    );
-  }
-
-  return {
-    batch: {
-      id: batch.id,
-      batchNumber: batch.batchNumber,
-      status: batch.status,
-      manufacturingDate: batch.manufacturingDate,
-      expiryDate: batch.expiryDate,
-      material: batch.material,
-    },
-    inbound,
-    producedBy,
-    ingredients,
-  };
-}
-
-/**
- * GET /production/trace/:batchId — traceability tree by batch id.
- */
-router.get("/trace/:batchId", requirePermission("production", "read"), async (req: Request, res: Response) => {
-  try {
-    const tree = await buildTraceTree(req.params.batchId);
-    if (!tree) return res.status(404).json({ error: "Batch not found" });
-    res.json({ tree });
-  } catch (error) {
-    console.error("GET /production/trace/:batchId error:", error);
-    res.status(500).json({ error: "Database error" });
-  }
-});
-
-/**
- * GET /production/trace?batchNumber=XXX — traceability tree by batch number.
- */
-router.get("/trace", requirePermission("production", "read"), async (req: Request, res: Response) => {
-  try {
-    const { batchNumber } = req.query;
-    if (!batchNumber) return res.status(400).json({ error: "batchNumber query is required" });
-    const batch = await prisma.batchLot.findFirst({ where: { batchNumber: String(batchNumber) } });
-    if (!batch) return res.status(404).json({ error: "Batch not found" });
-    const tree = await buildTraceTree(batch.id);
-    res.json({ tree });
-  } catch (error) {
-    console.error("GET /production/trace error:", error);
-    res.status(500).json({ error: "Database error" });
-  }
-});
+// Traceability endpoints moved to /api/traceability (routes/traceability.ts,
+// services/traceabilityService.ts) — unified upstream + downstream trace across
+// both production paths, with consignment-aware inbound resolution.
 
 /**
  * POST /production/waste

@@ -1,5 +1,6 @@
 import { prisma } from '../lib/db.js';
-import { ConsignmentStatus } from '@prisma/client';
+import { ConsignmentStatus, LedgerEventType } from '@prisma/client';
+import { postLedgerEntry } from '../lib/ledger.js';
 
 /**
  * Consignment Service
@@ -73,6 +74,12 @@ export async function getConsignments(filters?: {
       items: {
         include: {
           material: true,
+        },
+      },
+      qualityApproval: {
+        include: {
+          checkItems: true,
+          approvedBy: { select: { fullName: true } },
         },
       },
     },
@@ -350,6 +357,17 @@ export async function distributeToWarehouseBin(data: {
     throw new Error(`Consignment requires QA approval before distribution. Current status: ${item.consignment.status}`);
   }
 
+  // Block distribution while a quantity change for this ingredient awaits
+  // Head of QC approval — otherwise the wrong amount would reach stock.
+  const pendingAdjustment = await prisma.quantityAdjustment.findFirst({
+    where: { consignmentItemId: data.consignmentItemId, status: 'PENDING' },
+  });
+  if (pendingAdjustment) {
+    throw new Error(
+      'This ingredient has a quantity change awaiting Head of QC approval. Resolve it before distributing.'
+    );
+  }
+
   // Verify bin exists
   await prisma.warehouseBin.findUniqueOrThrow({
     where: { id: data.binId },
@@ -448,20 +466,29 @@ export async function markDistributionComplete(data: {
     },
   });
 
-  // Create inventory transaction for this distribution
-  // This adds the material to warehouse inventory
-  await prisma.inventoryTransaction.create({
-    data: {
+  // Post to stock at most once per consignment ingredient. Consignment GRNs
+  // already post the receipt, so this only acts as a fallback for consignments
+  // handled without one — preventing the historical double-count.
+  const alreadyPosted = await prisma.inventoryTransaction.aggregate({
+    where: { consignmentItemId: distribution.consignmentItemId },
+    _sum: { quantity: true },
+  });
+
+  if (Number(alreadyPosted._sum.quantity ?? 0) === 0) {
+    await postLedgerEntry(prisma, {
+      eventType: LedgerEventType.PO_RECEIPT,
       materialId: distribution.consignmentItem.materialId,
       warehouseId: distribution.bin.warehouse.id,
-      eventType: 'PO_RECEIPT',
-      quantity: distribution.quantity,
-      unitOfMeasure: distribution.consignmentItem.unitOfMeasure,
-      referenceId: `CSN-${distribution.consignment.consignmentNumber}`,
       binId: distribution.binId,
+      consignmentItemId: distribution.consignmentItemId,
+      quantity: Number(distribution.quantity),
+      unitOfMeasure: distribution.consignmentItem.unitOfMeasure,
+      referenceType: 'CONSIGNMENT_DISTRIBUTION',
+      referenceId: distribution.id,
       createdById: data.completedById,
-    },
-  });
+      notes: `Distributed via consignment ${distribution.consignment.consignmentNumber}`,
+    });
+  }
 
   return distribution;
 }
