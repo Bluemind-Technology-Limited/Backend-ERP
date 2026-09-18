@@ -137,6 +137,19 @@ router.post("/purchase-orders", requirePermission("procurement", "create"), asyn
       return res.status(400).json({ error: "At least one item is required" });
     }
 
+    // SOP KIB/QCA/010: the supplier needs a vendor code, otherwise every lot code
+    // received against this PO would be unbuildable.
+    const supplier = await prisma.supplier.findUnique({
+      where: { id: supplierId },
+      select: { name: true, vendorCode: true },
+    });
+    if (!supplier) return res.status(404).json({ error: "Supplier not found" });
+    if (!supplier.vendorCode) {
+      return res.status(400).json({
+        error: `Supplier "${supplier.name}" has no vendor code. Add it in Master Data → Suppliers before raising this PO.`,
+      });
+    }
+
     // If converting from an approved requisition, pull its items.
     let poItems = items;
     if (requisitionId) {

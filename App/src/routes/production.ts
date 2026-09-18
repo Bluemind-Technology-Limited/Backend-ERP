@@ -79,6 +79,19 @@ router.post(
         return res.status(400).json({ error: "At least one ingredient is required" });
       }
 
+      // SOP KIB/QCA/010: every ingredient needs a traceability code, otherwise
+      // its lot code can never be built when the material is received.
+      const ingredientIds = ingredients.map((ing: any) => ing.materialId).filter(Boolean);
+      const missingCode = await prisma.material.findFirst({
+        where: { id: { in: ingredientIds }, OR: [{ traceabilityCode: null }, { traceabilityCode: "" }] },
+        select: { name: true },
+      });
+      if (missingCode) {
+        return res.status(400).json({
+          error: `Ingredient "${missingCode.name}" has no traceability code. Add it in Master Data → Materials before saving this formulation.`,
+        });
+      }
+
       const bom = await createBatchFormulation({
         productName,
         description,

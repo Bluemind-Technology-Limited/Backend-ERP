@@ -1,6 +1,7 @@
 import { prisma } from '../lib/db.js';
 import { ConsignmentStatus, LedgerEventType } from '@prisma/client';
 import { postLedgerEntry } from '../lib/ledger.js';
+import { buildLotCode, buildYearCode, nextSetNumber } from '../lib/lotCode.js';
 
 /**
  * Consignment Service
@@ -462,7 +463,7 @@ export async function markDistributionComplete(data: {
           warehouse: true,
         },
       },
-      consignment: true,
+      consignment: { include: { supplier: { select: { id: true, name: true, vendorCode: true } } } },
     },
   });
 
@@ -475,9 +476,52 @@ export async function markDistributionComplete(data: {
   });
 
   if (Number(alreadyPosted._sum.quantity ?? 0) === 0) {
+    // Same trail as a GRN receipt: a batch lot carrying its lot code, plus a QA
+    // inspection. Without this the stock would land with no lot at all and be
+    // unreachable from traceability.
+    const material = distribution.consignmentItem.material;
+    const supplier = distribution.consignment.supplier ?? null;
+    const yearCode = buildYearCode();
+
+    const setNumber = await nextSetNumber(prisma, {
+      supplierId: supplier?.id ?? null,
+      materialId: material.id,
+      yearCode,
+    });
+
+    const lotCode = buildLotCode({
+      vendorCode: supplier?.vendorCode ?? null,
+      ingredientCode: material.traceabilityCode ?? null,
+      setNumber,
+      yearCode,
+    });
+
+    // Only reachable if the supplier / material codes are still missing, which
+    // the master-data guards exist to prevent.
+    const batchNumber =
+      lotCode ??
+      `CSN-${distribution.consignment.consignmentNumber}-${distribution.consignmentItemId.slice(0, 6)}`;
+
+    const batchLot = await prisma.batchLot.upsert({
+      where: { materialId_batchNumber: { materialId: material.id, batchNumber } },
+      update: {},
+      create: {
+        materialId: material.id,
+        batchNumber,
+        origin: 'INBOUND',
+        lotCode,
+        setNumber,
+        vendorCode: supplier?.vendorCode ?? null,
+        ingredientCode: material.traceabilityCode ?? null,
+        yearCode,
+        supplierId: supplier?.id ?? null,
+      },
+    });
+
     await postLedgerEntry(prisma, {
       eventType: LedgerEventType.PO_RECEIPT,
       materialId: distribution.consignmentItem.materialId,
+      batchLotId: batchLot.id,
       warehouseId: distribution.bin.warehouse.id,
       binId: distribution.binId,
       consignmentItemId: distribution.consignmentItemId,
@@ -487,6 +531,16 @@ export async function markDistributionComplete(data: {
       referenceId: distribution.id,
       createdById: data.completedById,
       notes: `Distributed via consignment ${distribution.consignment.consignmentNumber}`,
+    });
+
+    await prisma.inspectionRecord.create({
+      data: {
+        inspectionType: 'GRN',
+        materialId: material.id,
+        batchLotId: batchLot.id,
+        referenceId: distribution.id,
+        result: 'PENDING',
+      },
     });
   }
 

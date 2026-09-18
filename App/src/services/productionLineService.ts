@@ -496,6 +496,9 @@ export async function submitFinishingRecord(data: {
           materialId: finishedSku.id,
           batchNumber: data.batchNumber,
           status: 'QUARANTINE',
+          // The date the supervisor recorded the batch, so the finished lot
+          // carries its own production date in every list and trace.
+          manufacturingDate: data.productionDate ? new Date(data.productionDate) : new Date(),
           expiryDate: data.expiryDate ? new Date(data.expiryDate) : null,
           // Finished production batch — batch number comes from the station.
           origin: 'FINISHED',
