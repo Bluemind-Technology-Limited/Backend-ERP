@@ -79,9 +79,15 @@ PM creates plan (DRAFT) ──schedule──▶ SCHEDULED
 
 ## Notes
 
-- Station 1 is the **single consumer** of raw materials for plan-based
-  production. Do not also run the older production-order release flow for the
-  same plan, or stock will be deducted twice.
+- **Canonical consumption (enforced).** For any production order allocated to a
+  plan item (`BatchMachineAllocation`), the plan's **Stock Issue** station is the
+  single path that deducts stock. `POST /production/production-orders/:id/release`
+  still records the order's ingredient tracking and moves it to `RELEASED`, but
+  posts **no ledger entry** for plan-linked orders, and returns
+  `{ stockDeducted: false }`. Standalone orders (no plan allocation) keep
+  releasing and deducting as before. The production-orders API exposes
+  `planLinked` / `planNumber`, and the UI shows “Issue via Stock Issue” instead
+  of a Release button for those orders.
 - Finished output still passes through QA (`FINISHED_BATCH` inspections) before
   the batch is released from `QUARANTINE`, unchanged from before.
 - `ProductionStageStatus` currently defaults to `SUBMITTED`; `VERIFIED`/`FLAGGED`

@@ -581,7 +581,31 @@ router.get("/production-orders", requirePermission("production", "read"), async 
       },
       orderBy: { createdAt: "desc" },
     });
-    res.json({ productionOrders: orders });
+
+    // Flag which orders are plan-linked, so the UI can route release to the
+    // Stock Issue station (the canonical consumer) instead of deducting here.
+    const orderIds = orders.map((o) => o.id);
+    const allocations = orderIds.length
+      ? await prisma.batchMachineAllocation.findMany({
+          where: { productionOrderId: { in: orderIds } },
+          select: {
+            productionOrderId: true,
+            planItem: { select: { productionPlan: { select: { planNumber: true } } } },
+          },
+        })
+      : [];
+    const planByOrder = new Map<string, string | null>();
+    for (const a of allocations) {
+      planByOrder.set(a.productionOrderId, a.planItem?.productionPlan?.planNumber ?? null);
+    }
+
+    res.json({
+      productionOrders: orders.map((o) => ({
+        ...o,
+        planLinked: planByOrder.has(o.id),
+        planNumber: planByOrder.get(o.id) ?? null,
+      })),
+    });
   } catch (error) {
     console.error("GET /production/production-orders error:", error);
     res.status(500).json({ error: "Database error" });
@@ -705,6 +729,9 @@ router.post("/production-orders/:id/release", requirePermission("production", "u
           },
         });
 
+        // Plan-linked: stock is deducted once, at the Stock Issue station.
+        if (planLinked) continue;
+
         const material = await tx.material.findUnique({
           where: { id: matchingIng.materialId },
           select: { unitOfMeasure: true }
@@ -734,7 +761,13 @@ router.post("/production-orders/:id/release", requirePermission("production", "u
       });
     });
 
-    res.json({ ok: true, message: `Ingredients released for ${order.orderNumber}` });
+    res.json({
+      ok: true,
+      stockDeducted: !planLinked,
+      message: planLinked
+        ? `Ingredients recorded for ${order.orderNumber}. Stock is deducted at the Stock Issue station for plan ${planNumber}.`
+        : `Ingredients released for ${order.orderNumber}`,
+    });
   } catch (error: any) {
     console.error("POST /production-orders/:id/release error:", error);
     res.status(500).json({ error: error?.message || "Database error" });
