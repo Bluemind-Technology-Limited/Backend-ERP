@@ -61,13 +61,44 @@ export async function createDailyReconciliation(options: CreateReconciliationOpt
     plannedTotalQuantity += Number(item.targetQuantity);
   }
 
-  // Calculate actual totals from completed allocations
+  // Actual output comes from two places depending on the flow:
+  //  - plan-based line: the finishing station records the supervisor's achieved
+  //    quantity on the FINISHING stage record (and on the plan item)
+  //  - order-based line: the amount is on ProductionOrder.actualYield
+  // Prefer the stage record so a plan run is not counted as zero actual.
+  const finishingRecords = await prisma.productionStageRecord.findMany({
+    where: { productionPlanId, stage: 'FINISHING' },
+    select: { planItemId: true, achievedQuantity: true },
+  });
+
+  const achievedByItem = new Map<string, number>();
+  for (const record of finishingRecords) {
+    achievedByItem.set(
+      record.planItemId,
+      (achievedByItem.get(record.planItemId) ?? 0) + Number(record.achievedQuantity)
+    );
+  }
+
+  // Calculate actual totals, counting each plan item once.
   let actualItemCount = 0;
   let actualTotalQuantity = 0;
+  const countedItemIds = new Set<string>();
+
+  for (const item of plan.items) {
+    const achieved = achievedByItem.get(item.id);
+    if (achieved !== undefined) {
+      actualItemCount++;
+      actualTotalQuantity += achieved;
+      countedItemIds.add(item.id);
+    }
+  }
+
   for (const alloc of allocations) {
+    if (countedItemIds.has(alloc.productionPlanItemId)) continue;
     if (alloc.status === 'COMPLETED' && alloc.productionOrder.actualYield) {
       actualItemCount++;
       actualTotalQuantity += Number(alloc.productionOrder.actualYield);
+      countedItemIds.add(alloc.productionPlanItemId);
     }
   }
 
@@ -158,12 +189,18 @@ export async function getReconciliationDetails(reconciliationId: string) {
     },
   });
 
-  // Build item details array
+  // Build item details array. Actual output: the plan-based line records it on
+  // the plan item (finishing station), the order-based line on the production
+  // order. Matching must be on the plan item id — comparing it to the production
+  // order id never matches, which left every item without an actual.
   const itemDetails: ReconciliationItemDetail[] = reconciliation.productionPlan.items.map((item, idx) => {
-    const alloc = allocations.find((a) => a.productionOrder.id === item.id);
-    const actualQuantity = alloc?.productionOrder.actualYield
+    const alloc = allocations.find((a) => a.productionPlanItemId === item.id);
+    const fromPlanItem =
+      item.actualYield !== null && item.actualYield !== undefined ? Number(item.actualYield) : undefined;
+    const fromOrder = alloc?.productionOrder.actualYield
       ? Number(alloc.productionOrder.actualYield)
       : undefined;
+    const actualQuantity = fromPlanItem ?? fromOrder;
     const variance = actualQuantity !== undefined ? actualQuantity - Number(item.targetQuantity) : undefined;
     const variancePercentage = variance !== undefined && Number(item.targetQuantity) > 0
       ? (variance / Number(item.targetQuantity)) * 100

@@ -99,11 +99,14 @@ router.post("/stock/transfer", requirePermission("inventory", "create"), async (
 
 /**
  * POST /stock/adjustment — manual stock adjustment.
- * Creates a DRAFT-pending ledger entry (status PENDING) that requires
- * EXECUTIVE/SUPER approval for high-value adjustments. Until approved, the
- * ADJUSTMENT entry carries approvedById = null and is treated as pending.
  *
- * (Approval flow: approveAdjustment sets approvedById — see below.)
+ * Posts an ADJUSTMENT ledger entry straight away. The stock balance is the sum of
+ * the ledger, so the adjustment counts as soon as it is posted — there is no
+ * pending state. Who made it and why is recorded on the entry, which is the
+ * audit trail for manual changes.
+ *
+ * (A real approval gate would need an approve endpoint that sets approvedById
+ * plus a matching filter in getStock, so unapproved entries are excluded.)
  */
 router.post("/stock/adjustment", requirePermission("inventory", "create"), async (req: Request, res: Response) => {
   try {
@@ -128,7 +131,7 @@ router.post("/stock/adjustment", requirePermission("inventory", "create"), async
       notes: reason ?? null,
     });
 
-    res.status(201).json({ adjustment: entry, requiresApproval: req.user!.role === "STORE_OFFICER" });
+    res.status(201).json({ adjustment: entry });
   } catch (error: any) {
     console.error("POST /stock/adjustment error:", error);
     res.status(500).json({ error: error?.message || "Database error" });

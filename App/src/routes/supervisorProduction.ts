@@ -516,7 +516,9 @@ router.get(
  */
 router.post(
   "/daily-reconciliations/:id/verify",
-  requirePermission("production", "update"),
+  // Approving a reconciliation is a sign-off: managers only, so the supervisor
+  // who created it cannot verify their own numbers.
+  requirePermission("production", "approve"),
   async (req: Request, res: Response) => {
     try {
       const { notes } = req.body;
@@ -541,7 +543,7 @@ router.post(
  */
 router.post(
   "/daily-reconciliations/:id/flag",
-  requirePermission("production", "update"),
+  requirePermission("production", "approve"),
   async (req: Request, res: Response) => {
     try {
       const { issue, potentialCause, recommendedAction } = req.body;
