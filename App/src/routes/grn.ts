@@ -3,6 +3,7 @@ import { requireAuth } from "../middleware/auth.js";
 import { requirePermission } from "../middleware/rbac.js";
 import { prisma } from "../lib/db.js";
 import { postLedgerEntry } from "../lib/ledger.js";
+import { buildLotCode, buildYearCode, isValidSetNumber, missingLotCodeParts, nextSetNumber } from "../lib/lotCode.js";
 import { LedgerEventType, GoodsReceiptStatus } from "@prisma/client";
 import * as consignmentService from "../services/consignment.js";
 
@@ -23,7 +24,21 @@ router.get("/", requirePermission("procurement", "read"), async (req: Request, r
         items: {
           include: {
             material: { select: { name: true, sku: true } },
-            batchLot: { select: { id: true, batchNumber: true, expiryDate: true, status: true } },
+            batchLot: {
+              select: {
+                id: true,
+                batchNumber: true,
+                expiryDate: true,
+                status: true,
+                origin: true,
+                lotCode: true,
+                setNumber: true,
+                vendorCode: true,
+                ingredientCode: true,
+                yearCode: true,
+                supplierBatchNumber: true,
+              },
+            },
           },
         },
       },
@@ -32,6 +47,123 @@ router.get("/", requirePermission("procurement", "read"), async (req: Request, r
     res.json({ grns });
   } catch (error) {
     console.error("GET /grn error:", error);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+/**
+ * GET /grn/lot-preview — the lot code a receipt line will get (SOP KIB/QCA/010).
+ *
+ * The server owns the format so the UI never reimplements it, and the response
+ * carries the resolved names so a code is always shown next to the ingredient
+ * and supplier it belongs to.
+ */
+router.get("/lot-preview", requirePermission("procurement", "read"), async (req: Request, res: Response) => {
+  try {
+    const poId = req.query.poId ? String(req.query.poId) : null;
+    const yearCode = buildYearCode();
+
+    // PO mode — preview every line of a receipt in one call.
+    if (poId) {
+      const po = await prisma.purchaseOrder.findUnique({
+        where: { id: poId },
+        include: {
+          supplier: { select: { id: true, name: true, vendorCode: true } },
+          items: {
+            include: {
+              material: {
+                select: {
+                  id: true,
+                  name: true,
+                  sku: true,
+                  unitOfMeasure: true,
+                  traceabilityCode: true,
+                },
+              },
+            },
+          },
+        },
+      });
+      if (!po) return res.status(404).json({ error: "Purchase order not found" });
+
+      // Two lines for the same material must not be offered the same set number.
+      const lastSuggested = new Map<string, number>();
+      const items = [];
+
+      for (const item of po.items) {
+        const next = await nextSetNumber(prisma, {
+          supplierId: po.supplierId ?? null,
+          materialId: item.materialId,
+          yearCode,
+        });
+        const setNumber = Math.max(next, (lastSuggested.get(item.materialId) ?? 0) + 1);
+        lastSuggested.set(item.materialId, setNumber);
+
+        const parts = {
+          vendorCode: po.supplier?.vendorCode ?? null,
+          ingredientCode: item.material.traceabilityCode ?? null,
+          setNumber,
+          yearCode,
+        };
+
+        items.push({
+          materialId: item.materialId,
+          materialName: item.material.name,
+          materialSku: item.material.sku,
+          unitOfMeasure: item.unitOfMeasure,
+          setNumber,
+          lotCode: buildLotCode(parts),
+          missing: missingLotCodeParts(parts),
+        });
+      }
+
+      return res.json({ supplier: po.supplier, yearCode, items });
+    }
+
+    // Single mode — one material + supplier.
+    const materialId = req.query.materialId ? String(req.query.materialId) : null;
+    const supplierId = req.query.supplierId ? String(req.query.supplierId) : null;
+
+    const [material, supplier] = await Promise.all([
+      materialId
+        ? prisma.material.findUnique({
+            where: { id: materialId },
+            select: { id: true, name: true, sku: true, unitOfMeasure: true, traceabilityCode: true },
+          })
+        : Promise.resolve(null),
+      supplierId
+        ? prisma.supplier.findUnique({
+            where: { id: supplierId },
+            select: { id: true, name: true, vendorCode: true },
+          })
+        : Promise.resolve(null),
+    ]);
+
+    const setNumber = material
+      ? await nextSetNumber(prisma, {
+          supplierId: supplier?.id ?? null,
+          materialId: material.id,
+          yearCode,
+        })
+      : null;
+
+    const parts = {
+      vendorCode: supplier?.vendorCode ?? null,
+      ingredientCode: material?.traceabilityCode ?? null,
+      setNumber,
+      yearCode,
+    };
+
+    res.json({
+      material,
+      supplier,
+      yearCode,
+      setNumber,
+      lotCode: buildLotCode(parts),
+      missing: missingLotCodeParts(parts),
+    });
+  } catch (error: any) {
+    console.error("GET /grn/lot-preview error:", error);
     res.status(500).json({ error: "Database error" });
   }
 });
@@ -54,10 +186,16 @@ router.post("/", requirePermission("procurement", "create"), async (req: Request
 
     const po = await prisma.purchaseOrder.findUnique({
       where: { id: poId },
-      include: { items: true },
+      include: {
+        items: true,
+        supplier: { select: { id: true, name: true, vendorCode: true } },
+      },
     });
     if (!po) return res.status(404).json({ error: "Purchase order not found" });
     if (po.status === "CLOSED") return res.status(400).json({ error: "PO is already closed" });
+
+    const supplierId = po.supplierId ?? null;
+    const yearCode = buildYearCode();
 
     const number = `GRN-${Date.now().toString().slice(-8)}`;
 
@@ -74,20 +212,68 @@ router.post("/", requirePermission("procurement", "create"), async (req: Request
       });
 
       for (const it of items) {
-        const { materialId, quantity, unitOfMeasure, batchNumber, expiryDate, manufacturingDate, warehouseId } = it;
-        if (!materialId || !quantity || !unitOfMeasure || !batchNumber || !warehouseId) {
-          throw new Error("Each item needs materialId, quantity, unitOfMeasure, batchNumber and warehouseId");
+        const {
+          materialId,
+          quantity,
+          unitOfMeasure,
+          batchNumber,
+          expiryDate,
+          manufacturingDate,
+          warehouseId,
+          setNumber,
+          supplierBatchNumber,
+        } = it;
+        if (!materialId || !quantity || !unitOfMeasure || !warehouseId) {
+          throw new Error("Each item needs materialId, quantity, unitOfMeasure and warehouseId");
+        }
+
+        // 0. Lot code (SOP KIB/QCA/010). The set number is the incoming sequence
+        // for this supplier + ingredient + year: auto-suggested, but the store
+        // officer may override it.
+        const material = await tx.material.findUnique({
+          where: { id: materialId },
+          select: { traceabilityCode: true },
+        });
+
+        let resolvedSetNumber: number | null =
+          setNumber === undefined || setNumber === null || setNumber === "" ? null : Number(setNumber);
+        if (resolvedSetNumber !== null && !isValidSetNumber(resolvedSetNumber)) {
+          throw new Error("Material set number must be a positive whole number");
+        }
+        if (resolvedSetNumber === null) {
+          resolvedSetNumber = await nextSetNumber(tx, { supplierId, materialId, yearCode });
+        }
+
+        const vendorCode = po.supplier?.vendorCode ?? null;
+        const ingredientCode = material?.traceabilityCode ?? null;
+        const lotCode = buildLotCode({ vendorCode, ingredientCode, setNumber: resolvedSetNumber, yearCode });
+
+        // Until the vendor and ingredient codes are filled in on master data a
+        // lot code can't be built, so a manually typed batch number still works.
+        const resolvedBatchNumber = lotCode ?? String(batchNumber ?? "").trim();
+        if (!resolvedBatchNumber) {
+          throw new Error(
+            "Set a vendor code on the supplier and a traceability code on the material, or enter a batch number"
+          );
         }
 
         // 1. Batch lot (unique per material + batch number)
         const batchLot = await tx.batchLot.upsert({
-          where: { materialId_batchNumber: { materialId, batchNumber } },
+          where: { materialId_batchNumber: { materialId, batchNumber: resolvedBatchNumber } },
           update: {},
           create: {
             materialId,
-            batchNumber,
+            batchNumber: resolvedBatchNumber,
             expiryDate: expiryDate ? new Date(expiryDate) : null,
             manufacturingDate: manufacturingDate ? new Date(manufacturingDate) : null,
+            origin: "INBOUND",
+            lotCode,
+            setNumber: resolvedSetNumber,
+            vendorCode,
+            ingredientCode,
+            yearCode,
+            supplierBatchNumber: supplierBatchNumber ? String(supplierBatchNumber).trim() : null,
+            supplierId,
           },
         });
 
@@ -152,6 +338,9 @@ router.post("/", requirePermission("procurement", "create"), async (req: Request
 
     res.status(201).json({ grn });
   } catch (error: any) {
+    if (error?.code === "P2002") {
+      return res.status(409).json({ error: "That lot code already exists — choose a different material set number" });
+    }
     console.error("POST /grn error:", error);
     res.status(500).json({ error: error?.message || "Database error" });
   }
@@ -177,7 +366,10 @@ router.post("/consignment", requirePermission("procurement", "create"), async (r
 
     const consignment = await prisma.consignment.findUnique({
       where: { id: consignmentId },
-      include: { items: true },
+      include: {
+        items: true,
+        supplier: { select: { id: true, name: true, vendorCode: true } },
+      },
     });
 
     if (!consignment) {
@@ -190,6 +382,7 @@ router.post("/consignment", requirePermission("procurement", "create"), async (r
 
     // Generate GRN number (not linked to PO, but to consignment)
     const number = `GRN-CSN-${Date.now().toString().slice(-8)}`;
+    const yearCode = buildYearCode();
 
     const grn = await prisma.$transaction(async (tx) => {
       // Create GRN without PO reference for consignment-based receives
@@ -209,9 +402,19 @@ router.post("/consignment", requirePermission("procurement", "create"), async (r
 
       // Process each item from consignment
       for (const it of items) {
-        const { consignmentItemId, quantity, unitOfMeasure, batchNumber, warehouseId, expiryDate, manufacturingDate } = it;
-        if (!consignmentItemId || !quantity || !unitOfMeasure || !batchNumber || !warehouseId) {
-          throw new Error("Each item needs consignmentItemId, quantity, unitOfMeasure, batchNumber and warehouseId");
+        const {
+          consignmentItemId,
+          quantity,
+          unitOfMeasure,
+          batchNumber,
+          warehouseId,
+          expiryDate,
+          manufacturingDate,
+          setNumber,
+          supplierBatchNumber,
+        } = it;
+        if (!consignmentItemId || !quantity || !unitOfMeasure || !warehouseId) {
+          throw new Error("Each item needs consignmentItemId, quantity, unitOfMeasure and warehouseId");
         }
 
         // Get the consignment item to find the material
@@ -226,15 +429,48 @@ router.post("/consignment", requirePermission("procurement", "create"), async (r
 
         const materialId = consignmentItem.material.id;
 
+        // Lot code (SOP KIB/QCA/010) — same rules as a PO-backed receipt.
+        const vendorCode = consignment.supplier?.vendorCode ?? null;
+        const ingredientCode = consignmentItem.material.traceabilityCode ?? null;
+
+        let resolvedSetNumber: number | null =
+          setNumber === undefined || setNumber === null || setNumber === "" ? null : Number(setNumber);
+        if (resolvedSetNumber !== null && !isValidSetNumber(resolvedSetNumber)) {
+          throw new Error("Material set number must be a positive whole number");
+        }
+        if (resolvedSetNumber === null) {
+          resolvedSetNumber = await nextSetNumber(tx, {
+            supplierId: consignment.supplierId ?? null,
+            materialId,
+            yearCode,
+          });
+        }
+
+        const lotCode = buildLotCode({ vendorCode, ingredientCode, setNumber: resolvedSetNumber, yearCode });
+        const resolvedBatchNumber = lotCode ?? String(batchNumber ?? "").trim();
+        if (!resolvedBatchNumber) {
+          throw new Error(
+            "Set a vendor code on the supplier and a traceability code on the material, or enter a batch number"
+          );
+        }
+
         // 1. Create or get batch lot
         const batchLot = await tx.batchLot.upsert({
-          where: { materialId_batchNumber: { materialId, batchNumber } },
+          where: { materialId_batchNumber: { materialId, batchNumber: resolvedBatchNumber } },
           update: {},
           create: {
             materialId,
-            batchNumber,
+            batchNumber: resolvedBatchNumber,
             expiryDate: expiryDate ? new Date(expiryDate) : null,
             manufacturingDate: manufacturingDate ? new Date(manufacturingDate) : null,
+            origin: "INBOUND",
+            lotCode,
+            setNumber: resolvedSetNumber,
+            vendorCode,
+            ingredientCode,
+            yearCode,
+            supplierBatchNumber: supplierBatchNumber ? String(supplierBatchNumber).trim() : null,
+            supplierId: consignment.supplierId ?? null,
           },
         });
 

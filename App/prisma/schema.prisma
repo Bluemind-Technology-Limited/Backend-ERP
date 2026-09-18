@@ -200,36 +200,36 @@ model User {
   createdAt    DateTime @default(now()) @map("created_at")
   updatedAt    DateTime @updatedAt @map("updated_at")
 
-  requisitions              Requisition[]
-  purchaseOrders            PurchaseOrder[]
-  goodsReceipts             GoodsReceipt[]
-  productionOrders          ProductionOrder[]      @relation("order_creator")
-  releasedIngredientsOrders ProductionOrder[]      @relation("order_ingredients_releaser")
-  yieldLoggedOrders         ProductionOrder[]      @relation("yield_logger")
-  releasedIngredients       ProductionIngredient[] @relation("ingredient_releaser")
-  inspections               InspectionRecord[]
-  createdTransactions       InventoryTransaction[] @relation("transaction_creator")
-  approvedAdjustments       InventoryTransaction[] @relation("adjustment_approver")
-  notifications             Notification[]
-  bomApprovedBy             Bom[]                  @relation("bom_approved_by")
-  bomUpdatedBy              Bom[]                  @relation("bom_updated_by")
-  productionPlans           ProductionPlan[]
-  consignmentsCreated       Consignment[]          @relation("consignment_creator")
-  consignmentsReceived      Consignment[]          @relation("consignment_receiver")
-  consignmentDistributions  ConsignmentDistribution[]
-  userActivities            UserActivity[]
-  batchMachineAllocations   BatchMachineAllocation[]
-  reconciliations           DailyProductionReconciliation[]
-  qualityApprovalsStarted   QualityApproval[]      @relation("quality_approval_started")
-  qualityApprovalsApproved  QualityApproval[]      @relation("quality_approval_approved")
-  qualityCheckItems         QualityCheckItem[]     @relation("quality_check_performed")
-  qualityCheckAttachments   QualityCheckAttachment[]
-  quantityAdjustmentsRequested QuantityAdjustment[] @relation("qty_adj_requested")
-  quantityAdjustmentsApproved  QuantityAdjustment[] @relation("qty_adj_approved")
-  machineCommissionings     Commissioning[]        @relation("machine_commissioned_by")
-  staffAssignments          StaffAssignment[]
-  costAuditsCreated         CostAudit[]            @relation("cost_changed_by")
-  costAuditsApproved        CostAudit[]            @relation("cost_approved_by")
+  requisitions                 Requisition[]
+  purchaseOrders               PurchaseOrder[]
+  goodsReceipts                GoodsReceipt[]
+  productionOrders             ProductionOrder[]               @relation("order_creator")
+  releasedIngredientsOrders    ProductionOrder[]               @relation("order_ingredients_releaser")
+  yieldLoggedOrders            ProductionOrder[]               @relation("yield_logger")
+  releasedIngredients          ProductionIngredient[]          @relation("ingredient_releaser")
+  inspections                  InspectionRecord[]
+  createdTransactions          InventoryTransaction[]          @relation("transaction_creator")
+  approvedAdjustments          InventoryTransaction[]          @relation("adjustment_approver")
+  notifications                Notification[]
+  bomApprovedBy                Bom[]                           @relation("bom_approved_by")
+  bomUpdatedBy                 Bom[]                           @relation("bom_updated_by")
+  productionPlans              ProductionPlan[]
+  consignmentsCreated          Consignment[]                   @relation("consignment_creator")
+  consignmentsReceived         Consignment[]                   @relation("consignment_receiver")
+  consignmentDistributions     ConsignmentDistribution[]
+  userActivities               UserActivity[]
+  batchMachineAllocations      BatchMachineAllocation[]
+  reconciliations              DailyProductionReconciliation[]
+  qualityApprovalsStarted      QualityApproval[]               @relation("quality_approval_started")
+  qualityApprovalsApproved     QualityApproval[]               @relation("quality_approval_approved")
+  qualityCheckItems            QualityCheckItem[]              @relation("quality_check_performed")
+  qualityCheckAttachments      QualityCheckAttachment[]
+  quantityAdjustmentsRequested QuantityAdjustment[]            @relation("qty_adj_requested")
+  quantityAdjustmentsApproved  QuantityAdjustment[]            @relation("qty_adj_approved")
+  machineCommissionings        Commissioning[]                 @relation("machine_commissioned_by")
+  staffAssignments             StaffAssignment[]
+  costAuditsCreated            CostAudit[]                     @relation("cost_changed_by")
+  costAuditsApproved           CostAudit[]                     @relation("cost_approved_by")
 
   @@map("users")
 }
@@ -264,6 +264,9 @@ model Material {
   defaultExpiryDate DateTime?    @map("default_expiry_date") // Default expiry (e.g., 2 years out)
   requiresLot       Boolean      @default(true) @map("requires_lot")
   minQuantity       Decimal?     @default(0) @map("min_quantity") @db.Decimal(15, 4)
+  /// SOP KIB/QCA/010 lot-coding: numeric ingredient code (1, 2, 3…). Optional so
+  /// existing materials stay valid; required to generate a lot code.
+  traceabilityCode  String?      @map("traceability_code")
   standardCost      Decimal?     @default(0) @map("standard_cost") @db.Decimal(15, 4)
   lastCostUpdateAt  DateTime?    @map("last_cost_update_at")
   lastCostUpdatedBy String?      @map("last_cost_updated_by")
@@ -272,20 +275,20 @@ model Material {
   createdAt         DateTime     @default(now()) @map("created_at")
   updatedAt         DateTime     @updatedAt @map("updated_at")
 
-  batches               BatchLot[]
-  transactions          InventoryTransaction[]
-  bomIngredients        BomIngredient[]
-  requisitionItems      RequisitionItem[]
-  poItems               PurchaseOrderItem[]
-  grnItems              GoodsReceiptItem[]
-  inspectionRecords     InspectionRecord[]
-  suppliers             MaterialSupplier[]
-  productionIngredients ProductionIngredient[]
-  bomFinishedSku        Bom[]                  @relation("finished_sku")
+  batches                   BatchLot[]
+  transactions              InventoryTransaction[]
+  bomIngredients            BomIngredient[]
+  requisitionItems          RequisitionItem[]
+  poItems                   PurchaseOrderItem[]
+  grnItems                  GoodsReceiptItem[]
+  inspectionRecords         InspectionRecord[]
+  suppliers                 MaterialSupplier[]
+  productionIngredients     ProductionIngredient[]
+  bomFinishedSku            Bom[]                      @relation("finished_sku")
   planAggregatedIngredients PlanAggregatedIngredient[] @relation("plan_ingredients")
-  consignmentItems      ConsignmentItem[]      @relation("consignment_items")
-  quantityAdjustments   QuantityAdjustment[]
-  grindingInputs        ProductionGrindingInput[]
+  consignmentItems          ConsignmentItem[]          @relation("consignment_items")
+  quantityAdjustments       QuantityAdjustment[]
+  grindingInputs            ProductionGrindingInput[]
 
   @@map("materials")
 }
@@ -328,9 +331,9 @@ model WarehouseBin {
   code        String
   status      RecordStatus @default(ACTIVE)
 
-  zone         Zone                   @relation(fields: [zoneId], references: [id])
-  warehouse    Warehouse              @relation(fields: [warehouseId], references: [id])
-  transactions InventoryTransaction[]
+  zone          Zone                      @relation(fields: [zoneId], references: [id])
+  warehouse     Warehouse                 @relation(fields: [warehouseId], references: [id])
+  transactions  InventoryTransaction[]
   distributions ConsignmentDistribution[]
 
   @@unique([zoneId, code])
@@ -345,6 +348,9 @@ model Supplier {
   phone         String?
   address       String?
   taxId         String?      @map("tax_id")
+  /// SOP KIB/QCA/010 lot-coding: alphabetic vendor code (A, B, C…). Optional so
+  /// existing suppliers stay valid; required to generate a lot code.
+  vendorCode    String?      @map("vendor_code")
   status        RecordStatus @default(ACTIVE)
   createdAt     DateTime     @default(now()) @map("created_at")
   updatedAt     DateTime     @updatedAt @map("updated_at")
@@ -352,6 +358,7 @@ model Supplier {
   purchaseOrders PurchaseOrder[]
   materials      MaterialSupplier[]
   consignments   Consignment[]
+  batchLots      BatchLot[]         @relation("supplier_lots")
 
   @@map("suppliers")
 }
@@ -371,6 +378,13 @@ model MaterialSupplier {
 // 3. Inventory Ledger (event-sourced)
 // ---------------------------------------------------------------------------
 
+/// SOP KIB/QCA/010 lot-coding: an inbound receipt lot (raw/packaging received at
+/// a GRN) or a finished production batch (created when production completes).
+enum BatchLotOrigin {
+  INBOUND
+  FINISHED
+}
+
 model BatchLot {
   id                String      @id @default(uuid())
   batchNumber       String      @map("batch_number")
@@ -381,44 +395,67 @@ model BatchLot {
   notes             String?
   createdAt         DateTime    @default(now()) @map("created_at")
 
-  material              Material               @relation(fields: [materialId], references: [id])
+  // --- Lot coding (SOP KIB/QCA/010) -----------------------------------------
+  // The parts are stored alongside the rendered code so lot codes can be
+  // searched by component ("A" for vendor, "1" for ingredient) without ever
+  // having to parse the string back apart.
+  origin              BatchLotOrigin @default(INBOUND)
+  /// Rendered code, e.g. "A-1-1-26". Null until the parts are all available.
+  lotCode             String?        @unique @map("lot_code")
+  /// Incoming sequence for one supplier + ingredient + year (1, 2, 3 … 100 …).
+  setNumber           Int?           @map("set_number")
+  /// Snapshotted at creation so editing a vendor/ingredient code never rewrites
+  /// historical lot codes.
+  vendorCode          String?        @map("vendor_code")
+  ingredientCode      String?        @map("ingredient_code")
+  yearCode            String?        @map("year_code")
+  /// The supplier's own batch number, where they provide one (sits on the label).
+  supplierBatchNumber String?        @map("supplier_batch_number")
+  supplierId          String?        @map("supplier_id")
+
+  material              Material                  @relation(fields: [materialId], references: [id])
+  supplier              Supplier?                 @relation("supplier_lots", fields: [supplierId], references: [id])
   transactions          InventoryTransaction[]
-  productionOrders      ProductionOrder[]      @relation("finished_batch")
+  productionOrders      ProductionOrder[]         @relation("finished_batch")
   grnItems              GoodsReceiptItem[]
   inspections           InspectionRecord[]
   productionIngredients ProductionIngredient[]
   grindingInputs        ProductionGrindingInput[]
 
   @@unique([materialId, batchNumber])
+  @@index([vendorCode])
+  @@index([ingredientCode])
+  @@index([origin])
+  @@index([supplierId, materialId, yearCode])
   @@map("batch_lots")
 }
 
 // THE LEDGER — every stock movement is an immutable entry.
 // "Current stock" is the SUM of transactions per material/batch/bin. Never a mutable column.
 model InventoryTransaction {
-  id            String          @id @default(uuid())
-  eventType     LedgerEventType @map("event_type")
-  materialId    String          @map("material_id")
-  batchLotId    String?         @map("batch_lot_id")
-  warehouseId   String          @map("warehouse_id")
-  binId         String?         @map("bin_id")
-  consignmentItemId String?     @map("consignment_item_id") // links consignment stock to its ingredient
-  quantity      Decimal         @db.Decimal(15, 4) // signed: + in, - out
-  unitOfMeasure String          @map("unit_of_measure")
-  referenceType String?         @map("reference_type") // PO, GRN, PROD_ORDER, ADJUSTMENT
-  referenceId   String?         @map("reference_id")
-  createdById   String          @map("created_by_id")
-  approvedById  String?         @map("approved_by_id") // for gated adjustments
-  notes         String?
-  createdAt     DateTime        @default(now()) @map("created_at")
+  id                String          @id @default(uuid())
+  eventType         LedgerEventType @map("event_type")
+  materialId        String          @map("material_id")
+  batchLotId        String?         @map("batch_lot_id")
+  warehouseId       String          @map("warehouse_id")
+  binId             String?         @map("bin_id")
+  consignmentItemId String?         @map("consignment_item_id") // links consignment stock to its ingredient
+  quantity          Decimal         @db.Decimal(15, 4) // signed: + in, - out
+  unitOfMeasure     String          @map("unit_of_measure")
+  referenceType     String?         @map("reference_type") // PO, GRN, PROD_ORDER, ADJUSTMENT
+  referenceId       String?         @map("reference_id")
+  createdById       String          @map("created_by_id")
+  approvedById      String?         @map("approved_by_id") // for gated adjustments
+  notes             String?
+  createdAt         DateTime        @default(now()) @map("created_at")
 
-  material   Material      @relation(fields: [materialId], references: [id])
-  batchLot   BatchLot?     @relation(fields: [batchLotId], references: [id])
-  warehouse  Warehouse       @relation(fields: [warehouseId], references: [id])
-  bin        WarehouseBin?   @relation(fields: [binId], references: [id])
+  material        Material         @relation(fields: [materialId], references: [id])
+  batchLot        BatchLot?        @relation(fields: [batchLotId], references: [id])
+  warehouse       Warehouse        @relation(fields: [warehouseId], references: [id])
+  bin             WarehouseBin?    @relation(fields: [binId], references: [id])
   consignmentItem ConsignmentItem? @relation(fields: [consignmentItemId], references: [id], onDelete: SetNull)
-  createdBy  User          @relation("transaction_creator", fields: [createdById], references: [id])
-  approvedBy User?         @relation("adjustment_approver", fields: [approvedById], references: [id])
+  createdBy       User             @relation("transaction_creator", fields: [createdById], references: [id])
+  approvedBy      User?            @relation("adjustment_approver", fields: [approvedById], references: [id])
 
   @@index([materialId, batchLotId, warehouseId])
   @@index([createdAt])
@@ -501,23 +538,23 @@ model PurchaseOrderItem {
 }
 
 model GoodsReceipt {
-  id           String             @id @default(uuid())
-  number       String             @unique
-  poId         String?            @map("po_id")
-  consignmentId String?           @map("consignment_id")
-  receivedById String             @map("received_by_id")
-  status       GoodsReceiptStatus @default(PENDING_QA)
-  receivedAt   DateTime           @default(now()) @map("received_at")
-  approvedAt   DateTime?          @map("approved_at")
-  rejectedAt   DateTime?          @map("rejected_at")
-  notes        String?
-  createdAt    DateTime           @default(now()) @map("created_at")
-  updatedAt    DateTime           @updatedAt @map("updated_at")
+  id            String             @id @default(uuid())
+  number        String             @unique
+  poId          String?            @map("po_id")
+  consignmentId String?            @map("consignment_id")
+  receivedById  String             @map("received_by_id")
+  status        GoodsReceiptStatus @default(PENDING_QA)
+  receivedAt    DateTime           @default(now()) @map("received_at")
+  approvedAt    DateTime?          @map("approved_at")
+  rejectedAt    DateTime?          @map("rejected_at")
+  notes         String?
+  createdAt     DateTime           @default(now()) @map("created_at")
+  updatedAt     DateTime           @updatedAt @map("updated_at")
 
-  po         PurchaseOrder?     @relation(fields: [poId], references: [id])
+  po          PurchaseOrder?     @relation(fields: [poId], references: [id])
   consignment Consignment?       @relation(fields: [consignmentId], references: [id])
-  receivedBy User               @relation(fields: [receivedById], references: [id])
-  items      GoodsReceiptItem[]
+  receivedBy  User               @relation(fields: [receivedById], references: [id])
+  items       GoodsReceiptItem[]
 
   @@map("goods_receipts")
 }
@@ -557,12 +594,12 @@ model Bom {
   createdAt     DateTime  @default(now()) @map("created_at")
   updatedAt     DateTime  @updatedAt @map("updated_at")
 
-  finishedSku     Material?      @relation("finished_sku", fields: [finishedSkuId], references: [id])
-  approvedBy      User?          @relation("bom_approved_by", fields: [approvedById], references: [id])
-  updatedBy       User?          @relation("bom_updated_by", fields: [updatedById], references: [id])
-  ingredients     BomIngredient[]
+  finishedSku      Material?            @relation("finished_sku", fields: [finishedSkuId], references: [id])
+  approvedBy       User?                @relation("bom_approved_by", fields: [approvedById], references: [id])
+  updatedBy        User?                @relation("bom_updated_by", fields: [updatedById], references: [id])
+  ingredients      BomIngredient[]
   productionOrders ProductionOrder[]
-  planItems       ProductionPlanItem[]
+  planItems        ProductionPlanItem[]
 
   @@index([status])
   @@index([finishedSkuId])
@@ -570,13 +607,13 @@ model Bom {
 }
 
 model BomIngredient {
-  id            String  @id @default(uuid())
-  bomId         String  @map("bom_id")
-  materialId    String  @map("material_id")
-  quantity      Decimal @db.Decimal(15, 4)
-  unitOfMeasure String  @map("unit_of_measure")
-  isPercentage  Boolean @default(false) @map("is_percentage") // % vs absolute weight
-  estimatedCost Decimal @default(0) @map("estimated_cost") @db.Decimal(15, 4)
+  id            String    @id @default(uuid())
+  bomId         String    @map("bom_id")
+  materialId    String    @map("material_id")
+  quantity      Decimal   @db.Decimal(15, 4)
+  unitOfMeasure String    @map("unit_of_measure")
+  isPercentage  Boolean   @default(false) @map("is_percentage") // % vs absolute weight
+  estimatedCost Decimal   @default(0) @map("estimated_cost") @db.Decimal(15, 4)
   costUpdatedAt DateTime? @map("cost_updated_at")
 
   bom      Bom      @relation(fields: [bomId], references: [id], onDelete: Cascade)
@@ -591,12 +628,12 @@ model BomIngredient {
 // ---------------------------------------------------------------------------
 
 model MachineCategory {
-  id        String    @id @default(uuid())
-  name      String    @unique
-  code      String    @unique
-  isActive  Boolean   @default(true) @map("is_active")
-  createdAt DateTime  @default(now()) @map("created_at")
-  updatedAt DateTime  @updatedAt @map("updated_at")
+  id        String   @id @default(uuid())
+  name      String   @unique
+  code      String   @unique
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
 
   machines Machine[]
 
@@ -604,12 +641,12 @@ model MachineCategory {
 }
 
 model MachineDepartment {
-  id        String    @id @default(uuid())
-  name      String    @unique
-  code      String    @unique
-  isActive  Boolean   @default(true) @map("is_active")
-  createdAt DateTime  @default(now()) @map("created_at")
-  updatedAt DateTime  @updatedAt @map("updated_at")
+  id        String   @id @default(uuid())
+  name      String   @unique
+  code      String   @unique
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
 
   machines Machine[]
 
@@ -617,12 +654,12 @@ model MachineDepartment {
 }
 
 model MachineLocation {
-  id        String    @id @default(uuid())
-  name      String    @unique
-  code      String    @unique
-  isActive  Boolean   @default(true) @map("is_active")
-  createdAt DateTime  @default(now()) @map("created_at")
-  updatedAt DateTime  @updatedAt @map("updated_at")
+  id        String   @id @default(uuid())
+  name      String   @unique
+  code      String   @unique
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
 
   machines Machine[]
 
@@ -630,20 +667,20 @@ model MachineLocation {
 }
 
 model Machine {
-  id               String   @id @default(uuid())
-  name             String
-  code             String   @unique
-  serialNumber     String   @unique @map("serial_number")
-  categoryId       String   @map("category_id")
-  departmentId     String   @map("department_id")
-  locationId       String?  @map("location_id")
-  status           String   @default("ACTIVE") // ACTIVE, IDLE, UNDER_MAINTENANCE, OUT_OF_SERVICE
-  createdAt        DateTime @default(now()) @map("created_at")
-  updatedAt        DateTime @updatedAt @map("updated_at")
+  id           String   @id @default(uuid())
+  name         String
+  code         String   @unique
+  serialNumber String   @unique @map("serial_number")
+  categoryId   String   @map("category_id")
+  departmentId String   @map("department_id")
+  locationId   String?  @map("location_id")
+  status       String   @default("ACTIVE") // ACTIVE, IDLE, UNDER_MAINTENANCE, OUT_OF_SERVICE
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
 
-  category    MachineCategory   @relation(fields: [categoryId], references: [id])
-  department  MachineDepartment @relation(fields: [departmentId], references: [id])
-  location    MachineLocation?  @relation(fields: [locationId], references: [id])
+  category   MachineCategory   @relation(fields: [categoryId], references: [id])
+  department MachineDepartment @relation(fields: [departmentId], references: [id])
+  location   MachineLocation?  @relation(fields: [locationId], references: [id])
 
   spareParts       SparePart[]
   maintenances     Maintenance[]
@@ -729,8 +766,8 @@ model Commissioning {
   createdAt          DateTime @default(now()) @map("created_at")
   updatedAt          DateTime @updatedAt @map("updated_at")
 
-  machine       Machine @relation(fields: [machineId], references: [id], onDelete: Cascade)
-  commissionedBy User   @relation("machine_commissioned_by", fields: [commissionedById], references: [id])
+  machine        Machine @relation(fields: [machineId], references: [id], onDelete: Cascade)
+  commissionedBy User    @relation("machine_commissioned_by", fields: [commissionedById], references: [id])
 
   @@index([machineId, commissioningDate])
   @@map("commissionings")
@@ -801,29 +838,29 @@ model ProductionOrder {
   createdAt               DateTime              @default(now()) @map("created_at")
   updatedAt               DateTime              @updatedAt @map("updated_at")
 
-  bom                      Bom                    @relation(fields: [bomId], references: [id])
-  shift                    Shift?                 @relation(fields: [shiftId], references: [id])
-  createdBy                User                   @relation("order_creator", fields: [createdById], references: [id])
-  ingredientsReleasedBy    User?                  @relation("order_ingredients_releaser", fields: [ingredientsReleasedById], references: [id])
-  yieldLoggedBy            User?                  @relation("yield_logger", fields: [yieldLoggedById], references: [id])
-  finishedBatch            BatchLot?              @relation("finished_batch", fields: [finishedBatchId], references: [id])
-  productionIngredients    ProductionIngredient[]
-  batchMachineAllocations  BatchMachineAllocation[]
+  bom                     Bom                      @relation(fields: [bomId], references: [id])
+  shift                   Shift?                   @relation(fields: [shiftId], references: [id])
+  createdBy               User                     @relation("order_creator", fields: [createdById], references: [id])
+  ingredientsReleasedBy   User?                    @relation("order_ingredients_releaser", fields: [ingredientsReleasedById], references: [id])
+  yieldLoggedBy           User?                    @relation("yield_logger", fields: [yieldLoggedById], references: [id])
+  finishedBatch           BatchLot?                @relation("finished_batch", fields: [finishedBatchId], references: [id])
+  productionIngredients   ProductionIngredient[]
+  batchMachineAllocations BatchMachineAllocation[]
 
   @@map("production_orders")
 }
 
 model ProductionIngredient {
-  id                String                      @id @default(uuid())
-  productionOrderId String                      @map("production_order_id")
-  materialId        String                      @map("material_id")
-  projectedQuantity Decimal                     @map("projected_quantity") @db.Decimal(15, 4)
-  releasedQuantity  Decimal                     @default(0) @map("released_quantity") @db.Decimal(15, 4)
-  returnedQuantity  Decimal                     @default(0) @map("returned_quantity") @db.Decimal(15, 4)
-  batchLotId        String?                     @map("batch_lot_id")
-  releasedAt        DateTime?                   @map("released_at")
-  releasedById      String?                     @map("released_by_id")
-  status            ProductionIngredientStatus  @default(RESERVED) @map("status")
+  id                String                     @id @default(uuid())
+  productionOrderId String                     @map("production_order_id")
+  materialId        String                     @map("material_id")
+  projectedQuantity Decimal                    @map("projected_quantity") @db.Decimal(15, 4)
+  releasedQuantity  Decimal                    @default(0) @map("released_quantity") @db.Decimal(15, 4)
+  returnedQuantity  Decimal                    @default(0) @map("returned_quantity") @db.Decimal(15, 4)
+  batchLotId        String?                    @map("batch_lot_id")
+  releasedAt        DateTime?                  @map("released_at")
+  releasedById      String?                    @map("released_by_id")
+  status            ProductionIngredientStatus @default(RESERVED) @map("status")
 
   productionOrder ProductionOrder @relation(fields: [productionOrderId], references: [id], onDelete: Cascade)
   material        Material        @relation(fields: [materialId], references: [id])
@@ -838,22 +875,22 @@ model ProductionIngredient {
 // ---------------------------------------------------------------------------
 
 model ProductionPlan {
-  id           String                @id @default(uuid())
-  planNumber   String                @unique @map("plan_number")
+  id           String               @id @default(uuid())
+  planNumber   String               @unique @map("plan_number")
   description  String?
-  status       ProductionPlanStatus  @default(DRAFT)
-  scheduledFor DateTime?             @map("scheduled_for")
-  startedAt    DateTime?             @map("started_at")
-  completedAt  DateTime?             @map("completed_at")
-  createdById  String                @map("created_by_id")
-  createdAt    DateTime              @default(now()) @map("created_at")
-  updatedAt    DateTime              @updatedAt @map("updated_at")
+  status       ProductionPlanStatus @default(DRAFT)
+  scheduledFor DateTime?            @map("scheduled_for")
+  startedAt    DateTime?            @map("started_at")
+  completedAt  DateTime?            @map("completed_at")
+  createdById  String               @map("created_by_id")
+  createdAt    DateTime             @default(now()) @map("created_at")
+  updatedAt    DateTime             @updatedAt @map("updated_at")
 
-  createdBy                 User                          @relation(fields: [createdById], references: [id])
-  items                     ProductionPlanItem[]
-  aggregatedIngredients     PlanAggregatedIngredient[]
-  stageRecords              ProductionStageRecord[]
-  reconciliations           DailyProductionReconciliation[]
+  createdBy             User                            @relation(fields: [createdById], references: [id])
+  items                 ProductionPlanItem[]
+  aggregatedIngredients PlanAggregatedIngredient[]
+  stageRecords          ProductionStageRecord[]
+  reconciliations       DailyProductionReconciliation[]
 
   @@index([status])
   @@index([scheduledFor])
@@ -861,17 +898,17 @@ model ProductionPlan {
 }
 
 model ProductionPlanItem {
-  id               String  @id @default(uuid())
-  productionPlanId String  @map("production_plan_id")
-  bomId            String  @map("bom_id")
-  targetQuantity   Decimal @map("target_quantity") @db.Decimal(15, 4)
+  id               String   @id @default(uuid())
+  productionPlanId String   @map("production_plan_id")
+  bomId            String   @map("bom_id")
+  targetQuantity   Decimal  @map("target_quantity") @db.Decimal(15, 4)
   actualYield      Decimal? @map("actual_yield") @db.Decimal(15, 4)
-  sequence         Int     @default(1) // Order in which products are produced
+  sequence         Int      @default(1) // Order in which products are produced
 
-  productionPlan           ProductionPlan        @relation(fields: [productionPlanId], references: [id], onDelete: Cascade)
-  bom                      Bom                   @relation(fields: [bomId], references: [id])
-  batchMachineAllocations  BatchMachineAllocation[]
-  stageRecords             ProductionStageRecord[]
+  productionPlan          ProductionPlan           @relation(fields: [productionPlanId], references: [id], onDelete: Cascade)
+  bom                     Bom                      @relation(fields: [bomId], references: [id])
+  batchMachineAllocations BatchMachineAllocation[]
+  stageRecords            ProductionStageRecord[]
 
   @@index([productionPlanId])
   @@index([bomId])
@@ -941,15 +978,15 @@ model ProductionStageRecord {
 
 /// Unused material handed back from a station (per ingredient), returned to stock.
 model ProductionStageRemainder {
-  id                 String   @id @default(uuid())
-  stageRecordId      String   @map("stage_record_id")
-  materialId         String   @map("material_id")
-  quantity           Decimal  @db.Decimal(15, 4)
-  unitOfMeasure      String   @map("unit_of_measure")
-  warehouseId        String?  @map("warehouse_id")
-  batchLotId         String?  @map("batch_lot_id")
-  inventoryTransactionId String? @map("inventory_transaction_id")
-  createdAt          DateTime @default(now()) @map("created_at")
+  id                     String   @id @default(uuid())
+  stageRecordId          String   @map("stage_record_id")
+  materialId             String   @map("material_id")
+  quantity               Decimal  @db.Decimal(15, 4)
+  unitOfMeasure          String   @map("unit_of_measure")
+  warehouseId            String?  @map("warehouse_id")
+  batchLotId             String?  @map("batch_lot_id")
+  inventoryTransactionId String?  @map("inventory_transaction_id")
+  createdAt              DateTime @default(now()) @map("created_at")
 
   stageRecord ProductionStageRecord @relation(fields: [stageRecordId], references: [id], onDelete: Cascade)
 
@@ -971,8 +1008,8 @@ model ProductionGrindingInput {
   createdAt     DateTime @default(now()) @map("created_at")
 
   stageRecord ProductionStageRecord @relation(fields: [stageRecordId], references: [id], onDelete: Cascade)
-  material    Material             @relation(fields: [materialId], references: [id])
-  batchLot    BatchLot?            @relation(fields: [batchLotId], references: [id])
+  material    Material              @relation(fields: [materialId], references: [id])
+  batchLot    BatchLot?             @relation(fields: [batchLotId], references: [id])
 
   @@index([stageRecordId])
   @@index([materialId])
@@ -985,25 +1022,25 @@ model ProductionGrindingInput {
 // ---------------------------------------------------------------------------
 
 model Consignment {
-  id              String              @id @default(uuid())
+  id                String            @id @default(uuid())
   consignmentNumber String            @unique @map("consignment_number")
-  supplierId      String              @map("supplier_id")
-  warehouseId     String              @map("warehouse_id")
-  status          ConsignmentStatus   @default(DRAFT)
-  poNumbers       String?             @map("po_numbers") // CSV of related PO numbers
-  shipDate        DateTime?           @map("ship_date")
-  expectedDelivery DateTime?          @map("expected_delivery")
-  receivedAt      DateTime?           @map("received_at")
-  distributedAt   DateTime?           @map("distributed_at")
-  createdById     String              @map("created_by_id")
-  receivedById    String?             @map("received_by_id")
-  createdAt       DateTime            @default(now()) @map("created_at")
-  updatedAt       DateTime            @updatedAt @map("updated_at")
+  supplierId        String            @map("supplier_id")
+  warehouseId       String            @map("warehouse_id")
+  status            ConsignmentStatus @default(DRAFT)
+  poNumbers         String?           @map("po_numbers") // CSV of related PO numbers
+  shipDate          DateTime?         @map("ship_date")
+  expectedDelivery  DateTime?         @map("expected_delivery")
+  receivedAt        DateTime?         @map("received_at")
+  distributedAt     DateTime?         @map("distributed_at")
+  createdById       String            @map("created_by_id")
+  receivedById      String?           @map("received_by_id")
+  createdAt         DateTime          @default(now()) @map("created_at")
+  updatedAt         DateTime          @updatedAt @map("updated_at")
 
-  supplier           Supplier            @relation(fields: [supplierId], references: [id])
-  warehouse          Warehouse           @relation(fields: [warehouseId], references: [id])
-  createdBy          User                @relation("consignment_creator", fields: [createdById], references: [id])
-  receivedBy         User?               @relation("consignment_receiver", fields: [receivedById], references: [id])
+  supplier            Supplier                  @relation(fields: [supplierId], references: [id])
+  warehouse           Warehouse                 @relation(fields: [warehouseId], references: [id])
+  createdBy           User                      @relation("consignment_creator", fields: [createdById], references: [id])
+  receivedBy          User?                     @relation("consignment_receiver", fields: [receivedById], references: [id])
   items               ConsignmentItem[]
   distributions       ConsignmentDistribution[]
   qualityApproval     QualityApproval?
@@ -1019,18 +1056,18 @@ model Consignment {
 }
 
 model ConsignmentItem {
-  id              String  @id @default(uuid())
-  consignmentId   String  @map("consignment_id")
-  materialId      String  @map("material_id")
-  quantity        Decimal @db.Decimal(15, 4)
-  unitOfMeasure   String  @map("unit_of_measure")
-  distributedQty  Decimal @default(0) @map("distributed_qty") @db.Decimal(15, 4)
+  id             String  @id @default(uuid())
+  consignmentId  String  @map("consignment_id")
+  materialId     String  @map("material_id")
+  quantity       Decimal @db.Decimal(15, 4)
+  unitOfMeasure  String  @map("unit_of_measure")
+  distributedQty Decimal @default(0) @map("distributed_qty") @db.Decimal(15, 4)
 
-  consignment    Consignment @relation(fields: [consignmentId], references: [id], onDelete: Cascade)
-  material       Material    @relation("consignment_items", fields: [materialId], references: [id])
-  distributions  ConsignmentDistribution[]
-  qualityChecks  QualityCheckItem[]         @relation("quality_checks")
-  quantityAdjustments QuantityAdjustment[]
+  consignment           Consignment               @relation(fields: [consignmentId], references: [id], onDelete: Cascade)
+  material              Material                  @relation("consignment_items", fields: [materialId], references: [id])
+  distributions         ConsignmentDistribution[]
+  qualityChecks         QualityCheckItem[]        @relation("quality_checks")
+  quantityAdjustments   QuantityAdjustment[]
   inventoryTransactions InventoryTransaction[]
 
   @@index([consignmentId])
@@ -1039,18 +1076,18 @@ model ConsignmentItem {
 }
 
 model ConsignmentDistribution {
-  id                String    @id @default(uuid())
-  consignmentId     String    @map("consignment_id")
-  consignmentItemId String    @map("consignment_item_id")
-  binId             String    @map("bin_id")
-  quantity          Decimal   @db.Decimal(15, 4)
-  distributedAt     DateTime  @map("distributed_at") @default(now())
-  distributedById   String    @map("distributed_by_id")
+  id                String   @id @default(uuid())
+  consignmentId     String   @map("consignment_id")
+  consignmentItemId String   @map("consignment_item_id")
+  binId             String   @map("bin_id")
+  quantity          Decimal  @db.Decimal(15, 4)
+  distributedAt     DateTime @default(now()) @map("distributed_at")
+  distributedById   String   @map("distributed_by_id")
 
-  consignment        Consignment        @relation(fields: [consignmentId], references: [id], onDelete: Cascade)
-  consignmentItem    ConsignmentItem    @relation(fields: [consignmentItemId], references: [id], onDelete: Cascade)
-  bin                WarehouseBin       @relation(fields: [binId], references: [id])
-  distributedBy      User               @relation(fields: [distributedById], references: [id])
+  consignment     Consignment     @relation(fields: [consignmentId], references: [id], onDelete: Cascade)
+  consignmentItem ConsignmentItem @relation(fields: [consignmentItemId], references: [id], onDelete: Cascade)
+  bin             WarehouseBin    @relation(fields: [binId], references: [id])
+  distributedBy   User            @relation(fields: [distributedById], references: [id])
 
   @@index([consignmentId])
   @@index([consignmentItemId])
@@ -1063,50 +1100,50 @@ model ConsignmentDistribution {
 // ---------------------------------------------------------------------------
 
 model QualityApproval {
-  id                String                    @id @default(uuid())
-  consignmentId     String                    @unique @map("consignment_id")
-  status            QualityApprovalStatus     @default(PENDING)
-  totalItems        Int                       @default(0) @map("total_items")
-  passedItems       Int                       @default(0) @map("passed_items")
-  failedItems       Int                       @default(0) @map("failed_items")
-  startedAt         DateTime?                 @map("started_at")
-  completedAt       DateTime?                 @map("completed_at")
-  approvedAt        DateTime?                 @map("approved_at")
-  rejectedAt        DateTime?                 @map("rejected_at")
-  startedById       String?                   @map("started_by_id")
-  approvedById      String?                   @map("approved_by_id")
-  rejectionReason   String?                   @map("rejection_reason")
-  notes             String?
-  createdAt         DateTime                  @default(now()) @map("created_at")
-  updatedAt         DateTime                  @updatedAt @map("updated_at")
+  id              String                @id @default(uuid())
+  consignmentId   String                @unique @map("consignment_id")
+  status          QualityApprovalStatus @default(PENDING)
+  totalItems      Int                   @default(0) @map("total_items")
+  passedItems     Int                   @default(0) @map("passed_items")
+  failedItems     Int                   @default(0) @map("failed_items")
+  startedAt       DateTime?             @map("started_at")
+  completedAt     DateTime?             @map("completed_at")
+  approvedAt      DateTime?             @map("approved_at")
+  rejectedAt      DateTime?             @map("rejected_at")
+  startedById     String?               @map("started_by_id")
+  approvedById    String?               @map("approved_by_id")
+  rejectionReason String?               @map("rejection_reason")
+  notes           String?
+  createdAt       DateTime              @default(now()) @map("created_at")
+  updatedAt       DateTime              @updatedAt @map("updated_at")
 
-  consignment      Consignment              @relation(fields: [consignmentId], references: [id], onDelete: Cascade)
-  startedBy        User?                    @relation("quality_approval_started", fields: [startedById], references: [id])
-  approvedBy       User?                    @relation("quality_approval_approved", fields: [approvedById], references: [id])
-  checkItems       QualityCheckItem[]
-  
+  consignment Consignment        @relation(fields: [consignmentId], references: [id], onDelete: Cascade)
+  startedBy   User?              @relation("quality_approval_started", fields: [startedById], references: [id])
+  approvedBy  User?              @relation("quality_approval_approved", fields: [approvedById], references: [id])
+  checkItems  QualityCheckItem[]
+
   @@index([status])
   @@index([consignmentId])
   @@map("quality_approvals")
 }
 
 model QualityCheckItem {
-  id                      String                @id @default(uuid())
-  qualityApprovalId       String                @map("quality_approval_id")
-  consignmentItemId       String                @map("consignment_item_id")
-  checkType               QualityCheckType      @map("check_type")
-  status                  QualityApprovalStatus @default(PENDING)
-  result                  String?               // "PASS" | "FAIL"
-  remarks                 String?
-  checkedAt               DateTime?             @map("checked_at")
-  checkedById             String?               @map("checked_by_id")
-  createdAt               DateTime              @default(now()) @map("created_at")
-  updatedAt               DateTime              @updatedAt @map("updated_at")
+  id                String                @id @default(uuid())
+  qualityApprovalId String                @map("quality_approval_id")
+  consignmentItemId String                @map("consignment_item_id")
+  checkType         QualityCheckType      @map("check_type")
+  status            QualityApprovalStatus @default(PENDING)
+  result            String? // "PASS" | "FAIL"
+  remarks           String?
+  checkedAt         DateTime?             @map("checked_at")
+  checkedById       String?               @map("checked_by_id")
+  createdAt         DateTime              @default(now()) @map("created_at")
+  updatedAt         DateTime              @updatedAt @map("updated_at")
 
-  qualityApproval   QualityApproval  @relation(fields: [qualityApprovalId], references: [id], onDelete: Cascade)
-  consignmentItem   ConsignmentItem  @relation("quality_checks", fields: [consignmentItemId], references: [id], onDelete: Cascade)
-  checkedBy         User?            @relation("quality_check_performed", fields: [checkedById], references: [id])
-  attachments       QualityCheckAttachment[]
+  qualityApproval QualityApproval          @relation(fields: [qualityApprovalId], references: [id], onDelete: Cascade)
+  consignmentItem ConsignmentItem          @relation("quality_checks", fields: [consignmentItemId], references: [id], onDelete: Cascade)
+  checkedBy       User?                    @relation("quality_check_performed", fields: [checkedById], references: [id])
+  attachments     QualityCheckAttachment[]
 
   @@index([qualityApprovalId])
   @@index([consignmentItemId])
@@ -1130,8 +1167,8 @@ model QualityCheckAttachment {
   createdAt          DateTime @default(now()) @map("created_at")
 
   qualityCheckItem QualityCheckItem @relation(fields: [qualityCheckItemId], references: [id], onDelete: Cascade)
-  consignment      Consignment     @relation(fields: [consignmentId], references: [id], onDelete: Cascade)
-  uploadedBy       User            @relation(fields: [uploadedById], references: [id])
+  consignment      Consignment      @relation(fields: [consignmentId], references: [id], onDelete: Cascade)
+  uploadedBy       User             @relation(fields: [uploadedById], references: [id])
 
   @@index([qualityCheckItemId])
   @@index([consignmentId])
@@ -1203,17 +1240,17 @@ model InspectionRecord {
 // ---------------------------------------------------------------------------
 
 model UserActivity {
-  id            String   @id @default(uuid())
-  userId        String   @map("user_id")
-  activityType  String   @map("activity_type") // PAGE_VISIT, CREATE, UPDATE, DELETE, APPROVE, REJECT, TRANSFER, ADJUST
-  module        String   // inventory, procurement, production, qa, audit, admin
-  description   String?
-  entityType    String?  @map("entity_type") // Material, Requisition, PurchaseOrder, etc.
-  entityId      String?  @map("entity_id")
-  details       Json?    // Additional context (before/after values, IP, user agent, etc.)
-  ipAddress     String?  @map("ip_address")
-  userAgent     String?  @map("user_agent")
-  createdAt     DateTime @default(now()) @map("created_at")
+  id           String   @id @default(uuid())
+  userId       String   @map("user_id")
+  activityType String   @map("activity_type") // PAGE_VISIT, CREATE, UPDATE, DELETE, APPROVE, REJECT, TRANSFER, ADJUST
+  module       String // inventory, procurement, production, qa, audit, admin
+  description  String?
+  entityType   String?  @map("entity_type") // Material, Requisition, PurchaseOrder, etc.
+  entityId     String?  @map("entity_id")
+  details      Json? // Additional context (before/after values, IP, user agent, etc.)
+  ipAddress    String?  @map("ip_address")
+  userAgent    String?  @map("user_agent")
+  createdAt    DateTime @default(now()) @map("created_at")
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -1229,24 +1266,24 @@ model UserActivity {
 // ---------------------------------------------------------------------------
 
 model BatchMachineAllocation {
-  id                    String    @id @default(uuid())
-  productionPlanItemId  String    @map("production_plan_item_id")
-  productionOrderId     String    @map("production_order_id")
-  machineId             String    @map("machine_id")
-  scheduledStartTime    DateTime? @map("scheduled_start_time")
-  scheduledEndTime      DateTime? @map("scheduled_end_time")
-  actualStartTime       DateTime? @map("actual_start_time")
-  actualEndTime         DateTime? @map("actual_end_time")
-  batchNumber           String?   @map("batch_number")
-  status                String    @default("ALLOCATED") // ALLOCATED, SCHEDULED, IN_PROGRESS, COMPLETED
-  supervisorId          String    @map("supervisor_id")
-  notes                 String?
-  createdAt             DateTime  @default(now()) @map("created_at")
-  updatedAt             DateTime  @updatedAt @map("updated_at")
+  id                   String    @id @default(uuid())
+  productionPlanItemId String    @map("production_plan_item_id")
+  productionOrderId    String    @map("production_order_id")
+  machineId            String    @map("machine_id")
+  scheduledStartTime   DateTime? @map("scheduled_start_time")
+  scheduledEndTime     DateTime? @map("scheduled_end_time")
+  actualStartTime      DateTime? @map("actual_start_time")
+  actualEndTime        DateTime? @map("actual_end_time")
+  batchNumber          String?   @map("batch_number")
+  status               String    @default("ALLOCATED") // ALLOCATED, SCHEDULED, IN_PROGRESS, COMPLETED
+  supervisorId         String    @map("supervisor_id")
+  notes                String?
+  createdAt            DateTime  @default(now()) @map("created_at")
+  updatedAt            DateTime  @updatedAt @map("updated_at")
 
-  planItem          ProductionPlanItem @relation(fields: [productionPlanItemId], references: [id], onDelete: Cascade)
-  productionOrder   ProductionOrder    @relation(fields: [productionOrderId], references: [id], onDelete: Cascade)
-  supervisor        User               @relation(fields: [supervisorId], references: [id])
+  planItem        ProductionPlanItem @relation(fields: [productionPlanItemId], references: [id], onDelete: Cascade)
+  productionOrder ProductionOrder    @relation(fields: [productionOrderId], references: [id], onDelete: Cascade)
+  supervisor      User               @relation(fields: [supervisorId], references: [id])
 
   @@index([productionPlanItemId, machineId])
   @@index([supervisorId, createdAt])
@@ -1255,21 +1292,21 @@ model BatchMachineAllocation {
 }
 
 model DailyProductionReconciliation {
-  id                    String    @id @default(uuid())
-  productionPlanId      String    @map("production_plan_id")
-  reconciliationDate    DateTime  @map("reconciliation_date")
-  supervisorId          String    @map("supervisor_id")
-  plannedItemCount      Int       @map("planned_item_count")
-  plannedTotalQuantity  Decimal   @map("planned_total_quantity") @db.Decimal(15, 4)
-  actualItemCount       Int       @map("actual_item_count")
-  actualTotalQuantity   Decimal   @map("actual_total_quantity") @db.Decimal(15, 4)
-  quantityVariance      Decimal   @map("quantity_variance") @db.Decimal(15, 4)
-  variancePercentage    Decimal   @map("variance_percentage") @db.Decimal(5, 2)
-  discrepancyNotes      String?   @map("discrepancy_notes")
-  status                String    @default("PENDING") // PENDING, VERIFIED, FLAGGED
-  verifiedAt            DateTime? @map("verified_at")
-  createdAt             DateTime  @default(now()) @map("created_at")
-  updatedAt             DateTime  @updatedAt @map("updated_at")
+  id                   String    @id @default(uuid())
+  productionPlanId     String    @map("production_plan_id")
+  reconciliationDate   DateTime  @map("reconciliation_date")
+  supervisorId         String    @map("supervisor_id")
+  plannedItemCount     Int       @map("planned_item_count")
+  plannedTotalQuantity Decimal   @map("planned_total_quantity") @db.Decimal(15, 4)
+  actualItemCount      Int       @map("actual_item_count")
+  actualTotalQuantity  Decimal   @map("actual_total_quantity") @db.Decimal(15, 4)
+  quantityVariance     Decimal   @map("quantity_variance") @db.Decimal(15, 4)
+  variancePercentage   Decimal   @map("variance_percentage") @db.Decimal(5, 2)
+  discrepancyNotes     String?   @map("discrepancy_notes")
+  status               String    @default("PENDING") // PENDING, VERIFIED, FLAGGED
+  verifiedAt           DateTime? @map("verified_at")
+  createdAt            DateTime  @default(now()) @map("created_at")
+  updatedAt            DateTime  @updatedAt @map("updated_at")
 
   productionPlan ProductionPlan @relation(fields: [productionPlanId], references: [id], onDelete: Cascade)
   supervisor     User           @relation(fields: [supervisorId], references: [id])
@@ -1285,21 +1322,21 @@ model DailyProductionReconciliation {
 // ---------------------------------------------------------------------------
 
 model CostAudit {
-  id             String            @id @default(uuid())
-  entityType     String            @map("entity_type") // Material, PurchaseOrderItem, BomIngredient, ProductionOrder, GoodsReceiptItem
-  entityId       String            @map("entity_id")
-  fieldName      String            @map("field_name") // unitCost, standardCost, estimatedCost, actualCost
-  oldValue       Decimal?          @map("old_value") @db.Decimal(15, 4)
-  newValue       Decimal           @map("new_value") @db.Decimal(15, 4)
-  reason         String?           // Why the cost was changed
-  changeType     String            @map("change_type") // MANUAL, APPROVED, BULK_UPDATE
-  status         CostChangeStatus  @default(PENDING)
-  changedById    String            @map("changed_by_id")
-  approvedById   String?           @map("approved_by_id")
-  approvedAt     DateTime?         @map("approved_at")
+  id              String           @id @default(uuid())
+  entityType      String           @map("entity_type") // Material, PurchaseOrderItem, BomIngredient, ProductionOrder, GoodsReceiptItem
+  entityId        String           @map("entity_id")
+  fieldName       String           @map("field_name") // unitCost, standardCost, estimatedCost, actualCost
+  oldValue        Decimal?         @map("old_value") @db.Decimal(15, 4)
+  newValue        Decimal          @map("new_value") @db.Decimal(15, 4)
+  reason          String? // Why the cost was changed
+  changeType      String           @map("change_type") // MANUAL, APPROVED, BULK_UPDATE
+  status          CostChangeStatus @default(PENDING)
+  changedById     String           @map("changed_by_id")
+  approvedById    String?          @map("approved_by_id")
+  approvedAt      DateTime?        @map("approved_at")
   rejectionReason String?          @map("rejection_reason")
-  changedAt      DateTime          @default(now()) @map("changed_at")
-  updatedAt      DateTime          @updatedAt @map("updated_at")
+  changedAt       DateTime         @default(now()) @map("changed_at")
+  updatedAt       DateTime         @updatedAt @map("updated_at")
 
   changedBy  User  @relation("cost_changed_by", fields: [changedById], references: [id])
   approvedBy User? @relation("cost_approved_by", fields: [approvedById], references: [id])
@@ -1315,16 +1352,16 @@ model CostAudit {
 // ---------------------------------------------------------------------------
 
 model Notification {
-  id                String   @id @default(uuid())
-  userId            String   @map("user_id")
-  title             String
-  body              String?
-  type              String // EXPIRY | LOW_STOCK | APPROVAL | SYSTEM
-  notificationType  String   @default("SYSTEM") @map("notification_type") // LOW_STOCK_ALERT, APPROVAL_PENDING, SYSTEM, EXPIRY
-  referenceId       String?  @map("reference_id") // Material ID for low-stock alerts, GRN ID for approvals, etc.
-  isRead            Boolean  @default(false) @map("is_read")
-  isActionable      Boolean  @default(false) @map("is_actionable") // True if user can take action (e.g., create requisition)
-  createdAt         DateTime @default(now()) @map("created_at")
+  id               String   @id @default(uuid())
+  userId           String   @map("user_id")
+  title            String
+  body             String?
+  type             String // EXPIRY | LOW_STOCK | APPROVAL | SYSTEM
+  notificationType String   @default("SYSTEM") @map("notification_type") // LOW_STOCK_ALERT, APPROVAL_PENDING, SYSTEM, EXPIRY
+  referenceId      String?  @map("reference_id") // Material ID for low-stock alerts, GRN ID for approvals, etc.
+  isRead           Boolean  @default(false) @map("is_read")
+  isActionable     Boolean  @default(false) @map("is_actionable") // True if user can take action (e.g., create requisition)
+  createdAt        DateTime @default(now()) @map("created_at")
 
   user User @relation(fields: [userId], references: [id])
 

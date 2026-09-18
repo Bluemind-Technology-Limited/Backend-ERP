@@ -193,7 +193,7 @@ router.get("/materials", requirePermission("master_data", "read"), async (req: R
 
 router.post("/materials", requirePermission("master_data", "create"), async (req: Request, res: Response) => {
   try {
-    const { name, sku, type, category, unitOfMeasure, barcode, defaultExpiryDate, requiresLot, attachments, supplierIds } = req.body;
+    const { name, sku, type, category, unitOfMeasure, barcode, defaultExpiryDate, requiresLot, attachments, supplierIds, traceabilityCode } = req.body;
     if (!name || !type || !unitOfMeasure) {
       return res.status(400).json({ error: "name, type and unitOfMeasure are required" });
     }
@@ -208,6 +208,7 @@ router.post("/materials", requirePermission("master_data", "create"), async (req
         barcode: barcode ?? null,
         defaultExpiryDate: defaultExpiryDate ? new Date(defaultExpiryDate) : null,
         requiresLot: requiresLot ?? true,
+        traceabilityCode: traceabilityCode ? String(traceabilityCode).trim() : null,
         attachments: attachments ?? [],
         suppliers: Array.isArray(supplierIds) && supplierIds.length
           ? { create: supplierIds.map((sid: string) => ({ supplierId: sid })) }
@@ -224,7 +225,7 @@ router.post("/materials", requirePermission("master_data", "create"), async (req
 
 router.patch("/materials/:id", requirePermission("master_data", "update"), async (req: Request, res: Response) => {
   try {
-    const { name, type, category, unitOfMeasure, barcode, defaultExpiryDate, requiresLot, attachments, status, supplierIds } = req.body;
+    const { name, type, category, unitOfMeasure, barcode, defaultExpiryDate, requiresLot, attachments, status, supplierIds, traceabilityCode } = req.body;
     const material = await prisma.material.update({
       where: { id: req.params.id },
       data: {
@@ -235,6 +236,7 @@ router.patch("/materials/:id", requirePermission("master_data", "update"), async
         barcode,
         defaultExpiryDate: defaultExpiryDate !== undefined ? (defaultExpiryDate ? new Date(defaultExpiryDate) : null) : undefined,
         requiresLot,
+        traceabilityCode: traceabilityCode !== undefined ? (traceabilityCode ? String(traceabilityCode).trim() : null) : undefined,
         attachments,
         status,
         ...(Array.isArray(supplierIds)
@@ -347,10 +349,18 @@ router.get("/suppliers", requirePermission("master_data", "read"), async (req: R
 
 router.post("/suppliers", requirePermission("master_data", "create"), async (req: Request, res: Response) => {
   try {
-    const { name, contactPerson, email, phone, address, taxId } = req.body;
+    const { name, contactPerson, email, phone, address, taxId, vendorCode } = req.body;
     if (!name) return res.status(400).json({ error: "name is required" });
     const supplier = await prisma.supplier.create({
-      data: { name, contactPerson, email, phone, address, taxId },
+      data: {
+        name,
+        contactPerson,
+        email,
+        phone,
+        address,
+        taxId,
+        vendorCode: vendorCode ? String(vendorCode).trim() : null,
+      },
     });
     res.status(201).json({ supplier });
   } catch (error) {
@@ -361,10 +371,19 @@ router.post("/suppliers", requirePermission("master_data", "create"), async (req
 
 router.patch("/suppliers/:id", requirePermission("master_data", "update"), async (req: Request, res: Response) => {
   try {
-    const { name, contactPerson, email, phone, address, taxId, status } = req.body;
+    const { name, contactPerson, email, phone, address, taxId, status, vendorCode } = req.body;
     const supplier = await prisma.supplier.update({
       where: { id: req.params.id },
-      data: { name, contactPerson, email, phone, address, taxId, status },
+      data: {
+        name,
+        contactPerson,
+        email,
+        phone,
+        address,
+        taxId,
+        status,
+        vendorCode: vendorCode !== undefined ? (vendorCode ? String(vendorCode).trim() : null) : undefined,
+      },
     });
     res.json({ supplier });
   } catch (error) {

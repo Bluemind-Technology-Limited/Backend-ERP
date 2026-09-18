@@ -21,6 +21,16 @@ const BATCH_SELECT = {
   manufacturingDate: true,
   expiryDate: true,
   notes: true,
+  // Lot code (SOP KIB/QCA/010) — carried on every batch node so the tree can
+  // show the code next to the ingredient and the supplier it came from.
+  origin: true,
+  lotCode: true,
+  setNumber: true,
+  vendorCode: true,
+  ingredientCode: true,
+  yearCode: true,
+  supplierBatchNumber: true,
+  supplier: { select: { id: true, name: true, vendorCode: true } },
 };
 
 async function resolveInbound(batchLotId: string) {
@@ -261,24 +271,55 @@ export interface BatchMatch {
   manufacturingDate: Date | null;
   expiryDate: Date | null;
   material: { id: string; name: string; sku: string; type: string; unitOfMeasure: string };
+  /** Where the batch came from — inferred from production/GRN links. */
   origin: 'PRODUCTION_ORDER' | 'PRODUCTION_PLAN' | 'INBOUND' | 'UNKNOWN';
+  /** The stored lot-code origin (SOP KIB/QCA/010). */
+  batchOrigin: string;
+  // --- Lot code (SOP KIB/QCA/010) ------------------------------------------
+  // The parts travel with the result so a code is never shown on its own — the
+  // UI always has the ingredient and supplier names to display beside it.
+  lotCode: string | null;
+  setNumber: number | null;
+  vendorCode: string | null;
+  ingredientCode: string | null;
+  yearCode: string | null;
+  supplierBatchNumber: string | null;
+  supplier: { id: string; name: string; vendorCode: string | null } | null;
 }
 
-/** Universal search: any batch number, material name or SKU. */
+/**
+ * Universal search: batch number, material name/SKU, or any lot-code component.
+ *
+ * Searching "A" matches the vendor code, "1" matches the ingredient code (and
+ * the set number), and "A-1-1-26" matches the rendered code — all as structured
+ * filters, so nothing is ever parsed out of the string.
+ */
 export async function searchBatchLots(q: string, limit = 25): Promise<BatchMatch[]> {
   const term = q?.trim();
   if (!term) return [];
+
+  const numeric = /^\d+$/.test(term) ? Number(term) : null;
 
   const batches = await prisma.batchLot.findMany({
     where: {
       OR: [
         { batchNumber: { contains: term, mode: 'insensitive' } },
+        { lotCode: { contains: term, mode: 'insensitive' } },
+        { vendorCode: { equals: term, mode: 'insensitive' } },
+        { ingredientCode: { equals: term, mode: 'insensitive' } },
+        { yearCode: { equals: term, mode: 'insensitive' } },
+        ...(numeric !== null ? [{ setNumber: numeric }] : []),
+        { supplierBatchNumber: { contains: term, mode: 'insensitive' } },
         { material: { name: { contains: term, mode: 'insensitive' } } },
         { material: { sku: { contains: term, mode: 'insensitive' } } },
+        { material: { traceabilityCode: { equals: term, mode: 'insensitive' } } },
+        { supplier: { name: { contains: term, mode: 'insensitive' } } },
+        { supplier: { vendorCode: { equals: term, mode: 'insensitive' } } },
       ],
     },
     include: {
       material: { select: { id: true, name: true, sku: true, type: true, unitOfMeasure: true } },
+      supplier: { select: { id: true, name: true, vendorCode: true } },
     },
     orderBy: { createdAt: 'desc' },
     take: limit,
@@ -324,6 +365,14 @@ export async function searchBatchLots(q: string, limit = 25): Promise<BatchMatch
         : inboundSet.has(b.id)
           ? 'INBOUND'
           : 'UNKNOWN',
+    batchOrigin: b.origin,
+    lotCode: b.lotCode,
+    setNumber: b.setNumber,
+    vendorCode: b.vendorCode,
+    ingredientCode: b.ingredientCode,
+    yearCode: b.yearCode,
+    supplierBatchNumber: b.supplierBatchNumber,
+    supplier: b.supplier,
   }));
 }
 

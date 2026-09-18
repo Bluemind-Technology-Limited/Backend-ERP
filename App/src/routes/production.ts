@@ -927,6 +927,8 @@ router.post("/production-orders/:id/complete", requirePermission("production", "
           manufacturingDate: new Date(),
           expiryDate: expiryDate,
           status: "QUARANTINE",
+          // Finished production batch — the supervisor typed this batch number.
+          origin: "FINISHED",
         },
       });
 

@@ -497,6 +497,8 @@ export async function submitFinishingRecord(data: {
           batchNumber: data.batchNumber,
           status: 'QUARANTINE',
           expiryDate: data.expiryDate ? new Date(data.expiryDate) : null,
+          // Finished production batch — batch number comes from the station.
+          origin: 'FINISHED',
         },
       });
       finishedBatchLotId = batchLot.id;
