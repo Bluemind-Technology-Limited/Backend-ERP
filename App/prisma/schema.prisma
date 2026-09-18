@@ -140,6 +140,20 @@ enum QuantityAdjustmentStatus {
   REJECTED
 }
 
+enum MaintenanceType {
+  PREVENTIVE
+  CORRECTIVE
+  PREDICTIVE
+  EMERGENCY
+}
+
+enum MaintenanceStatus {
+  SCHEDULED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
 enum ProductionIngredientStatus {
   RESERVED
   RELEASED
@@ -212,6 +226,8 @@ model User {
   qualityCheckAttachments   QualityCheckAttachment[]
   quantityAdjustmentsRequested QuantityAdjustment[] @relation("qty_adj_requested")
   quantityAdjustmentsApproved  QuantityAdjustment[] @relation("qty_adj_approved")
+  machineCommissionings     Commissioning[]        @relation("machine_commissioned_by")
+  staffAssignments          StaffAssignment[]
   costAuditsCreated         CostAudit[]            @relation("cost_changed_by")
   costAuditsApproved        CostAudit[]            @relation("cost_approved_by")
 
@@ -629,6 +645,12 @@ model Machine {
   department  MachineDepartment @relation(fields: [departmentId], references: [id])
   location    MachineLocation?  @relation(fields: [locationId], references: [id])
 
+  spareParts       SparePart[]
+  maintenances     Maintenance[]
+  commissionings   Commissioning[]
+  performances     Performance[]
+  staffAssignments StaffAssignment[]
+
   @@index([status])
   @@index([categoryId])
   @@index([departmentId])
@@ -645,6 +667,110 @@ model Shift {
   productionOrders ProductionOrder[]
 
   @@map("shifts")
+}
+
+// ---------------------------------------------------------------------------
+// Machine asset management (spare parts, maintenance, commissioning,
+// performance, staff assignment).
+// ---------------------------------------------------------------------------
+
+model SparePart {
+  id              String    @id @default(uuid())
+  machineId       String    @map("machine_id")
+  partName        String    @map("part_name")
+  partNumber      String    @map("part_number")
+  description     String?
+  supplier        String?
+  stockLevel      Int       @default(0) @map("stock_level")
+  minStockLevel   Int       @default(0) @map("min_stock_level")
+  costPerUnit     Decimal   @default(0) @map("cost_per_unit") @db.Decimal(15, 2)
+  lastRestockDate DateTime? @map("last_restock_date")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  machine Machine @relation(fields: [machineId], references: [id], onDelete: Cascade)
+
+  @@index([machineId])
+  @@map("spare_parts")
+}
+
+model Maintenance {
+  id                  String            @id @default(uuid())
+  machineId           String            @map("machine_id")
+  type                MaintenanceType
+  status              MaintenanceStatus @default(SCHEDULED)
+  scheduledDate       DateTime          @map("scheduled_date")
+  completedDate       DateTime?         @map("completed_date")
+  description         String?
+  techniciansAssigned String?           @map("technicians_assigned")
+  estimatedDuration   Int?              @map("estimated_duration")
+  actualDuration      Int?              @map("actual_duration")
+  costEstimate        Decimal?          @map("cost_estimate") @db.Decimal(15, 2)
+  actualCost          Decimal?          @map("actual_cost") @db.Decimal(15, 2)
+  notes               String?
+  createdAt           DateTime          @default(now()) @map("created_at")
+  updatedAt           DateTime          @updatedAt @map("updated_at")
+
+  machine Machine @relation(fields: [machineId], references: [id], onDelete: Cascade)
+
+  @@index([machineId, scheduledDate])
+  @@index([status])
+  @@map("maintenances")
+}
+
+model Commissioning {
+  id                 String   @id @default(uuid())
+  machineId          String   @map("machine_id")
+  commissionedById   String   @map("commissioned_by_id")
+  commissioningDate  DateTime @map("commissioning_date")
+  installationStatus String   @map("installation_status")
+  testResults        String?  @map("test_results")
+  notes              String?
+  createdAt          DateTime @default(now()) @map("created_at")
+  updatedAt          DateTime @updatedAt @map("updated_at")
+
+  machine       Machine @relation(fields: [machineId], references: [id], onDelete: Cascade)
+  commissionedBy User   @relation("machine_commissioned_by", fields: [commissionedById], references: [id])
+
+  @@index([machineId, commissioningDate])
+  @@map("commissionings")
+}
+
+model Performance {
+  id                   String   @id @default(uuid())
+  machineId            String   @map("machine_id")
+  recordDate           DateTime @map("record_date")
+  targetOutput         Decimal  @map("target_output") @db.Decimal(15, 4)
+  actualOutput         Decimal  @map("actual_output") @db.Decimal(15, 4)
+  efficiencyPercentage Decimal  @default(0) @map("efficiency_percentage") @db.Decimal(6, 2)
+  downtime             Int      @default(0)
+  notes                String?
+  createdAt            DateTime @default(now()) @map("created_at")
+  updatedAt            DateTime @updatedAt @map("updated_at")
+
+  machine Machine @relation(fields: [machineId], references: [id], onDelete: Cascade)
+
+  @@index([machineId, recordDate])
+  @@map("performances")
+}
+
+model StaffAssignment {
+  id             String    @id @default(uuid())
+  machineId      String    @map("machine_id")
+  userId         String    @map("user_id")
+  role           String
+  assignedDate   DateTime  @default(now()) @map("assigned_date")
+  unassignedDate DateTime? @map("unassigned_date")
+  isActive       Boolean   @default(true) @map("is_active")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  machine Machine @relation(fields: [machineId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([machineId, isActive])
+  @@index([userId, isActive])
+  @@map("staff_assignments")
 }
 
 model ProductionOrder {
@@ -713,7 +839,7 @@ model ProductionIngredient {
 
 model ProductionPlan {
   id           String                @id @default(uuid())
-  planNumber   String                @unique
+  planNumber   String                @unique @map("plan_number")
   description  String?
   status       ProductionPlanStatus  @default(DRAFT)
   scheduledFor DateTime?             @map("scheduled_for")
@@ -860,7 +986,7 @@ model ProductionGrindingInput {
 
 model Consignment {
   id              String              @id @default(uuid())
-  consignmentNumber String            @unique
+  consignmentNumber String            @unique @map("consignment_number")
   supplierId      String              @map("supplier_id")
   warehouseId     String              @map("warehouse_id")
   status          ConsignmentStatus   @default(DRAFT)

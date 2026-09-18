@@ -9,7 +9,7 @@ import * as costService from "../services/costManagementService.js";
 import * as userActivityLogger from "../services/userActivityLogger.js";
 import { prisma } from "../lib/db.js";
 
-const router = Router();
+const router: Router = Router();
 router.use(requireAuth);
 
 // ---------------------------------------------------------------------------

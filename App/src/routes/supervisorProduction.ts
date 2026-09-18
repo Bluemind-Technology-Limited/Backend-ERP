@@ -1,12 +1,71 @@
 import { Router, type Request, type Response } from "express";
 import { requireAuth } from "../middleware/auth.js";
 import { requirePermission } from "../middleware/rbac.js";
+import { prisma } from "../lib/db.js";
 import * as batchMachineAllocationService from "../services/batchMachineAllocationService.js";
 import * as dailyProductionReconciliationService from "../services/dailyProductionReconciliationService.js";
 import * as supervisorProductionService from "../services/supervisorProductionService.js";
 
 const router: Router = Router();
 router.use(requireAuth);
+
+const PLAN_STATUS_VALUES = ["DRAFT", "SCHEDULED", "IN_PROGRESS", "COMPLETED", "CANCELLED"] as const;
+type PlanStatus = (typeof PLAN_STATUS_VALUES)[number];
+
+// ---------------------------------------------------------------------------
+// Landing Dashboard
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /supervisor/dashboard
+ * Aggregate counters for the production supervisor landing view.
+ */
+router.get(
+  "/dashboard",
+  requirePermission("production", "read"),
+  async (req: Request, res: Response) => {
+    try {
+      const startOfToday = new Date();
+      startOfToday.setHours(0, 0, 0, 0);
+
+      const [totalPlans, activePlans, completedToday, allocations, reconciliations] =
+        await Promise.all([
+          prisma.productionPlan.count(),
+          prisma.productionPlan.count({ where: { status: "IN_PROGRESS" } }),
+          prisma.productionPlan.count({
+            where: { status: "COMPLETED", completedAt: { gte: startOfToday } },
+          }),
+          prisma.batchMachineAllocation.groupBy({ by: ["status"], _count: { _all: true } }),
+          prisma.dailyProductionReconciliation.groupBy({ by: ["status"], _count: { _all: true } }),
+        ]);
+
+      const countFor = (rows: any[], statuses: string[]) =>
+        rows
+          .filter((row) => statuses.includes(row.status))
+          .reduce((sum, row) => sum + (row._count?._all ?? 0), 0);
+
+      res.json({
+        totalPlans,
+        activePlans,
+        completedToday,
+        pendingReconciliations: countFor(reconciliations, ["PENDING"]),
+        allocationMetrics: {
+          scheduled: countFor(allocations, ["ALLOCATED", "SCHEDULED"]),
+          inProgress: countFor(allocations, ["IN_PROGRESS"]),
+          completed: countFor(allocations, ["COMPLETED"]),
+        },
+        reconciliationMetrics: {
+          pending: countFor(reconciliations, ["PENDING"]),
+          verified: countFor(reconciliations, ["VERIFIED"]),
+          flagged: countFor(reconciliations, ["FLAGGED"]),
+        },
+      });
+    } catch (error: any) {
+      console.error("GET /supervisor/dashboard error:", error);
+      res.status(500).json({ error: error?.message || "Database error" });
+    }
+  }
+);
 
 // ---------------------------------------------------------------------------
 // Production Plan Visibility Endpoints
@@ -26,12 +85,17 @@ router.get(
       const limitNum = parseInt(limit as string) || 20;
       const skip = (pageNum - 1) * limitNum;
 
-      const where = status
-        ? { status: status as string }
-        : { status: { in: ["SCHEDULED", "IN_PROGRESS", "COMPLETED"] } };
+      const requestedStatus =
+        typeof status === "string" && (PLAN_STATUS_VALUES as readonly string[]).includes(status)
+          ? (status as PlanStatus)
+          : undefined;
+
+      const where = requestedStatus
+        ? { status: requestedStatus }
+        : { status: { in: ["SCHEDULED", "IN_PROGRESS", "COMPLETED"] as PlanStatus[] } };
 
       const [plans, total] = await Promise.all([
-        (req as any).prisma.productionPlan.findMany({
+        prisma.productionPlan.findMany({
           where,
           include: {
             items: true,
@@ -41,7 +105,7 @@ router.get(
           skip,
           take: limitNum,
         }),
-        (req as any).prisma.productionPlan.count({ where }),
+        prisma.productionPlan.count({ where }),
       ]);
 
       // Get execution status for each plan
@@ -72,7 +136,7 @@ router.get(
   requirePermission("production", "read"),
   async (req: Request, res: Response) => {
     try {
-      const plan = await (req as any).prisma.productionPlan.findUnique({
+      const plan = await prisma.productionPlan.findUnique({
         where: { id: req.params.planId },
         include: {
           items: {
@@ -109,18 +173,34 @@ router.get(
   requirePermission("production", "read"),
   async (req: Request, res: Response) => {
     try {
-      const items = await (req as any).prisma.productionPlanItem.findMany({
+      const items = await prisma.productionPlanItem.findMany({
         where: { productionPlanId: req.params.planId },
         include: {
           bom: { include: { finishedSku: { select: { name: true, sku: true, unitOfMeasure: true } } } },
-          batchMachineAllocations: {
-            include: { machine: true, productionOrder: true },
-          },
+          batchMachineAllocations: { include: { productionOrder: true } },
         },
         orderBy: { sequence: "asc" },
       });
 
-      res.json({ items });
+      // BatchMachineAllocation stores `machineId` without a Prisma relation, so
+      // hydrate the machines explicitly to keep the `machine` shape consumers expect.
+      const machineIds = [
+        ...new Set(items.flatMap((item) => item.batchMachineAllocations.map((a) => a.machineId))),
+      ];
+      const machines = machineIds.length
+        ? await prisma.machine.findMany({ where: { id: { in: machineIds } } })
+        : [];
+      const machineById = new Map(machines.map((machine) => [machine.id, machine]));
+
+      res.json({
+        items: items.map((item) => ({
+          ...item,
+          batchMachineAllocations: item.batchMachineAllocations.map((allocation) => ({
+            ...allocation,
+            machine: machineById.get(allocation.machineId) ?? null,
+          })),
+        })),
+      });
     } catch (error: any) {
       console.error("GET /supervisor/production-plans/:planId/items error:", error);
       res.status(500).json({ error: error?.message || "Database error" });
@@ -137,7 +217,7 @@ router.get(
   requirePermission("production", "read"),
   async (req: Request, res: Response) => {
     try {
-      const ingredients = await (req as any).prisma.planAggregatedIngredient.findMany({
+      const ingredients = await prisma.planAggregatedIngredient.findMany({
         where: { productionPlanId: req.params.planId },
         include: { material: { select: { name: true, sku: true, unitOfMeasure: true } } },
       });
@@ -390,7 +470,7 @@ router.get(
         );
         res.json({ reconciliations });
       } else {
-        const reconciliations = await (req as any).prisma.dailyProductionReconciliation.findMany({
+        const reconciliations = await prisma.dailyProductionReconciliation.findMany({
           include: {
             productionPlan: { select: { planNumber: true } },
             supervisor: { select: { fullName: true } },
