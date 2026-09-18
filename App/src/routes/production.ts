@@ -599,9 +599,23 @@ router.get("/production-orders", requirePermission("production", "read"), async 
       planByOrder.set(a.productionOrderId, a.planItem?.productionPlan?.planNumber ?? null);
     }
 
+    // ProductionOrder stores `machineId` without a Prisma relation, so hydrate the
+    // machines explicitly to keep the `machine` shape the UI expects.
+    const machineIds = [
+      ...new Set(orders.map((o) => o.machineId).filter((id): id is string => Boolean(id))),
+    ];
+    const machines = machineIds.length
+      ? await prisma.machine.findMany({
+          where: { id: { in: machineIds } },
+          select: { id: true, name: true, code: true },
+        })
+      : [];
+    const machineById = new Map(machines.map((machine) => [machine.id, machine]));
+
     res.json({
       productionOrders: orders.map((o) => ({
         ...o,
+        machine: o.machineId ? machineById.get(o.machineId) ?? null : null,
         planLinked: planByOrder.has(o.id),
         planNumber: planByOrder.get(o.id) ?? null,
       })),
