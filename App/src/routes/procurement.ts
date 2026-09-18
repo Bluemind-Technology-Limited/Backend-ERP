@@ -150,6 +150,30 @@ router.post("/purchase-orders", requirePermission("procurement", "create"), asyn
       });
     }
 
+    // Each item must actually be sourced from this supplier — a material knows
+    // who supplies it (Master Data → Materials).
+    const requestedMaterialIds = items
+      .map((it: any) => it.materialId)
+      .filter(Boolean);
+    if (requestedMaterialIds.length) {
+      const linked = await prisma.materialSupplier.findMany({
+        where: { supplierId, materialId: { in: requestedMaterialIds } },
+        select: { materialId: true },
+      });
+      const linkedIds = new Set(linked.map((l) => l.materialId));
+      const unlinkedIds = requestedMaterialIds.filter((id: string) => !linkedIds.has(id));
+
+      if (unlinkedIds.length) {
+        const material = await prisma.material.findFirst({
+          where: { id: { in: unlinkedIds } },
+          select: { name: true },
+        });
+        return res.status(400).json({
+          error: `"${material?.name ?? "A material"}" is not supplied by ${supplier.name}. Link it in Master Data → Materials, or raise a separate PO with its own supplier.`,
+        });
+      }
+    }
+
     // If converting from an approved requisition, pull its items.
     let poItems = items;
     if (requisitionId) {
