@@ -81,7 +81,7 @@ export async function approveCostChange(auditId: string, approvedBy: string, rej
 
   // If approved, apply the cost change
   if (approved) {
-    await applyCostChange(audit.entityType, audit.entityId, audit.fieldName, audit.newValue);
+    await applyCostChange(audit.entityType, audit.entityId, audit.fieldName, Number(audit.newValue));
   }
 
   return updated;

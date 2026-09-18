@@ -24,7 +24,7 @@ export interface CostChangeRequest {
   entityType: string; // Material, PurchaseOrderItem, BomIngredient, ProductionOrder, GoodsReceiptItem
   entityId: string;
   fieldName: string;
-  oldValue: number;
+  oldValue: number | null; // null when the field had no prior value
   newValue: number;
   reason?: string;
   changeType: 'MANUAL' | 'APPROVED' | 'BULK_UPDATE';
