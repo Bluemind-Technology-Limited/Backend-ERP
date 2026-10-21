@@ -9,6 +9,10 @@ import {
   getLpoPreview,
   sendLpos,
   LpoValidationError,
+  ensurePurchaseOrderForRequisition,
+  getPurchaseOrderLpoPreview,
+  sendPurchaseOrderLpos,
+  setPurchaseOrderItemHold,
 } from "../services/lpoService.js";
 
 const router: Router = Router();
@@ -139,6 +143,123 @@ router.post(
       }
       console.error("POST /procurement/requisitions/:id/lpo/send error:", error);
       res.status(500).json({ error: error?.message || "Failed to send LPOs" });
+    }
+  }
+);
+
+/**
+ * POST /procurement/requisitions/:id/ensure-po
+ * Creates the PO for an approved requisition if it does not exist yet, so the
+ * LPO modal can work on real PO lines (with their own LPO/hold state).
+ */
+router.post(
+  "/requisitions/:id/ensure-po",
+  requirePermission("procurement", "create"),
+  async (req: Request, res: Response) => {
+    try {
+      const purchaseOrder = await ensurePurchaseOrderForRequisition(req.params.id, req.user!.id);
+      res.status(201).json({ purchaseOrder });
+    } catch (error: any) {
+      if (error instanceof LpoValidationError) {
+        return res.status(400).json({ error: error.message, issues: error.issues });
+      }
+      if (/not found/i.test(error?.message ?? "")) {
+        return res.status(404).json({ error: error.message });
+      }
+      if (/approved/i.test(error?.message ?? "")) {
+        return res.status(400).json({ error: error.message });
+      }
+      console.error("POST /procurement/requisitions/:id/ensure-po error:", error);
+      res.status(500).json({ error: error?.message || "Failed to prepare the purchase order" });
+    }
+  }
+);
+
+/**
+ * GET /procurement/purchase-orders/:id/lpo/preview
+ * Every line with its LPO state (sent / on hold / received / ready).
+ */
+router.get(
+  "/purchase-orders/:id/lpo/preview",
+  requirePermission("procurement", "read"),
+  async (req: Request, res: Response) => {
+    try {
+      const preview = await getPurchaseOrderLpoPreview(req.params.id);
+      res.json(preview);
+    } catch (error: any) {
+      if (/not found/i.test(error?.message ?? "")) {
+        return res.status(404).json({ error: error.message });
+      }
+      console.error("GET /procurement/purchase-orders/:id/lpo/preview error:", error);
+      res.status(500).json({ error: error?.message || "Failed to prepare LPO preview" });
+    }
+  }
+);
+
+/**
+ * POST /procurement/purchase-orders/:id/lpo/send
+ * Sends the selected (unsent, unheld) lines, one LPO per supplier. The order
+ * can be sent again later for the remaining lines.
+ */
+router.post(
+  "/purchase-orders/:id/lpo/send",
+  requirePermission("procurement", "update"),
+  async (req: Request, res: Response) => {
+    try {
+      const { itemIds, selections, unitCosts, notes, expectedDelivery } = req.body ?? {};
+      if (!Array.isArray(itemIds) || itemIds.length === 0) {
+        return res.status(400).json({ error: "Select at least one item to include in the LPO" });
+      }
+      const result = await sendPurchaseOrderLpos({
+        poId: req.params.id,
+        userId: req.user!.id,
+        itemIds: itemIds.map((id: unknown) => String(id)),
+        selections: selections && typeof selections === "object" ? selections : {},
+        unitCosts: unitCosts && typeof unitCosts === "object" ? unitCosts : {},
+        notes,
+        expectedDelivery,
+      });
+      res.status(201).json(result);
+    } catch (error: any) {
+      if (error instanceof LpoValidationError) {
+        return res.status(400).json({ error: error.message, issues: error.issues });
+      }
+      if (/not found/i.test(error?.message ?? "")) {
+        return res.status(404).json({ error: error.message });
+      }
+      if (/already|email|configured/i.test(error?.message ?? "")) {
+        return res.status(409).json({ error: error.message });
+      }
+      console.error("POST /procurement/purchase-orders/:id/lpo/send error:", error);
+      res.status(500).json({ error: error?.message || "Failed to send LPOs" });
+    }
+  }
+);
+
+/**
+ * PATCH /procurement/purchase-orders/:id/items/:itemId/hold
+ * Temporarily withhold a line from LPO selection (or resume it).
+ */
+router.patch(
+  "/purchase-orders/:id/items/:itemId/hold",
+  requirePermission("procurement", "update"),
+  async (req: Request, res: Response) => {
+    try {
+      const { onHold, reason } = req.body ?? {};
+      if (typeof onHold !== "boolean") {
+        return res.status(400).json({ error: "onHold must be true or false" });
+      }
+      const item = await setPurchaseOrderItemHold(req.params.id, req.params.itemId, onHold, reason);
+      res.json({ item });
+    } catch (error: any) {
+      if (/not found/i.test(error?.message ?? "")) {
+        return res.status(404).json({ error: error.message });
+      }
+      if (/already/i.test(error?.message ?? "")) {
+        return res.status(409).json({ error: error.message });
+      }
+      console.error("PATCH /procurement/purchase-orders/:id/items/:itemId/hold error:", error);
+      res.status(500).json({ error: error?.message || "Failed to update the line hold" });
     }
   }
 );
@@ -466,6 +587,7 @@ router.post("/purchase-orders", requirePermission("procurement", "create"), asyn
         items: {
           create: poItems.map((it) => ({
             materialId: it.materialId,
+            supplierId: it.supplierId ?? supplierId,
             quantity: it.quantity,
             unitCost: it.unitCost ?? 0,
             unitOfMeasure: it.unitOfMeasure,

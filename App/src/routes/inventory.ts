@@ -215,6 +215,203 @@ router.get("/finished-goods", requirePermission("inventory", "read"), async (req
   }
 });
 
+/**
+ * GET /finished-goods/daily — finished goods as a DAILY stock ledger.
+ *
+ * One row per product per production/movement date (newest first) with that
+ * day's output, outbound movement and the running balance. The latest row
+ * carries the product's current stock. Batch-level balances are returned too
+ * so the UI can still dispatch from a specific batch/warehouse.
+ */
+router.get("/finished-goods/daily", requirePermission("inventory", "read"), async (_req: Request, res: Response) => {
+  try {
+    const finishedMaterials = await prisma.material.findMany({
+      where: { type: "FINISHED" },
+      select: { id: true, name: true, sku: true, unitOfMeasure: true },
+    });
+    if (!finishedMaterials.length) return res.json({ products: [] });
+
+    const materialIds = finishedMaterials.map((m) => m.id);
+    const transactions = await prisma.inventoryTransaction.findMany({
+      where: { materialId: { in: materialIds }, batchLotId: { not: null } },
+      select: {
+        materialId: true,
+        batchLotId: true,
+        warehouseId: true,
+        quantity: true,
+        eventType: true,
+        referenceType: true,
+        referenceId: true,
+        createdAt: true,
+      },
+      orderBy: { createdAt: "asc" },
+    });
+    if (!transactions.length) return res.json({ products: [] });
+
+    const batchIds = [...new Set(transactions.map((t) => t.batchLotId).filter(Boolean))] as string[];
+    const warehouseIds = [...new Set(transactions.map((t) => t.warehouseId))];
+
+    const [batchLots, warehouses, prodOrders] = await Promise.all([
+      prisma.batchLot.findMany({
+        where: { id: { in: batchIds } },
+        select: {
+          id: true,
+          batchNumber: true,
+          status: true,
+          manufacturingDate: true,
+          expiryDate: true,
+        },
+      }),
+      prisma.warehouse.findMany({
+        where: { id: { in: warehouseIds } },
+        select: { id: true, name: true, code: true },
+      }),
+      prisma.productionOrder.findMany({
+        where: { finishedBatchId: { in: batchIds } },
+        select: { orderNumber: true, finishedBatchId: true },
+      }),
+    ]);
+
+    const batchMap = new Map(batchLots.map((b) => [b.id, b]));
+    const warehouseMap = new Map(warehouses.map((w) => [w.id, w]));
+    const orderMap = new Map(prodOrders.map((o) => [o.finishedBatchId, o.orderNumber]));
+
+    type Line = {
+      batchLotId: string;
+      batchNumber: string;
+      batchStatus: string;
+      manufacturingDate: Date | null;
+      expiryDate: Date | null;
+      warehouseId: string;
+      warehouseName: string;
+      warehouseCode: string;
+      orderNumber: string | null;
+      qtyIn: number;
+      qtyOut: number;
+      onHand: number;
+    };
+
+    const byMaterial = new Map<string, typeof transactions>();
+    for (const tx of transactions) {
+      const list = byMaterial.get(tx.materialId);
+      if (list) list.push(tx);
+      else byMaterial.set(tx.materialId, [tx]);
+    }
+
+    const products = finishedMaterials
+      .map((material) => {
+        const txs = byMaterial.get(material.id) ?? [];
+
+        // Current balance per batch + warehouse (sum of the whole ledger).
+        const balanceKey = (batchLotId: string, warehouseId: string) => `${batchLotId}|${warehouseId}`;
+        const balances = new Map<string, number>();
+        const days = new Map<
+          string,
+          { produced: number; qtyIn: number; qtyOut: number; lines: Map<string, { qtyIn: number; qtyOut: number }> }
+        >();
+
+        for (const tx of txs) {
+          const batchLotId = tx.batchLotId as string;
+          const key = balanceKey(batchLotId, tx.warehouseId);
+          const qty = Number(tx.quantity);
+          balances.set(key, (balances.get(key) ?? 0) + qty);
+
+          const date = tx.createdAt.toISOString().slice(0, 10);
+          let day = days.get(date);
+          if (!day) {
+            day = { produced: 0, qtyIn: 0, qtyOut: 0, lines: new Map() };
+            days.set(date, day);
+          }
+          if (qty >= 0) day.qtyIn += qty;
+          else day.qtyOut += Math.abs(qty);
+          if (tx.eventType === "PROD_OUTPUT") day.produced += qty;
+
+          const line = day.lines.get(key) ?? { qtyIn: 0, qtyOut: 0 };
+          if (qty >= 0) line.qtyIn += qty;
+          else line.qtyOut += Math.abs(qty);
+          day.lines.set(key, line);
+        }
+
+        // Running balance, newest first for display.
+        const ordered = [...days.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1));
+        let running = 0;
+        const daysOut = ordered.map(([date, day]) => {
+          const net = day.qtyIn - day.qtyOut;
+          running += net;
+          return {
+            date,
+            produced: day.produced,
+            qtyIn: day.qtyIn,
+            qtyOut: day.qtyOut,
+            net,
+            closingBalance: running,
+            lines: [...day.lines.entries()].map(([key, line]) => {
+              const [batchLotId, warehouseId] = key.split("|");
+              const batch = batchMap.get(batchLotId);
+              const warehouse = warehouseMap.get(warehouseId);
+              return {
+                batchLotId,
+                batchNumber: batch?.batchNumber ?? "—",
+                batchStatus: batch?.status ?? "—",
+                manufacturingDate: batch?.manufacturingDate ?? null,
+                expiryDate: batch?.expiryDate ?? null,
+                warehouseId,
+                warehouseName: warehouse?.name ?? "—",
+                warehouseCode: warehouse?.code ?? "",
+                orderNumber: orderMap.get(batchLotId) ?? null,
+                qtyIn: line.qtyIn,
+                qtyOut: line.qtyOut,
+                onHand: balances.get(key) ?? 0,
+              } as Line;
+            }),
+          };
+        });
+
+        const currentBatches: Line[] = [...balances.entries()]
+          .filter(([, qty]) => Math.abs(qty) > 0.00001)
+          .map(([key, qty]) => {
+            const [batchLotId, warehouseId] = key.split("|");
+            const batch = batchMap.get(batchLotId);
+            const warehouse = warehouseMap.get(warehouseId);
+            return {
+              batchLotId,
+              batchNumber: batch?.batchNumber ?? "—",
+              batchStatus: batch?.status ?? "—",
+              manufacturingDate: batch?.manufacturingDate ?? null,
+              expiryDate: batch?.expiryDate ?? null,
+              warehouseId,
+              warehouseName: warehouse?.name ?? "—",
+              warehouseCode: warehouse?.code ?? "",
+              orderNumber: orderMap.get(batchLotId) ?? null,
+              qtyIn: 0,
+              qtyOut: 0,
+              onHand: qty,
+            } as Line;
+          })
+          .sort((a, b) => b.onHand - a.onHand);
+
+        return {
+          materialId: material.id,
+          materialName: material.name,
+          sku: material.sku,
+          unitOfMeasure: material.unitOfMeasure,
+          producedTotal: daysOut.reduce((sum, d) => sum + d.produced, 0),
+          currentStock: running,
+          latestDate: daysOut.length ? daysOut[daysOut.length - 1].date : null,
+          batches: currentBatches,
+          days: daysOut.slice().reverse(),
+        };
+      })
+      .filter((p) => p.days.length > 0)
+      .sort((a, b) => a.materialName.localeCompare(b.materialName));
+
+    res.json({ products });
+  } catch (error) {
+    console.error("GET /finished-goods/daily error:", error);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
 export default router;
 
 /**

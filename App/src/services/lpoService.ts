@@ -9,7 +9,9 @@ import { logActivity } from "./userActivityLogger.js";
  *
  * One internal PurchaseOrder is created per requisition. Its items remember
  * their supplier, so the same order can be split into one LPO PDF + email per
- * supplier. Duplicate material lines for the same supplier are merged.
+ * supplier. LPOs are issued per item: a line that has already travelled on an
+ * LPO is never offered again, and a line can be put on a temporary hold, so a
+ * single order can be sent to suppliers over several rounds.
  */
 
 export class LpoValidationError extends Error {
@@ -41,6 +43,16 @@ interface MergedItem {
   suppliers: SupplierInfo[];
 }
 
+const SUPPLIER_SELECT = {
+  id: true,
+  name: true,
+  email: true,
+  contactPerson: true,
+  phone: true,
+  address: true,
+  vendorCode: true,
+} as const;
+
 const REQUISITION_FOR_LPO = {
   requestedBy: { select: { fullName: true, email: true } },
   purchaseOrders: { select: { id: true, number: true, status: true } },
@@ -55,21 +67,35 @@ const REQUISITION_FOR_LPO = {
           standardCost: true,
           suppliers: {
             include: {
-              supplier: {
-                select: {
-                  id: true,
-                  name: true,
-                  email: true,
-                  contactPerson: true,
-                  phone: true,
-                  address: true,
-                  vendorCode: true,
-                },
-              },
+              supplier: { select: SUPPLIER_SELECT },
             },
           },
         },
       },
+    },
+  },
+} as const;
+
+const PURCHASE_ORDER_FOR_LPO = {
+  supplier: { select: SUPPLIER_SELECT },
+  requisition: { select: { id: true, number: true, notes: true } },
+  items: {
+    include: {
+      material: {
+        select: {
+          id: true,
+          name: true,
+          sku: true,
+          unitOfMeasure: true,
+          standardCost: true,
+          suppliers: {
+            include: {
+              supplier: { select: SUPPLIER_SELECT },
+            },
+          },
+        },
+      },
+      supplier: { select: SUPPLIER_SELECT },
     },
   },
 } as const;
@@ -136,7 +162,11 @@ function groupBySupplier(
   return [...groups.values()];
 }
 
-/** Preview data for the Generate & Send modal. */
+// ---------------------------------------------------------------------------
+// Requisition preview (legacy entry point)
+// ---------------------------------------------------------------------------
+
+/** Preview data for the Generate & Send modal, keyed by requisition. */
 export async function getLpoPreview(requisitionId: string) {
   const requisition = await loadRequisition(requisitionId);
   if (!requisition) throw new Error("Requisition not found");
@@ -173,152 +203,285 @@ export async function getLpoPreview(requisitionId: string) {
   };
 }
 
-export interface SendLpoInput {
-  requisitionId: string;
-  userId: string;
-  selections?: Record<string, string>;
-  unitCosts?: Record<string, number>;
-  notes?: string | null;
-  expectedDelivery?: string | null;
-}
+// ---------------------------------------------------------------------------
+// Purchase order -> LPO rounds
+// ---------------------------------------------------------------------------
 
-export async function sendLpos(input: SendLpoInput) {
-  const requisition = await loadRequisition(input.requisitionId);
+/**
+ * Creates the internal purchase order for an approved requisition if it does
+ * not exist yet. Never deletes or rewrites lines, so LPO history survives.
+ */
+export async function ensurePurchaseOrderForRequisition(requisitionId: string, userId: string) {
+  const requisition = await loadRequisition(requisitionId);
   if (!requisition) throw new Error("Requisition not found");
   if (requisition.status !== "APPROVED") {
     throw new Error("Only approved requisitions can be converted to LPOs");
   }
 
-  const merged = mergeItems(requisition);
-  const selections = input.selections ?? {};
-  const rawUnitCosts = input.unitCosts ?? {};
-  const unitCosts: Record<string, number> = {};
-  for (const [materialId, value] of Object.entries(rawUnitCosts)) {
-    unitCosts[materialId] = Number(value);
-  }
-  const issues: string[] = [];
+  const existing = await prisma.purchaseOrder.findFirst({
+    where: { requisitionId: requisition.id },
+    orderBy: { createdAt: "asc" },
+  });
+  if (existing) return existing;
 
-  for (const item of merged) {
-    if (item.suppliers.length === 0) {
-      issues.push(`${item.materialName} has no supplier linked in Master Data.`);
+  const merged = mergeItems(requisition);
+  if (merged.length === 0) throw new LpoValidationError(["This requisition has no items."]);
+
+  const supplierless = merged.filter((item) => item.suppliers.length === 0);
+  if (supplierless.length) {
+    throw new LpoValidationError(
+      supplierless.map((item) => `${item.materialName} has no supplier linked in Master Data.`)
+    );
+  }
+
+  return prisma.purchaseOrder.create({
+    data: {
+      number: `PO-${Date.now().toString().slice(-8)}`,
+      supplierId: merged[0].suppliers[0].id,
+      requisitionId: requisition.id,
+      createdById: userId,
+      status: "DRAFT",
+      notes: requisition.notes,
+      items: {
+        create: merged.map((item) => ({
+          materialId: item.materialId,
+          supplierId: item.suppliers.length === 1 ? item.suppliers[0].id : null,
+          quantity: item.quantity,
+          unitCost: item.standardCost,
+          unitOfMeasure: item.unitOfMeasure,
+        })),
+      },
+    },
+  });
+}
+
+/** Supplier options + LPO/hold state for every line on an order. */
+export async function getPurchaseOrderLpoPreview(poId: string) {
+  const purchaseOrder = await prisma.purchaseOrder.findUnique({
+    where: { id: poId },
+    include: PURCHASE_ORDER_FOR_LPO,
+  });
+  if (!purchaseOrder) throw new Error("Purchase order not found");
+
+  const items = purchaseOrder.items.map((item) => {
+    const linked = item.material.suppliers.map((s) => s.supplier);
+    const suppliers = [...linked];
+    if (item.supplier && !suppliers.some((s) => s.id === item.supplier?.id)) {
+      suppliers.push(item.supplier);
+    }
+    const ordered = Number(item.quantity);
+    const received = Number(item.receivedQty);
+    const fullyReceived = received >= ordered;
+    const lpoSent = Boolean(item.lpoSentAt);
+    return {
+      id: item.id,
+      materialId: item.materialId,
+      materialName: item.material.name,
+      sku: item.material.sku,
+      unitOfMeasure: item.unitOfMeasure,
+      quantity: ordered,
+      receivedQty: received,
+      unitCost: Number(item.unitCost),
+      standardCost: Number(item.material.standardCost ?? 0),
+      supplierId: item.supplierId ?? (suppliers.length === 1 ? suppliers[0].id : ""),
+      supplierName: item.supplier?.name ?? null,
+      suppliers,
+      onHold: item.onHold,
+      holdReason: item.holdReason,
+      lpoNumber: item.lpoNumber,
+      lpoSentAt: item.lpoSentAt,
+      lpoSent,
+      fullyReceived,
+      eligible: !lpoSent && !item.onHold && !fullyReceived,
+    };
+  });
+
+  return {
+    purchaseOrder: {
+      id: purchaseOrder.id,
+      number: purchaseOrder.number,
+      status: purchaseOrder.status,
+      notes: purchaseOrder.notes,
+      expectedDelivery: purchaseOrder.expectedDelivery,
+      sentAt: purchaseOrder.sentAt,
+      supplier: purchaseOrder.supplier,
+      requisition: purchaseOrder.requisition,
+      lpoSequence: purchaseOrder.lpoSequence,
+    },
+    items,
+    summary: {
+      total: items.length,
+      sent: items.filter((i) => i.lpoSent).length,
+      onHold: items.filter((i) => i.onHold).length,
+      received: items.filter((i) => i.fullyReceived).length,
+      eligible: items.filter((i) => i.eligible).length,
+    },
+  };
+}
+
+export interface SendPurchaseOrderLposInput {
+  poId: string;
+  userId: string;
+  /** PurchaseOrderItem ids selected for this LPO round. */
+  itemIds: string[];
+  /** itemId -> supplierId, when a line can be bought from several suppliers. */
+  selections?: Record<string, string>;
+  /** itemId -> unit cost. */
+  unitCosts?: Record<string, number>;
+  notes?: string | null;
+  expectedDelivery?: string | null;
+}
+
+interface PreparedLine {
+  itemId: string;
+  materialId: string;
+  materialName: string;
+  sku: string;
+  quantity: number;
+  unitOfMeasure: string;
+  unitCost: number;
+}
+
+export async function sendPurchaseOrderLpos(input: SendPurchaseOrderLposInput) {
+  const po = await prisma.purchaseOrder.findUnique({
+    where: { id: input.poId },
+    include: PURCHASE_ORDER_FOR_LPO,
+  });
+  if (!po) throw new Error("Purchase order not found");
+
+  const selectedIds = [...new Set(input.itemIds ?? [])];
+  if (selectedIds.length === 0) {
+    throw new LpoValidationError(["Select at least one item to include in the LPO."]);
+  }
+
+  const byId = new Map(po.items.map((item) => [item.id, item]));
+  const issues: string[] = [];
+  const chosen: Array<{ item: (typeof po.items)[number]; supplier: SupplierInfo; unitCost: number }> = [];
+
+  for (const itemId of selectedIds) {
+    const item = byId.get(itemId);
+    if (!item) {
+      issues.push("One of the selected items is not on this purchase order.");
       continue;
     }
-    const supplier = supplierForItem(item, selections[item.materialId]);
+
+    const name = item.material.name;
+    if (item.lpoSentAt) {
+      issues.push(`${name} was already sent on ${item.lpoNumber ?? "an earlier LPO"}.`);
+      continue;
+    }
+    if (item.onHold) {
+      issues.push(`${name} is on hold — resume it before including it in an LPO.`);
+      continue;
+    }
+    if (Number(item.receivedQty) >= Number(item.quantity)) {
+      issues.push(`${name} has already been fully received.`);
+      continue;
+    }
+
+    const linked = item.material.suppliers.map((s) => s.supplier);
+    const pool = [...linked];
+    if (item.supplier && !pool.some((s) => s.id === item.supplierId)) pool.push(item.supplier);
+
+    const supplierId = input.selections?.[item.id] ?? item.supplierId ?? (pool.length === 1 ? pool[0].id : "");
+    const supplier = pool.find((s) => s.id === supplierId);
     if (!supplier) {
-      const names = item.suppliers.map((s) => s.name).join(", ");
-      issues.push(`Choose a supplier for ${item.materialName} (${names}).`);
+      issues.push(
+        pool.length === 0
+          ? `${name} has no supplier linked in Master Data.`
+          : `Choose a supplier for ${name} (${pool.map((s) => s.name).join(", ")}).`
+      );
       continue;
     }
     if (!supplier.email?.trim()) {
       issues.push(`${supplier.name} has no email address. Add it in Master Data → Suppliers.`);
     }
-    if (!Number.isFinite(unitCosts[item.materialId]) || Number(unitCosts[item.materialId]) < 0) {
-      if (unitCosts[item.materialId] !== undefined) {
-        issues.push(`Unit cost for ${item.materialName} must be zero or greater.`);
-      }
+
+    const rawCost = input.unitCosts?.[item.id];
+    const unitCost = rawCost !== undefined ? Number(rawCost) : Number(item.unitCost);
+    if (!Number.isFinite(unitCost) || unitCost < 0) {
+      issues.push(`Unit cost for ${name} must be zero or greater.`);
+      continue;
     }
+
+    chosen.push({ item, supplier, unitCost });
   }
 
-  if (issues.length) throw new LpoValidationError(issues);
-
-  const groups = groupBySupplier(merged, selections, unitCosts);
-  if (groups.length === 0) {
-    throw new LpoValidationError(["No supplier groups could be built for this requisition."]);
+  if (issues.length) throw new LpoValidationError([...new Set(issues)]);
+  if (chosen.length === 0) {
+    throw new LpoValidationError(["No supplier groups could be built for the selected items."]);
   }
 
-  const existing = await prisma.purchaseOrder.findFirst({
-    where: { requisitionId: requisition.id },
-    include: { items: true, goodsReceipts: { select: { id: true } } },
-  });
-
-  if (existing?.status === "SENT") {
-    throw new Error("LPOs have already been sent for this requisition.");
+  // One LPO per supplier; duplicate material lines for the same supplier merge.
+  const groups = new Map<
+    string,
+    { supplier: SupplierInfo; lines: PreparedLine[]; itemIds: string[]; total: number }
+  >();
+  for (const { item, supplier, unitCost } of chosen) {
+    const group = groups.get(supplier.id) ?? { supplier, lines: [], itemIds: [], total: 0 };
+    const existing = group.lines.find((line) => line.materialId === item.materialId && line.unitCost === unitCost);
+    if (existing) {
+      existing.quantity += Number(item.quantity);
+    } else {
+      group.lines.push({
+        itemId: item.id,
+        materialId: item.materialId,
+        materialName: item.material.name,
+        sku: item.material.sku,
+        quantity: Number(item.quantity),
+        unitOfMeasure: item.unitOfMeasure,
+        unitCost,
+      });
+    }
+    group.itemIds.push(item.id);
+    group.total += Number(item.quantity) * unitCost;
+    groups.set(supplier.id, group);
   }
-  if (existing && existing.goodsReceipts.length > 0) {
-    throw new Error("This purchase order already has goods receipts and cannot be regenerated.");
-  }
-
-  const expectedDelivery = input.expectedDelivery
-    ? new Date(input.expectedDelivery)
-    : undefined;
-  const notes = input.notes !== undefined ? input.notes : requisition.notes;
+  const groupList = [...groups.values()];
 
   const apiKey = process.env.RESEND_API_KEY;
   if (!apiKey) {
     throw new Error("Email service is not configured (RESEND_API_KEY missing).");
   }
 
-  // One internal PO. The first supplier is stored as the primary supplier for
-  // legacy screens; each item keeps its own supplier for the outbound split.
-  const purchaseOrder = await prisma.$transaction(async (tx) => {
-    const po = existing
-      ? await tx.purchaseOrder.update({
-          where: { id: existing.id },
-          data: {
-            supplierId: groups[0].supplier.id,
-            notes: notes ?? null,
-            ...(expectedDelivery !== undefined ? { expectedDelivery } : {}),
-            lpoEmails: Prisma.DbNull,
-          },
-        })
-      : await tx.purchaseOrder.create({
-          data: {
-            number: `PO-${Date.now().toString().slice(-8)}`,
-            supplierId: groups[0].supplier.id,
-            requisitionId: requisition.id,
-            createdById: input.userId,
-            status: "DRAFT",
-            notes: notes ?? null,
-            expectedDelivery: expectedDelivery ?? null,
-          },
-        });
-
-    if (existing) {
-      await tx.purchaseOrderItem.deleteMany({ where: { poId: po.id } });
-    }
-
-    await tx.purchaseOrderItem.createMany({
-      data: groups.flatMap((group) =>
-        group.items.map((item) => ({
-          poId: po.id,
-          materialId: item.materialId,
-          supplierId: group.supplier.id,
-          quantity: item.quantity,
-          unitCost: item.unitCost,
-          unitOfMeasure: item.unitOfMeasure,
-        }))
-      ),
-    });
-
-    return po;
+  // Reserve LPO numbers so concurrent sends never collide.
+  const reserved = await prisma.purchaseOrder.update({
+    where: { id: po.id },
+    data: { lpoSequence: { increment: groupList.length } },
+    select: { lpoSequence: true },
   });
+  const firstSequence = reserved.lpoSequence - groupList.length;
 
   const resend = new Resend(apiKey);
   const from = process.env.RESEND_FROM_EMAIL || "noreply@kibgroup.com";
+  const currency = process.env.LPO_CURRENCY || "NGN";
 
   const results: Array<{
     supplierId: string;
     supplierName: string;
     email: string;
     lpoNumber: string;
+    itemIds: string[];
+    itemCount: number;
+    total: number;
     success: boolean;
     error?: string;
   }> = [];
 
-  for (let index = 0; index < groups.length; index++) {
-    const group = groups[index];
-    const lpoNumber = `${purchaseOrder.number}-${String(index + 1).padStart(2, "0")}`;
+  for (let index = 0; index < groupList.length; index++) {
+    const group = groupList[index];
+    const lpoNumber = `${po.number}-${String(firstSequence + index + 1).padStart(2, "0")}`;
     const supplier = group.supplier;
     const supplierEmail = supplier.email!.trim();
 
     try {
       const pdf = await generateLpoPdf({
         lpoNumber,
-        poNumber: purchaseOrder.number,
-        requisitionNumber: requisition.number,
+        poNumber: po.number,
+        requisitionNumber: po.requisition?.number ?? null,
         date: new Date(),
-        expectedDelivery: expectedDelivery ?? null,
-        notes: notes ?? null,
+        expectedDelivery: po.expectedDelivery,
+        notes: input.notes !== undefined ? input.notes : po.notes,
         supplier: {
           name: supplier.name,
           contactPerson: supplier.contactPerson,
@@ -326,12 +489,12 @@ export async function sendLpos(input: SendLpoInput) {
           phone: supplier.phone,
           address: supplier.address,
         },
-        lines: group.items.map((item) => ({
-          materialName: item.materialName,
-          sku: item.sku,
-          quantity: item.quantity,
-          unitOfMeasure: item.unitOfMeasure,
-          unitCost: item.unitCost,
+        lines: group.lines.map((line) => ({
+          materialName: line.materialName,
+          sku: line.sku,
+          quantity: line.quantity,
+          unitOfMeasure: line.unitOfMeasure,
+          unitCost: line.unitCost,
         })),
       });
 
@@ -343,8 +506,8 @@ export async function sendLpos(input: SendLpoInput) {
           <div style="font-family:Arial,sans-serif;color:#171717;line-height:1.5">
             <p>Dear ${supplier.contactPerson || supplier.name},</p>
             <p>Please find attached our Local Purchase Order <strong>${lpoNumber}</strong>
-            covering ${group.items.length} item(s) totalling
-            <strong>${new Intl.NumberFormat("en-NG", { style: "currency", currency: process.env.LPO_CURRENCY || "NGN" }).format(group.total)}</strong>.</p>
+            covering ${group.lines.length} item(s) totalling
+            <strong>${new Intl.NumberFormat("en-NG", { style: "currency", currency }).format(group.total)}</strong>.</p>
             <p>Kindly acknowledge receipt and confirm the delivery date.</p>
             <p>Regards,<br/>${process.env.COMPANY_NAME || "KIB Group"} Procurement</p>
           </div>
@@ -362,6 +525,9 @@ export async function sendLpos(input: SendLpoInput) {
         supplierName: supplier.name,
         email: supplierEmail,
         lpoNumber,
+        itemIds: group.itemIds,
+        itemCount: group.lines.length,
+        total: group.total,
         success: !error,
         error: error?.message,
       });
@@ -371,20 +537,75 @@ export async function sendLpos(input: SendLpoInput) {
         supplierName: supplier.name,
         email: supplierEmail,
         lpoNumber,
+        itemIds: group.itemIds,
+        itemCount: group.lines.length,
+        total: group.total,
         success: false,
         error: error?.message || "Failed to generate or send LPO",
       });
     }
   }
 
-  const allSent = results.every((result) => result.success);
-  const updated = await prisma.purchaseOrder.update({
-    where: { id: purchaseOrder.id },
-    data: {
-      status: allSent ? "SENT" : "DRAFT",
-      sentAt: allSent ? new Date() : null,
-      lpoEmails: results as any,
-    },
+  const sentAt = new Date();
+  const successful = results.filter((result) => result.success);
+  const expectedDelivery = input.expectedDelivery ? new Date(input.expectedDelivery) : undefined;
+
+  const state = await prisma.$transaction(async (tx) => {
+    // Remember the chosen supplier/cost even when the email fails — a retry
+    // should not have to re-enter them.
+    for (const { item, supplier, unitCost } of chosen) {
+      await tx.purchaseOrderItem.update({
+        where: { id: item.id },
+        data: { supplierId: supplier.id, unitCost },
+      });
+    }
+
+    for (const result of successful) {
+      await tx.purchaseOrderItem.updateMany({
+        where: { id: { in: result.itemIds } },
+        data: { lpoNumber: result.lpoNumber, lpoSentAt: sentAt },
+      });
+    }
+
+    const lines = await tx.purchaseOrderItem.findMany({
+      where: { poId: po.id },
+      select: { onHold: true, lpoSentAt: true },
+    });
+    const remaining = lines.filter((line) => !line.lpoSentAt && !line.onHold).length;
+
+    const history = Array.isArray(po.lpoEmails) ? (po.lpoEmails as unknown[]) : [];
+    const nextStatus =
+      po.status === "DRAFT" && remaining === 0 ? "SENT" : po.status;
+
+    await tx.purchaseOrder.update({
+      where: { id: po.id },
+      data: {
+        status: nextStatus,
+        sentAt: po.sentAt ?? (successful.length ? sentAt : null),
+        lpoEmails: [
+          ...history,
+          ...results.map((result) => ({
+            supplierId: result.supplierId,
+            supplierName: result.supplierName,
+            email: result.email,
+            lpoNumber: result.lpoNumber,
+            itemCount: result.itemCount,
+            total: result.total,
+            success: result.success,
+            error: result.error,
+            sentAt,
+          })),
+        ] as Prisma.InputJsonValue,
+        ...(input.notes !== undefined ? { notes: input.notes } : {}),
+        ...(expectedDelivery ? { expectedDelivery } : {}),
+      },
+    });
+
+    return { remaining };
+  });
+
+  const updated = await prisma.purchaseOrder.findUnique({
+    where: { id: po.id },
     include: {
       supplier: { select: { id: true, name: true } },
       items: {
@@ -400,11 +621,111 @@ export async function sendLpos(input: SendLpoInput) {
     userId: input.userId,
     activityType: "UPDATE",
     module: "procurement",
-    description: `Generated ${results.length} LPO(s) for ${requisition.number}${allSent ? " and emailed suppliers" : " (some emails failed)"}`,
+    description: `Sent ${results.length} LPO(s) from ${po.number}${state.remaining ? ` — ${state.remaining} line(s) still to send` : ""}`,
     entityType: "PurchaseOrder",
-    entityId: updated.id,
-    details: { requisition: requisition.number, results },
+    entityId: po.id,
+    details: { results },
   }).catch((logError) => console.error("Failed to log LPO send:", logError));
 
-  return { purchaseOrder: updated, lpoResults: results, allSent };
+  return {
+    purchaseOrder: updated,
+    lpoResults: results,
+    allSent: results.every((result) => result.success),
+    remaining: state.remaining,
+  };
+}
+
+/** Temporarily withhold a line from LPO selection. */
+export async function setPurchaseOrderItemHold(
+  poId: string,
+  itemId: string,
+  onHold: boolean,
+  reason?: string | null
+) {
+  const item = await prisma.purchaseOrderItem.findFirst({
+    where: { id: itemId, poId },
+    select: { id: true, lpoNumber: true, lpoSentAt: true, receivedQty: true },
+  });
+  if (!item) throw new Error("Purchase order item not found");
+
+  if (onHold) {
+    if (item.lpoSentAt) {
+      throw new Error(`This line has already been sent on ${item.lpoNumber ?? "an LPO"}`);
+    }
+    if (Number(item.receivedQty) > 0) {
+      throw new Error("This line has already been received");
+    }
+  }
+
+  return prisma.purchaseOrderItem.update({
+    where: { id: itemId },
+    data: {
+      onHold,
+      holdReason: onHold ? reason?.trim() || null : null,
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Legacy requisition entry point — sends every eligible line in one round.
+// ---------------------------------------------------------------------------
+
+export interface SendLpoInput {
+  requisitionId: string;
+  userId: string;
+  selections?: Record<string, string>;
+  unitCosts?: Record<string, number>;
+  notes?: string | null;
+  expectedDelivery?: string | null;
+}
+
+export async function sendLpos(input: SendLpoInput) {
+  const po = await ensurePurchaseOrderForRequisition(input.requisitionId, input.userId);
+
+  const items = await prisma.purchaseOrderItem.findMany({
+    where: { poId: po.id },
+    select: {
+      id: true,
+      materialId: true,
+      supplierId: true,
+      quantity: true,
+      receivedQty: true,
+      onHold: true,
+      lpoSentAt: true,
+    },
+  });
+
+  const eligible = items.filter(
+    (item) =>
+      !item.onHold &&
+      !item.lpoSentAt &&
+      Number(item.receivedQty) < Number(item.quantity)
+  );
+  if (eligible.length === 0) {
+    throw new LpoValidationError([
+      "Every line on this purchase order has already been sent or is on hold.",
+    ]);
+  }
+
+  // The legacy payload keys selections by material id.
+  const selections: Record<string, string> = {};
+  const unitCosts: Record<string, number> = {};
+  for (const item of eligible) {
+    const supplierId = input.selections?.[item.materialId];
+    if (supplierId) selections[item.id] = supplierId;
+    else if (item.supplierId) selections[item.id] = item.supplierId;
+
+    const cost = input.unitCosts?.[item.materialId];
+    if (cost !== undefined) unitCosts[item.id] = Number(cost);
+  }
+
+  return sendPurchaseOrderLpos({
+    poId: po.id,
+    userId: input.userId,
+    itemIds: eligible.map((item) => item.id),
+    selections,
+    unitCosts,
+    notes: input.notes,
+    expectedDelivery: input.expectedDelivery,
+  });
 }

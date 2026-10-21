@@ -256,6 +256,47 @@ router.post("/inspections/:id/reject", requirePermission("qa", "approve"), async
 });
 
 // ---------------------------------------------------------------------------
+// QA comment
+// ---------------------------------------------------------------------------
+
+/**
+ * PATCH /inspections/:id/comment
+ * Records the inspector's comments/observations on one received item. Comments
+ * stay editable while the item is pending; release/reject freezes them.
+ */
+router.patch(
+  "/inspections/:id/comment",
+  requirePermission("qa", "update"),
+  async (req: Request, res: Response) => {
+    try {
+      const { notes } = req.body ?? {};
+      if (notes !== undefined && notes !== null && typeof notes !== "string") {
+        return res.status(400).json({ error: "notes must be text" });
+      }
+
+      const inspection = await prisma.inspectionRecord.findUnique({
+        where: { id: req.params.id },
+        select: { id: true, result: true },
+      });
+      if (!inspection) return res.status(404).json({ error: "Inspection record not found" });
+      if (inspection.result !== "PENDING") {
+        return res.status(409).json({ error: "Comments are locked once the item is released or rejected" });
+      }
+
+      const updated = await prisma.inspectionRecord.update({
+        where: { id: inspection.id },
+        data: { notes: typeof notes === "string" ? notes.trim() || null : null },
+      });
+
+      res.json({ inspection: updated });
+    } catch (error: any) {
+      console.error("PATCH /qa/inspections/:id/comment error:", error);
+      res.status(500).json({ error: error?.message || "Database error" });
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
 // QA review document (Cloudflare R2)
 //
 // The browser uploads directly to R2 and posts back only the resulting URL.

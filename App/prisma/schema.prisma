@@ -523,6 +523,9 @@ model PurchaseOrder {
   closedAt         DateTime?           @map("closed_at")
   /// Per-supplier LPO email results (lpoNumber, email, success, error, sentAt).
   lpoEmails        Json?               @map("lpo_emails")
+  /// Running counter of LPOs issued for this order, so numbers stay unique
+  /// when the order is sent to suppliers in several rounds.
+  lpoSequence      Int                 @default(0) @map("lpo_sequence")
   notes            String?
   createdAt        DateTime            @default(now()) @map("created_at")
   updatedAt        DateTime            @updatedAt @map("updated_at")
@@ -548,6 +551,13 @@ model PurchaseOrderItem {
   /// Supplier this line is bought from. Nullable for legacy rows; set when an
   /// LPO is generated so one internal PO can be split across suppliers.
   supplierId    String? @map("supplier_id")
+  /// Withheld from LPO selection (price/quantity still being agreed).
+  onHold        Boolean   @default(false) @map("on_hold")
+  holdReason    String?   @map("hold_reason")
+  /// LPO this line travelled on. Once set the line is never offered again,
+  /// so one order can be sent to suppliers over several rounds.
+  lpoNumber     String?   @map("lpo_number")
+  lpoSentAt     DateTime? @map("lpo_sent_at")
 
   po       PurchaseOrder @relation(fields: [poId], references: [id], onDelete: Cascade)
   material Material      @relation(fields: [materialId], references: [id])
