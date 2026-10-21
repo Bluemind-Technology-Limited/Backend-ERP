@@ -79,7 +79,13 @@ export interface StockRow {
 /** Derive current stock: SUM(quantity) grouped per material/batch/warehouse/bin. */
 export async function getStock(
   prisma: PrismaClient,
-  filters?: { materialId?: string; warehouseId?: string; batchLotId?: string }
+  filters?: {
+    materialId?: string;
+    warehouseId?: string;
+    batchLotId?: string;
+    /** When false, finished-goods rows are excluded (stock ledger shows materials only). */
+    includeFinished?: boolean;
+  }
 ): Promise<StockRow[]> {
   const where: any = {};
   if (filters?.materialId) where.materialId = filters.materialId;
@@ -97,7 +103,10 @@ export async function getStock(
   const batchIds = [...new Set(grouped.map((g) => g.batchLotId).filter(Boolean))] as string[];
 
   const [materials, warehouses, batches] = await Promise.all([
-    prisma.material.findMany({ where: { id: { in: materialIds } }, select: { id: true, name: true, sku: true, unitOfMeasure: true, minQuantity: true } }),
+    prisma.material.findMany({
+      where: { id: { in: materialIds } },
+      select: { id: true, name: true, sku: true, unitOfMeasure: true, minQuantity: true, type: true },
+    }),
     prisma.warehouse.findMany({ where: { id: { in: warehouseIds } }, select: { id: true, name: true } }),
     batchIds.length
       ? prisma.batchLot.findMany({ where: { id: { in: batchIds } }, select: { id: true, batchNumber: true, manufacturingDate: true, expiryDate: true } })
@@ -126,6 +135,10 @@ export async function getStock(
         quantity: Number(g._sum.quantity ?? 0),
         minQuantity: mat?.minQuantity ? Number(mat.minQuantity) : 0,
       };
+    })
+    .filter((row) => {
+      if (filters?.includeFinished !== false) return true;
+      return matMap.get(row.materialId)?.type !== "FINISHED";
     });
 
   // If filtering specifically, don't auto-fill all products unless no filter is applied or if materialId is set
@@ -133,6 +146,7 @@ export async function getStock(
     const allActiveMaterials = await prisma.material.findMany({
       where: {
         status: "ACTIVE",
+        ...(filters?.includeFinished === false ? { type: { not: "FINISHED" } } : {}),
         ...(filters?.materialId ? { id: filters.materialId } : {})
       },
       select: { id: true, name: true, sku: true, unitOfMeasure: true, minQuantity: true }
@@ -165,12 +179,18 @@ export async function getStock(
 /** Get the full transaction history (audit trail) for a material/batch. */
 export async function getLedgerHistory(
   prisma: PrismaClient,
-  filters?: { materialId?: string; batchLotId?: string }
+  filters?: {
+    materialId?: string;
+    batchLotId?: string;
+    /** Exclude ledger entries belonging to finished goods. */
+    excludeFinished?: boolean;
+  }
 ) {
   return prisma.inventoryTransaction.findMany({
     where: {
       ...(filters?.materialId ? { materialId: filters.materialId } : {}),
       ...(filters?.batchLotId ? { batchLotId: filters.batchLotId } : {}),
+      ...(filters?.excludeFinished ? { material: { type: { not: "FINISHED" } } } : {}),
     },
     include: {
       material: { select: { name: true, sku: true } },

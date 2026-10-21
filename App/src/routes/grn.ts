@@ -6,9 +6,26 @@ import { postLedgerEntry } from "../lib/ledger.js";
 import { buildLotCode, buildYearCode, isValidSetNumber, missingLotCodeParts, nextSetNumber } from "../lib/lotCode.js";
 import { LedgerEventType, GoodsReceiptStatus } from "@prisma/client";
 import * as consignmentService from "../services/consignment.js";
+import { logActivity } from "../services/userActivityLogger.js";
+import { recomputePurchaseOrderStatus } from "../services/purchaseOrderStatus.js";
 
 const router: Router = Router();
 router.use(requireAuth);
+
+type SupplierOption = { id: string; name: string; vendorCode: string | null };
+
+/**
+ * A material can be sourced from several suppliers. Direct receipts never ask
+ * the store officer to pick one, so it follows from the material: prefer a
+ * supplier that has a vendor code (lot codes need it), then alphabetical order
+ * so the same material always resolves to the same supplier.
+ */
+const pickMaterialSupplier = (links: Array<{ supplier: SupplierOption }>): SupplierOption | null => {
+  const suppliers = links
+    .map((link) => link.supplier)
+    .sort((a, b) => a.name.localeCompare(b.name));
+  return suppliers.find((s) => s.vendorCode) ?? suppliers[0] ?? null;
+};
 
 /**
  * GET /grn — list goods receipts.
@@ -20,6 +37,8 @@ router.get("/", requirePermission("procurement", "read"), async (req: Request, r
       where: status ? { status: status as GoodsReceiptStatus } : {},
       include: {
         po: { select: { id: true, number: true, status: true, supplier: { select: { name: true } } } },
+        consignment: { select: { id: true, consignmentNumber: true } },
+        supplier: { select: { id: true, name: true } },
         receivedBy: { select: { fullName: true, email: true } },
         items: {
           include: {
@@ -124,20 +143,38 @@ router.get("/lot-preview", requirePermission("procurement", "read"), async (req:
     const materialId = req.query.materialId ? String(req.query.materialId) : null;
     const supplierId = req.query.supplierId ? String(req.query.supplierId) : null;
 
-    const [material, supplier] = await Promise.all([
-      materialId
-        ? prisma.material.findUnique({
-            where: { id: materialId },
-            select: { id: true, name: true, sku: true, unitOfMeasure: true, traceabilityCode: true },
-          })
-        : Promise.resolve(null),
-      supplierId
-        ? prisma.supplier.findUnique({
-            where: { id: supplierId },
-            select: { id: true, name: true, vendorCode: true },
-          })
-        : Promise.resolve(null),
-    ]);
+    const materialRow = materialId
+      ? await prisma.material.findUnique({
+          where: { id: materialId },
+          select: {
+            id: true,
+            name: true,
+            sku: true,
+            unitOfMeasure: true,
+            traceabilityCode: true,
+            suppliers: { include: { supplier: { select: { id: true, name: true, vendorCode: true } } } },
+          },
+        })
+      : null;
+
+    const explicitSupplier = supplierId
+      ? await prisma.supplier.findUnique({
+          where: { id: supplierId },
+          select: { id: true, name: true, vendorCode: true },
+        })
+      : null;
+
+    // The supplier follows from the material when the officer doesn't choose one.
+    const supplier = explicitSupplier ?? pickMaterialSupplier(materialRow?.suppliers ?? []);
+    const material = materialRow
+      ? {
+          id: materialRow.id,
+          name: materialRow.name,
+          sku: materialRow.sku,
+          unitOfMeasure: materialRow.unitOfMeasure,
+          traceabilityCode: materialRow.traceabilityCode,
+        }
+      : null;
 
     const setNumber = material
       ? await nextSetNumber(prisma, {
@@ -179,39 +216,148 @@ router.get("/lot-preview", requirePermission("procurement", "read"), async (req:
  */
 router.post("/", requirePermission("procurement", "create"), async (req: Request, res: Response) => {
   try {
-    const { poId, notes, items } = req.body;
-    if (!poId || !Array.isArray(items) || items.length === 0) {
-      return res.status(400).json({ error: "poId and items are required" });
+    const { poId, notes, items, source: requestedSource, supplierId: requestedSupplierId, receivedAt } = req.body;
+    const isDirect = !poId && requestedSource === "DIRECT";
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: "items are required" });
+    }
+    if (!poId && !isDirect) {
+      return res.status(400).json({ error: "poId is required, or set source to DIRECT for a contingency receipt" });
+    }
+    if (isDirect && (!notes || !String(notes).trim())) {
+      return res.status(400).json({ error: "A reason/notes is required for a direct goods receipt" });
     }
 
-    const po = await prisma.purchaseOrder.findUnique({
-      where: { id: poId },
-      include: {
-        items: true,
-        supplier: { select: { id: true, name: true, vendorCode: true } },
-      },
-    });
-    if (!po) return res.status(404).json({ error: "Purchase order not found" });
-    if (po.status === "CLOSED") return res.status(400).json({ error: "PO is already closed" });
+    // A receipt against a PO *is* a consignment: the lines that arrived form the
+    // shipment, the outstanding balance stays on the PO for the next delivery.
+    if (poId) {
+      const po = await prisma.purchaseOrder.findUnique({
+        where: { id: String(poId) },
+        include: { items: true },
+      });
+      if (!po) return res.status(404).json({ error: "Purchase order not found" });
 
-    const supplierId = po.supplierId ?? null;
+      const warehouseId = items.find((it: any) => it?.warehouseId)?.warehouseId;
+      if (!warehouseId) {
+        return res.status(400).json({ error: "Each item needs a warehouse" });
+      }
+
+      const consignment = await consignmentService.createConsignment({
+        supplierId: po.supplierId,
+        warehouseId: String(warehouseId),
+        createdById: req.user!.id,
+        poId: po.id,
+        notes,
+        receivedAt: receivedAt ? new Date(receivedAt) : undefined,
+        items: items.map((it: any) => ({
+          poItemId:
+            it.poItemId ?? po.items.find((p) => p.materialId === it.materialId)?.id ?? null,
+          materialId: it.materialId,
+          quantity: Number(it.quantity),
+          unitOfMeasure: it.unitOfMeasure,
+          expiryDate: it.expiryDate ?? null,
+          setNumber: it.setNumber ?? null,
+          warehouseId: it.warehouseId ?? null,
+          unitCost: it.unitCost ?? null,
+        })),
+      });
+
+      const grn =
+        consignment.goodsReceipts[0] ??
+        (await prisma.goodsReceipt.findFirst({
+          where: { consignmentId: consignment.id },
+          orderBy: { receivedAt: "desc" },
+        }));
+
+      return res.status(201).json({ grn, consignment });
+    }
+
+    const po = poId
+      ? await prisma.purchaseOrder.findUnique({
+          where: { id: poId },
+          include: {
+            items: true,
+            supplier: { select: { id: true, name: true, vendorCode: true } },
+          },
+        })
+      : null;
+    if (poId && !po) return res.status(404).json({ error: "Purchase order not found" });
+    if (po?.status === "CLOSED") return res.status(400).json({ error: "PO is already closed" });
+
+    // Never receive more than the PO still has outstanding — the remainder is
+    // what a later receipt is allowed to claim.
+    if (po) {
+      const requestedByMaterial = new Map<string, number>();
+      for (const it of items) {
+        if (!it?.materialId) continue;
+        requestedByMaterial.set(
+          it.materialId,
+          (requestedByMaterial.get(it.materialId) ?? 0) + Number(it.quantity ?? 0)
+        );
+      }
+      for (const [materialId, requested] of requestedByMaterial) {
+        const lines = po.items.filter((p) => p.materialId === materialId);
+        if (lines.length === 0) continue;
+        const remaining = lines.reduce(
+          (sum, line) => sum + (Number(line.quantity) - Number(line.receivedQty)),
+          0
+        );
+        if (requested > remaining) {
+          return res.status(400).json({
+            error: `Only ${remaining} remaining on ${po.number} for this material (requested ${requested}). The outstanding balance stays on the PO — receive it later.`,
+            materialId,
+            remaining,
+          });
+        }
+      }
+    }
+
+    let supplierId: string | null = po?.supplierId ?? null;
+    let supplier = po?.supplier ?? null;
+    if (!po && requestedSupplierId) {
+      const directSupplier = await prisma.supplier.findUnique({
+        where: { id: String(requestedSupplierId) },
+        select: { id: true, name: true, vendorCode: true },
+      });
+      if (!directSupplier) return res.status(404).json({ error: "Supplier not found" });
+      supplierId = directSupplier.id;
+      supplier = directSupplier;
+    }
+
     const yearCode = buildYearCode();
 
-    const number = `GRN-${Date.now().toString().slice(-8)}`;
+    const number = isDirect
+      ? `GRN-D-${Date.now().toString().slice(-8)}`
+      : `GRN-${Date.now().toString().slice(-8)}`;
+
+    // The date the goods physically arrived (backdatable), one stamp per receipt.
+    const receivedDate = receivedAt ? new Date(receivedAt) : new Date();
+    if (Number.isNaN(receivedDate.getTime())) {
+      return res.status(400).json({ error: "receivedAt is not a valid date" });
+    }
 
     const grn = await prisma.$transaction(async (tx) => {
       const receipt = await tx.goodsReceipt.create({
         data: {
           number,
-          poId,
+          poId: po?.id ?? null,
+          consignmentId: null,
+          supplierId,
+          source: isDirect ? "DIRECT" : "PURCHASE_ORDER",
           receivedById: req.user!.id,
           status: "PENDING_QA",
-          receivedAt: new Date(),
+          receivedAt: receivedDate,
           notes,
         },
       });
 
+      // Direct receipts may mix materials from different suppliers; the header
+      // supplier is only filled in when every line resolves to the same one.
+      const lineSupplierIds = new Set<string>();
+      let lineIndex = 0;
+
       for (const it of items) {
+        lineIndex += 1;
         const {
           materialId,
           quantity,
@@ -222,6 +368,7 @@ router.post("/", requirePermission("procurement", "create"), async (req: Request
           warehouseId,
           setNumber,
           supplierBatchNumber,
+          unitCost,
         } = it;
         if (!materialId || !quantity || !unitOfMeasure || !warehouseId) {
           throw new Error("Each item needs materialId, quantity, unitOfMeasure and warehouseId");
@@ -232,8 +379,38 @@ router.post("/", requirePermission("procurement", "create"), async (req: Request
         // officer may override it.
         const material = await tx.material.findUnique({
           where: { id: materialId },
-          select: { traceabilityCode: true },
+          select: {
+            traceabilityCode: true,
+            type: true,
+            suppliers: { include: { supplier: { select: { id: true, name: true, vendorCode: true } } } },
+          },
         });
+        if (!material) {
+          throw new Error(`Material not found: ${materialId}`);
+        }
+        if (material.type === "FINISHED") {
+          throw new Error("Finished goods cannot be received through a GRN");
+        }
+
+        // Supplier for this line. PO-backed receipts use the PO supplier; direct
+        // receipts take it from the material (no supplier step in the UI).
+        let lineSupplier = supplier;
+        let lineSupplierId = supplierId;
+        if (isDirect) {
+          const requestedItemSupplierId = it.supplierId ? String(it.supplierId) : null;
+          if (requestedItemSupplierId) {
+            lineSupplier = await tx.supplier.findUnique({
+              where: { id: requestedItemSupplierId },
+              select: { id: true, name: true, vendorCode: true },
+            });
+            if (!lineSupplier) throw new Error(`Supplier not found: ${requestedItemSupplierId}`);
+            lineSupplierId = lineSupplier.id;
+          } else if (!lineSupplier) {
+            lineSupplier = pickMaterialSupplier(material.suppliers);
+            lineSupplierId = lineSupplier?.id ?? null;
+          }
+        }
+        if (lineSupplierId) lineSupplierIds.add(lineSupplierId);
 
         let resolvedSetNumber: number | null =
           setNumber === undefined || setNumber === null || setNumber === "" ? null : Number(setNumber);
@@ -241,21 +418,17 @@ router.post("/", requirePermission("procurement", "create"), async (req: Request
           throw new Error("Material set number must be a positive whole number");
         }
         if (resolvedSetNumber === null) {
-          resolvedSetNumber = await nextSetNumber(tx, { supplierId, materialId, yearCode });
+          resolvedSetNumber = await nextSetNumber(tx, { supplierId: lineSupplierId, materialId, yearCode });
         }
 
-        const vendorCode = po.supplier?.vendorCode ?? null;
+        const vendorCode = lineSupplier?.vendorCode ?? null;
         const ingredientCode = material?.traceabilityCode ?? null;
         const lotCode = buildLotCode({ vendorCode, ingredientCode, setNumber: resolvedSetNumber, yearCode });
 
-        // Until the vendor and ingredient codes are filled in on master data a
-        // lot code can't be built, so a manually typed batch number still works.
-        const resolvedBatchNumber = lotCode ?? String(batchNumber ?? "").trim();
-        if (!resolvedBatchNumber) {
-          throw new Error(
-            "Set a vendor code on the supplier and a traceability code on the material, or enter a batch number"
-          );
-        }
+        // The batch number is assigned by QA on inspection. Until then the lot
+        // carries the SOP lot code, or a provisional receipt-scoped reference.
+        const resolvedBatchNumber =
+          lotCode ?? (String(batchNumber ?? "").trim() || `PENDING-${number}-${lineIndex}`);
 
         // 1. Batch lot (unique per material + batch number)
         const batchLot = await tx.batchLot.upsert({
@@ -264,6 +437,7 @@ router.post("/", requirePermission("procurement", "create"), async (req: Request
           create: {
             materialId,
             batchNumber: resolvedBatchNumber,
+            status: "QUARANTINE",
             expiryDate: expiryDate ? new Date(expiryDate) : null,
             manufacturingDate: manufacturingDate ? new Date(manufacturingDate) : null,
             origin: "INBOUND",
@@ -273,11 +447,13 @@ router.post("/", requirePermission("procurement", "create"), async (req: Request
             ingredientCode,
             yearCode,
             supplierBatchNumber: supplierBatchNumber ? String(supplierBatchNumber).trim() : null,
-            supplierId,
+            supplierId: lineSupplierId,
           },
         });
 
         // 2. GRN item
+        const poItem = po?.items.find((p) => p.materialId === materialId);
+        const resolvedUnitCost = Number(unitCost ?? poItem?.unitCost ?? 0);
         await tx.goodsReceiptItem.create({
           data: {
             grnId: receipt.id,
@@ -285,6 +461,7 @@ router.post("/", requirePermission("procurement", "create"), async (req: Request
             batchLotId: batchLot.id,
             quantity,
             unitOfMeasure,
+            unitCost: resolvedUnitCost,
           },
         });
 
@@ -299,7 +476,9 @@ router.post("/", requirePermission("procurement", "create"), async (req: Request
           referenceType: "GRN",
           referenceId: receipt.id,
           createdById: req.user!.id,
-          notes: `GRN ${number} against PO ${po.number}`,
+          notes: isDirect
+            ? `GRN ${number} (direct receipt${lineSupplier ? ` from ${lineSupplier.name}` : ""})`
+            : `GRN ${number} against PO ${po?.number ?? ""}`,
         });
 
         // 4. QA inspection hook
@@ -314,7 +493,6 @@ router.post("/", requirePermission("procurement", "create"), async (req: Request
         });
 
         // 5. Update PO received quantities
-        const poItem = po.items.find((p) => p.materialId === materialId);
         if (poItem) {
           await tx.purchaseOrderItem.update({
             where: { id: poItem.id },
@@ -323,23 +501,50 @@ router.post("/", requirePermission("procurement", "create"), async (req: Request
         }
       }
 
-      // 6. Roll PO status to PARTIAL / RECEIVED
-      const allReceived = po.items.every((p) => {
-        const item = items.filter((i: any) => i.materialId === p.materialId);
-        return item.reduce((s: number, i: any) => s + Number(i.quantity), 0) >= Number(p.quantity);
-      });
-      await tx.purchaseOrder.update({
-        where: { id: poId },
-        data: { status: allReceived ? "RECEIVED" : "PARTIAL" },
-      });
+      // Direct receipts with a single supplier behind every line get it on the
+      // receipt header too, so the GRN list can show where the goods came from.
+      if (isDirect && !receipt.supplierId && lineSupplierIds.size === 1) {
+        const [onlySupplierId] = [...lineSupplierIds];
+        await tx.goodsReceipt.update({
+          where: { id: receipt.id },
+          data: { supplierId: onlySupplierId },
+        });
+      }
+
+      // 6. Roll PO state from its line balances (fully / partially received).
+      if (po) {
+        await recomputePurchaseOrderStatus(tx, po.id);
+      }
 
       return receipt;
     });
+
+    if (isDirect) {
+      const saved = await prisma.goodsReceipt.findUnique({
+        where: { id: grn.id },
+        select: { supplier: { select: { id: true, name: true } } },
+      });
+      const supplierName = saved?.supplier?.name;
+      await logActivity({
+        userId: req.user!.id,
+        activityType: "CREATE",
+        module: "procurement",
+        description: `Direct goods receipt ${number}${supplierName ? ` from ${supplierName}` : ""}`,
+        entityType: "GoodsReceipt",
+        entityId: grn.id,
+        details: { supplierId: saved?.supplier?.id ?? null, notes, itemCount: items.length },
+      }).catch((logError) => console.error("Failed to log direct GRN:", logError));
+    }
 
     res.status(201).json({ grn });
   } catch (error: any) {
     if (error?.code === "P2002") {
       return res.status(409).json({ error: "That lot code already exists — choose a different material set number" });
+    }
+    // Validation failures from the consignment service are user-facing.
+    if (error instanceof Error && !("code" in error)) {
+      console.error("POST /grn rejected:", error.message);
+      return res.status(400).json({ error: error.message });
     }
     console.error("POST /grn error:", error);
     res.status(500).json({ error: error?.message || "Database error" });
@@ -348,14 +553,15 @@ router.post("/", requirePermission("procurement", "create"), async (req: Request
 
 /**
  * POST /grn/consignment — receive goods against a consignment.
- * Alternative to PO-based GRN. Goods arrive via consignment (grouped shipment).
+ * Alternative to PO-based GRN. Goods arrive via consignment (a batch of PO lines).
  * Workflow:
- *   1. Consignment arrives in IN_TRANSIT status
- *   2. Warehouse receives it -> marks RECEIVED
- *   3. Items distributed to warehouse bins -> marked DISTRIBUTED
- *   4. GRN created to formalize the receipt for QA & ledger
- * 
- * This endpoint receives items from a RECEIVED consignment and creates a GRN.
+ *   1. Consignment is created from selected PO lines
+ *   2. Warehouse receives what physically arrived -> GRN posted against the consignment
+ *   3. Unreceived quantities stay outstanding on the consignment and the PO
+ *   4. A later GRN can claim the remainder; the PO completes once nothing is left
+ *
+ * Partial receipts are the norm — only the quantities actually delivered are
+ * recorded, and both the consignment line and its PO line advance by that much.
  */
 router.post("/consignment", requirePermission("procurement", "create"), async (req: Request, res: Response) => {
   try {
@@ -367,7 +573,8 @@ router.post("/consignment", requirePermission("procurement", "create"), async (r
     const consignment = await prisma.consignment.findUnique({
       where: { id: consignmentId },
       include: {
-        items: true,
+        po: { select: { id: true, number: true, status: true } },
+        items: { include: { material: true, poItem: { select: { id: true, unitCost: true } } } },
         supplier: { select: { id: true, name: true, vendorCode: true } },
       },
     });
@@ -376,23 +583,25 @@ router.post("/consignment", requirePermission("procurement", "create"), async (r
       return res.status(404).json({ error: "Consignment not found" });
     }
 
-    if (consignment.status !== "RECEIVED") {
-      return res.status(400).json({ error: "Consignment must be in RECEIVED status to create GRN" });
+    // Once a consignment is in QA or has been distributed, its receipt is closed.
+    const closedStatuses = ["QUALITY_PENDING", "QUALITY_APPROVED", "DISTRIBUTED", "COMPLETED"];
+    if (closedStatuses.includes(consignment.status)) {
+      return res.status(400).json({ error: `Consignment is ${consignment.status} and can no longer receive goods` });
     }
 
-    // Generate GRN number (not linked to PO, but to consignment)
+    // Generate GRN number (linked to the consignment and, when known, its PO)
     const number = `GRN-CSN-${Date.now().toString().slice(-8)}`;
     const yearCode = buildYearCode();
 
     const grn = await prisma.$transaction(async (tx) => {
-      // Create GRN without PO reference for consignment-based receives
-      // Note: poId can be null for consignment-based GRNs, or we keep it for audit trail
       const receipt = await tx.goodsReceipt.create({
         data: {
           number,
-          // Consignment-based receipts have no Purchase Order behind them.
-          poId: null,
+          // Keeping the PO reference gives full PO -> consignment -> GRN traceability.
+          poId: consignment.poId ?? null,
           consignmentId,
+          supplierId: consignment.supplierId ?? null,
+          source: "CONSIGNMENT",
           receivedById: req.user!.id,
           status: "PENDING_QA",
           receivedAt: new Date(),
@@ -418,13 +627,18 @@ router.post("/consignment", requirePermission("procurement", "create"), async (r
         }
 
         // Get the consignment item to find the material
-        const consignmentItem = await tx.consignmentItem.findUnique({
-          where: { id: consignmentItemId },
-          include: { material: true },
-        });
+        const consignmentItem = consignment.items.find((ci) => ci.id === consignmentItemId);
 
         if (!consignmentItem) {
-          throw new Error(`Consignment item not found: ${consignmentItemId}`);
+          throw new Error(`Consignment item not found on this consignment: ${consignmentItemId}`);
+        }
+
+        // Only what is still outstanding on this consignment line can come in now.
+        const outstanding = Number(consignmentItem.quantity) - Number(consignmentItem.receivedQty);
+        if (Number(quantity) > outstanding) {
+          throw new Error(
+            `${consignmentItem.material.name}: only ${outstanding} ${consignmentItem.unitOfMeasure} still outstanding on this consignment`
+          );
         }
 
         const materialId = consignmentItem.material.id;
@@ -447,12 +661,10 @@ router.post("/consignment", requirePermission("procurement", "create"), async (r
         }
 
         const lotCode = buildLotCode({ vendorCode, ingredientCode, setNumber: resolvedSetNumber, yearCode });
-        const resolvedBatchNumber = lotCode ?? String(batchNumber ?? "").trim();
-        if (!resolvedBatchNumber) {
-          throw new Error(
-            "Set a vendor code on the supplier and a traceability code on the material, or enter a batch number"
-          );
-        }
+        // Batch number is assigned by QA on inspection; until then the lot code
+        // (or a provisional reference) identifies the lot.
+        const resolvedBatchNumber =
+          lotCode ?? (String(batchNumber ?? "").trim() || `PENDING-${number}-${consignmentItem.id.slice(0, 6)}`);
 
         // 1. Create or get batch lot
         const batchLot = await tx.batchLot.upsert({
@@ -461,6 +673,7 @@ router.post("/consignment", requirePermission("procurement", "create"), async (r
           create: {
             materialId,
             batchNumber: resolvedBatchNumber,
+            status: "QUARANTINE",
             expiryDate: expiryDate ? new Date(expiryDate) : null,
             manufacturingDate: manufacturingDate ? new Date(manufacturingDate) : null,
             origin: "INBOUND",
@@ -482,6 +695,7 @@ router.post("/consignment", requirePermission("procurement", "create"), async (r
             batchLotId: batchLot.id,
             quantity,
             unitOfMeasure,
+            unitCost: Number(consignmentItem.poItem?.unitCost ?? 0),
           },
         });
 
@@ -510,7 +724,38 @@ router.post("/consignment", requirePermission("procurement", "create"), async (r
             result: "PENDING",
           },
         });
+
+        // 5. Advance the consignment line and the PO line it fulfils.
+        await tx.consignmentItem.update({
+          where: { id: consignmentItem.id },
+          data: { receivedQty: { increment: Number(quantity) } },
+        });
+        if (consignmentItem.poItemId) {
+          await tx.purchaseOrderItem.update({
+            where: { id: consignmentItem.poItemId },
+            data: { receivedQty: { increment: Number(quantity) } },
+          });
+        }
       }
+
+      // 6. Consignment + PO state follow the line balances.
+      if (consignment.poId) {
+        await recomputePurchaseOrderStatus(tx, consignment.poId);
+      }
+
+      const lineBalances = await tx.consignmentItem.findMany({
+        where: { consignmentId },
+        select: { quantity: true, receivedQty: true },
+      });
+      const fullyReceived = lineBalances.every((l) => Number(l.receivedQty) >= Number(l.quantity));
+
+      await tx.consignment.update({
+        where: { id: consignmentId },
+        data: {
+          status: fullyReceived ? "RECEIVED" : "PARTIALLY_RECEIVED",
+          ...(fullyReceived ? { receivedAt: new Date() } : {}),
+        },
+      });
 
       return receipt;
     });
@@ -518,7 +763,7 @@ router.post("/consignment", requirePermission("procurement", "create"), async (r
     res.status(201).json({ grn });
   } catch (error: any) {
     console.error("POST /grn/consignment error:", error);
-    res.status(500).json({ error: error?.message || "Database error" });
+    res.status(400).json({ error: error?.message || "Database error" });
   }
 });
 
@@ -542,7 +787,13 @@ router.delete("/:grnId", requirePermission("procurement", "delete"), async (req:
 
     // Delete in transaction to maintain data integrity
     await prisma.$transaction(async (tx) => {
-      // 1. Delete ledger entries for this GRN
+      // 1. Ledger entries for this GRN, captured before deletion so consignment
+      //    lines can be rolled back by exactly what was posted.
+      const ledgerEntries = await tx.inventoryTransaction.findMany({
+        where: { referenceType: "GRN", referenceId: grnId },
+        select: { consignmentItemId: true, quantity: true },
+      });
+
       await tx.inventoryTransaction.deleteMany({
         where: {
           referenceType: "GRN",
@@ -579,12 +830,36 @@ router.delete("/:grnId", requirePermission("procurement", "delete"), async (req:
         }
       }
 
-      // 4. Delete GRN items
+      // 4. Reverse the consignment line balances this receipt advanced.
+      if (grn.consignmentId) {
+        for (const entry of ledgerEntries) {
+          if (!entry.consignmentItemId) continue;
+          await tx.consignmentItem.update({
+            where: { id: entry.consignmentItemId },
+            data: { receivedQty: { decrement: Number(entry.quantity) } },
+          });
+        }
+
+        const balances = await tx.consignmentItem.findMany({
+          where: { consignmentId: grn.consignmentId },
+          select: { quantity: true, receivedQty: true },
+        });
+        const fullyReceived = balances.every((l) => Number(l.receivedQty) >= Number(l.quantity));
+        await tx.consignment.update({
+          where: { id: grn.consignmentId },
+          data: {
+            status: fullyReceived ? "RECEIVED" : "PARTIALLY_RECEIVED",
+            ...(fullyReceived ? {} : { receivedAt: null }),
+          },
+        });
+      }
+
+      // 5. Delete GRN items
       await tx.goodsReceiptItem.deleteMany({
         where: { grnId },
       });
 
-      // 5. Delete inspection records for this GRN
+      // 6. Delete inspection records for this GRN
       await tx.inspectionRecord.deleteMany({
         where: {
           inspectionType: "GRN",
@@ -592,36 +867,12 @@ router.delete("/:grnId", requirePermission("procurement", "delete"), async (req:
         },
       });
 
-      // 6. If PO exists, check if we need to update its status
+      // 7. Re-derive the PO state from its (now reduced) line balances.
       if (grn.poId) {
-        const po = await tx.purchaseOrder.findUnique({
-          where: { id: grn.poId },
-          include: { items: true },
-        });
-
-        if (po) {
-          // Calculate total received quantity for the PO
-          const totalReceived = po.items.reduce((sum, item) => sum + Number(item.receivedQty || 0), 0);
-          const totalQuantity = po.items.reduce((sum, item) => sum + Number(item.quantity), 0);
-
-          // Update PO status based on receipt progress
-          let newStatus = po.status;
-          if (totalReceived === 0) {
-            newStatus = "DRAFT"; // No items received, back to DRAFT
-          } else if (totalReceived < totalQuantity) {
-            newStatus = "PARTIAL"; // Some items received
-          }
-
-          if (newStatus !== po.status) {
-            await tx.purchaseOrder.update({
-              where: { id: grn.poId },
-              data: { status: newStatus },
-            });
-          }
-        }
+        await recomputePurchaseOrderStatus(tx, grn.poId);
       }
 
-      // 7. Delete the GRN itself
+      // 8. Delete the GRN itself
       await tx.goodsReceipt.delete({
         where: { id: grnId },
       });

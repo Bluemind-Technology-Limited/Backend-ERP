@@ -4,9 +4,47 @@ import { requirePermission } from "../middleware/rbac.js";
 import { prisma } from "../lib/db.js";
 import { RequisitionStatus, PurchaseOrderStatus } from "@prisma/client";
 import * as consignmentService from "../services/consignment.js";
+import { logActivity } from "../services/userActivityLogger.js";
+import {
+  getLpoPreview,
+  sendLpos,
+  LpoValidationError,
+} from "../services/lpoService.js";
 
 const router: Router = Router();
 router.use(requireAuth);
+
+/** Shared shape for requisition list/detail/edit responses. */
+const REQUISITION_INCLUDE = {
+  requestedBy: { select: { id: true, fullName: true, email: true } },
+  items: {
+    include: {
+      material: {
+        select: {
+          id: true,
+          name: true,
+          sku: true,
+          unitOfMeasure: true,
+          type: true,
+          suppliers: {
+            include: {
+              supplier: {
+                select: {
+                  id: true,
+                  name: true,
+                  contactPerson: true,
+                  email: true,
+                  phone: true,
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  },
+  purchaseOrders: { select: { id: true, number: true, status: true } },
+};
 
 // ---------------------------------------------------------------------------
 // Requisitions  (STORE_OFFICER creates; PROCUREMENT_OFFICER approves -> PO)
@@ -17,11 +55,7 @@ router.get("/requisitions", requirePermission("procurement", "read"), async (req
     const { status } = req.query;
     const requisitions = await prisma.requisition.findMany({
       where: status ? { status: status as RequisitionStatus } : {},
-      include: {
-        requestedBy: { select: { id: true, fullName: true, email: true } },
-        items: { include: { material: { select: { id: true, name: true, sku: true, unitOfMeasure: true } } } },
-        purchaseOrders: { select: { id: true, number: true, status: true } },
-      },
+      include: REQUISITION_INCLUDE,
       orderBy: { createdAt: "desc" },
     });
     res.json({ requisitions });
@@ -30,6 +64,84 @@ router.get("/requisitions", requirePermission("procurement", "read"), async (req
     res.status(500).json({ error: "Database error" });
   }
 });
+
+/**
+ * GET /procurement/requisitions/:id
+ * Full detail for the approver (items + material suppliers + linked POs).
+ */
+router.get("/requisitions/:id", requirePermission("procurement", "read"), async (req: Request, res: Response) => {
+  try {
+    const requisition = await prisma.requisition.findUnique({
+      where: { id: req.params.id },
+      include: REQUISITION_INCLUDE,
+    });
+    if (!requisition) return res.status(404).json({ error: "Requisition not found" });
+    res.json({ requisition });
+  } catch (error) {
+    console.error("GET /procurement/requisitions/:id error:", error);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+/**
+ * GET /procurement/requisitions/:id/lpo/preview
+ * Supplier grouping + line data for the Generate & Send modal.
+ */
+router.get(
+  "/requisitions/:id/lpo/preview",
+  requirePermission("procurement", "read"),
+  async (req: Request, res: Response) => {
+    try {
+      const preview = await getLpoPreview(req.params.id);
+      res.json(preview);
+    } catch (error: any) {
+      if (/not found/i.test(error?.message ?? "")) {
+        return res.status(404).json({ error: error.message });
+      }
+      if (/approved/i.test(error?.message ?? "")) {
+        return res.status(400).json({ error: error.message });
+      }
+      console.error("GET /procurement/requisitions/:id/lpo/preview error:", error);
+      res.status(500).json({ error: error?.message || "Failed to prepare LPO preview" });
+    }
+  }
+);
+
+/**
+ * POST /procurement/requisitions/:id/lpo/send
+ * Creates/reuses the single internal PO, generates one LPO PDF per supplier,
+ * emails each supplier, and marks the PO SENT when every email succeeds.
+ */
+router.post(
+  "/requisitions/:id/lpo/send",
+  requirePermission("procurement", "update"),
+  async (req: Request, res: Response) => {
+    try {
+      const { selections, unitCosts, notes, expectedDelivery } = req.body ?? {};
+      const result = await sendLpos({
+        requisitionId: req.params.id,
+        userId: req.user!.id,
+        selections: selections && typeof selections === "object" ? selections : {},
+        unitCosts: unitCosts && typeof unitCosts === "object" ? unitCosts : {},
+        notes,
+        expectedDelivery,
+      });
+      res.status(201).json(result);
+    } catch (error: any) {
+      if (error instanceof LpoValidationError) {
+        return res.status(400).json({ error: error.message, issues: error.issues });
+      }
+      if (/not found/i.test(error?.message ?? "")) {
+        return res.status(404).json({ error: error.message });
+      }
+      if (/approved|already|receipts|email/i.test(error?.message ?? "")) {
+        return res.status(409).json({ error: error.message });
+      }
+      console.error("POST /procurement/requisitions/:id/lpo/send error:", error);
+      res.status(500).json({ error: error?.message || "Failed to send LPOs" });
+    }
+  }
+);
 
 router.post("/requisitions", requirePermission("procurement", "create"), async (req: Request, res: Response) => {
   try {
@@ -41,6 +153,22 @@ router.post("/requisitions", requirePermission("procurement", "create"), async (
       if (!it.materialId || !it.quantity || !it.unitOfMeasure) {
         return res.status(400).json({ error: "Each item needs materialId, quantity and unitOfMeasure" });
       }
+    }
+
+    // Finished products are produced in-house, never requisitioned from suppliers.
+    const materialIds = [...new Set(items.map((it: any) => String(it.materialId)))];
+    const materials = await prisma.material.findMany({
+      where: { id: { in: materialIds } },
+      select: { id: true, name: true, type: true },
+    });
+    if (materials.length !== materialIds.length) {
+      return res.status(400).json({ error: "One or more materials were not found" });
+    }
+    const finished = materials.find((m) => m.type === "FINISHED");
+    if (finished) {
+      return res.status(400).json({
+        error: `"${finished.name}" is a finished product and cannot be requisitioned`,
+      });
     }
     const number = `REQ-${Date.now().toString().slice(-8)}`;
     const requisition = await prisma.requisition.create({
@@ -57,7 +185,7 @@ router.post("/requisitions", requirePermission("procurement", "create"), async (
           })),
         },
       },
-      include: { items: true },
+      include: REQUISITION_INCLUDE,
     });
     res.status(201).json({ requisition });
   } catch (error) {
@@ -66,8 +194,111 @@ router.post("/requisitions", requirePermission("procurement", "create"), async (
   }
 });
 
+/**
+ * PATCH /procurement/requisitions/:id/items
+ * Approver edits line items (quantity up/down, add/remove) before deciding,
+ * and creators can edit drafts. Only allowed while DRAFT or PENDING_APPROVAL
+ * and while no purchase order exists.
+ */
+router.patch("/requisitions/:id/items", requirePermission("procurement", "update"), async (req: Request, res: Response) => {
+  try {
+    const { items, notes } = req.body;
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: "At least one item is required" });
+    }
+    for (const it of items) {
+      if (!it.materialId || !(Number(it.quantity) > 0) || !it.unitOfMeasure) {
+        return res.status(400).json({ error: "Each item needs materialId, a quantity greater than zero and unitOfMeasure" });
+      }
+    }
+
+    const existing = await prisma.requisition.findUnique({
+      where: { id: req.params.id },
+      include: {
+        items: { include: { material: { select: { name: true } } } },
+        purchaseOrders: { select: { id: true } },
+      },
+    });
+    if (!existing) return res.status(404).json({ error: "Requisition not found" });
+    if (existing.status !== "DRAFT" && existing.status !== "PENDING_APPROVAL") {
+      return res.status(409).json({ error: "Only draft or pending requisitions can be edited" });
+    }
+    if (existing.purchaseOrders.length > 0) {
+      return res.status(409).json({ error: "A purchase order already exists for this requisition" });
+    }
+
+    // Finished products are produced in-house, never requisitioned from suppliers.
+    const materialIds = [...new Set(items.map((it: any) => String(it.materialId)))];
+    const materials = await prisma.material.findMany({
+      where: { id: { in: materialIds } },
+      select: { id: true, name: true, type: true },
+    });
+    if (materials.length !== materialIds.length) {
+      return res.status(400).json({ error: "One or more materials were not found" });
+    }
+    const finished = materials.find((m) => m.type === "FINISHED");
+    if (finished) {
+      return res.status(400).json({
+        error: `"${finished.name}" is a finished product and cannot be requisitioned`,
+      });
+    }
+
+    const updated = await prisma.$transaction(async (tx) => {
+      await tx.requisitionItem.deleteMany({ where: { requisitionId: existing.id } });
+      return tx.requisition.update({
+        where: { id: existing.id },
+        data: {
+          ...(notes !== undefined ? { notes } : {}),
+          items: {
+            create: items.map((it: any) => ({
+              materialId: it.materialId,
+              quantity: Number(it.quantity),
+              unitOfMeasure: it.unitOfMeasure,
+            })),
+          },
+        },
+        include: REQUISITION_INCLUDE,
+      });
+    });
+
+    await logActivity({
+      userId: req.user!.id,
+      activityType: "UPDATE",
+      module: "procurement",
+      description: `Edited requisition ${updated.number} (${updated.items.length} item(s))`,
+      entityType: "Requisition",
+      entityId: updated.id,
+      details: {
+        before: existing.items.map((it) => ({
+          material: it.material.name,
+          quantity: Number(it.quantity),
+          unitOfMeasure: it.unitOfMeasure,
+        })),
+        after: items,
+      },
+    }).catch((logError) => {
+      // The edit already committed; a failed audit write should not fail the request.
+      console.error("Failed to log requisition edit:", logError);
+    });
+
+    res.json({ requisition: updated });
+  } catch (error) {
+    console.error("PATCH /procurement/requisitions/:id/items error:", error);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
 router.patch("/requisitions/:id/submit", requirePermission("procurement", "update"), async (req: Request, res: Response) => {
   try {
+    const existing = await prisma.requisition.findUnique({
+      where: { id: req.params.id },
+      select: { status: true },
+    });
+    if (!existing) return res.status(404).json({ error: "Requisition not found" });
+    if (existing.status !== "DRAFT") {
+      return res.status(409).json({ error: "Only draft requisitions can be submitted" });
+    }
+
     const requisition = await prisma.requisition.update({
       where: { id: req.params.id },
       data: { status: "PENDING_APPROVAL" },
@@ -118,7 +349,16 @@ router.get("/purchase-orders", requirePermission("procurement", "read"), async (
         supplier: { select: { id: true, name: true } },
         requisition: { select: { id: true, number: true, status: true } },
         createdBy: { select: { id: true, fullName: true } },
-        items: { include: { material: { select: { id: true, name: true, sku: true, unitOfMeasure: true } } } },
+        items: {
+          include: {
+            material: { select: { id: true, name: true, sku: true, unitOfMeasure: true } },
+            supplier: { select: { id: true, name: true } },
+          },
+        },
+        consignments: {
+          select: { id: true, consignmentNumber: true, receivedAt: true, status: true },
+          orderBy: { receivedAt: "asc" },
+        },
       },
       orderBy: { createdAt: "desc" },
     });
@@ -133,6 +373,11 @@ router.post("/purchase-orders", requirePermission("procurement", "create"), asyn
   try {
     const { supplierId, requisitionId, notes, expectedDelivery, items } = req.body;
     if (!supplierId) return res.status(400).json({ error: "supplierId is required" });
+    if (!requisitionId) {
+      return res.status(400).json({
+        error: "A purchase order must be raised from an approved requisition — select the requisition first.",
+      });
+    }
     if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ error: "At least one item is required" });
     }
@@ -174,25 +419,38 @@ router.post("/purchase-orders", requirePermission("procurement", "create"), asyn
       }
     }
 
-    // If converting from an approved requisition, pull its items.
-    let poItems = items;
-    if (requisitionId) {
-      const req = await prisma.requisition.findUnique({
-        where: { id: requisitionId },
-        include: { items: true },
+    // A PO only carries lines that were approved on its requisition — never
+    // free-typed materials.
+    const requisition = await prisma.requisition.findUnique({
+      where: { id: requisitionId },
+      include: { items: true },
+    });
+    if (!requisition) return res.status(404).json({ error: "Requisition not found" });
+    if (requisition.status !== "APPROVED") {
+      return res.status(400).json({ error: "Requisition must be APPROVED before raising a purchase order" });
+    }
+
+    const requisitionMaterialIds = new Set(requisition.items.map((it) => it.materialId));
+    const offRequisition = items.find((it: any) => !requisitionMaterialIds.has(it.materialId));
+    if (offRequisition) {
+      const material = await prisma.material.findUnique({
+        where: { id: offRequisition.materialId },
+        select: { name: true },
       });
-      if (!req) return res.status(404).json({ error: "Requisition not found" });
-      if (req.status !== "APPROVED") return res.status(400).json({ error: "Requisition must be APPROVED first" });
-      
-      // If the user did not supply custom edited items, load from requisition defaults
-      if (!Array.isArray(items) || items.length === 0) {
-        poItems = req.items.map((it) => ({
-          materialId: it.materialId,
-          quantity: it.quantity,
-          unitCost: 0,
-          unitOfMeasure: it.unitOfMeasure,
-        }));
-      }
+      return res.status(400).json({
+        error: `"${material?.name ?? "A material"}" is not on ${requisition.number}. Add it to a requisition first.`,
+      });
+    }
+
+    // If the caller supplied no items, take them straight from the requisition.
+    let poItems = items;
+    if (items.length === 0) {
+      poItems = requisition.items.map((it) => ({
+        materialId: it.materialId,
+        quantity: it.quantity,
+        unitCost: 0,
+        unitOfMeasure: it.unitOfMeasure,
+      }));
     }
 
     const number = `PO-${Date.now().toString().slice(-8)}`;
@@ -226,7 +484,7 @@ router.post("/purchase-orders", requirePermission("procurement", "create"), asyn
 router.patch("/purchase-orders/:id/status", requirePermission("procurement", "update"), async (req: Request, res: Response) => {
   try {
     const { status } = req.body;
-    if (!["DRAFT", "SENT", "PARTIAL", "RECEIVED", "CLOSED"].includes(status)) {
+    if (!["DRAFT", "SENT", "PARTIALLY_RECEIVED", "RECEIVED", "CLOSED"].includes(status)) {
       return res.status(400).json({ error: "Invalid PO status" });
     }
     const purchaseOrder = await prisma.purchaseOrder.update({
@@ -346,24 +604,34 @@ router.get("/consignments", requirePermission("procurement", "read"), async (req
  */
 router.post("/consignments", requirePermission("procurement", "create"), async (req: Request, res: Response) => {
   try {
-    const { supplierId, warehouseId, poNumbers, shipDate, expectedDelivery } = req.body;
+    const { supplierId, warehouseId, poId, poNumbers, shipDate, expectedDelivery, receivedAt, notes, items } = req.body;
     if (!supplierId || !warehouseId) {
       return res.status(400).json({ error: "supplierId and warehouseId are required" });
+    }
+    if (!poId) {
+      return res.status(400).json({ error: "Select a purchase order — a consignment records what arrived from it" });
+    }
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: "Select at least one material that arrived" });
     }
 
     const consignment = await consignmentService.createConsignment({
       supplierId,
       warehouseId,
       createdById: req.user!.id,
+      poId,
+      notes: notes ?? null,
       poNumbers,
       shipDate: shipDate ? new Date(shipDate) : undefined,
       expectedDelivery: expectedDelivery ? new Date(expectedDelivery) : undefined,
+      receivedAt: receivedAt ? new Date(receivedAt) : undefined,
+      items,
     });
 
     res.status(201).json({ consignment });
-  } catch (error) {
+  } catch (error: any) {
     console.error("POST /procurement/consignments error:", error);
-    res.status(500).json({ error: "Database error" });
+    res.status(400).json({ error: error?.message || "Database error" });
   }
 });
 
@@ -392,7 +660,7 @@ router.get("/consignments/:id", requirePermission("procurement", "read"), async 
  */
 router.post("/consignments/:id/items", requirePermission("procurement", "create"), async (req: Request, res: Response) => {
   try {
-    const { materialId, quantity, unitOfMeasure } = req.body;
+    const { materialId, quantity, unitOfMeasure, poItemId } = req.body;
     if (!materialId || !quantity || !unitOfMeasure) {
       return res.status(400).json({ error: "materialId, quantity, and unitOfMeasure are required" });
     }
@@ -402,12 +670,13 @@ router.post("/consignments/:id/items", requirePermission("procurement", "create"
       materialId,
       quantity,
       unitOfMeasure,
+      poItemId: poItemId ?? null,
     });
 
     res.status(201).json({ item });
   } catch (error: any) {
     console.error("POST /procurement/consignments/:id/items error:", error);
-    res.status(500).json({ error: error.message || "Database error" });
+    res.status(400).json({ error: error.message || "Database error" });
   }
 });
 

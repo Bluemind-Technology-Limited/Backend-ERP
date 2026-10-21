@@ -181,7 +181,19 @@ router.get("/materials", requirePermission("master_data", "read"), async (req: R
           : {}),
       },
       include: {
-        suppliers: { include: { supplier: { select: { id: true, name: true } } } },
+        suppliers: {
+          include: {
+            supplier: {
+              select: {
+                id: true,
+                name: true,
+                contactPerson: true,
+                email: true,
+                phone: true,
+              },
+            },
+          },
+        },
       },
       orderBy: { createdAt: "desc" },
     });

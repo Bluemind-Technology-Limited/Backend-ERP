@@ -54,6 +54,9 @@ async function resolveInbound(batchLotId: string) {
               warehouse: { select: { id: true, name: true } },
             },
           },
+          supplier: {
+            select: { id: true, name: true, contactPerson: true, email: true, phone: true },
+          },
         },
       },
     },
@@ -62,8 +65,8 @@ async function resolveInbound(batchLotId: string) {
   if (!item) return null;
   const grn: any = (item as any).grn;
 
-  const supplier = grn.po?.supplier ?? grn.consignment?.supplier ?? null;
-  const via = grn.po ? 'PO' : grn.consignment ? 'CONSIGNMENT' : 'UNKNOWN';
+  const supplier = grn.supplier ?? grn.po?.supplier ?? grn.consignment?.supplier ?? null;
+  const via = grn.po ? "PO" : grn.consignment ? "CONSIGNMENT" : "DIRECT";
 
   return {
     grnNumber: grn.number,

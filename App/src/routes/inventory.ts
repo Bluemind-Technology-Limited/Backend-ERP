@@ -18,6 +18,7 @@ router.get("/stock", requirePermission("inventory", "read"), async (req: Request
       materialId: (req.query.materialId as string) || undefined,
       warehouseId: (req.query.warehouseId as string) || undefined,
       batchLotId: (req.query.batchLotId as string) || undefined,
+      includeFinished: false,
     });
     res.json({ stock });
   } catch (error) {
@@ -35,6 +36,7 @@ router.get("/stock/history", requirePermission("inventory", "read"), async (req:
     const history = await getLedgerHistory(prisma, {
       materialId: (req.query.materialId as string) || undefined,
       batchLotId: (req.query.batchLotId as string) || undefined,
+      excludeFinished: true,
     });
     res.json({ history });
   } catch (error) {

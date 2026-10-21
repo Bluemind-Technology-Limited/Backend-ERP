@@ -64,6 +64,27 @@ router.get(
 );
 
 /**
+ * GET /production-line/daily-records?from=&to=
+ * One entry per production date: expected vs achieved per arm, plus WIP.
+ */
+router.get(
+  "/daily-records",
+  requirePermission("production", "read"),
+  async (req: Request, res: Response) => {
+    try {
+      const days = await productionLineService.getDailyRecords({
+        from: req.query.from ? String(req.query.from) : undefined,
+        to: req.query.to ? String(req.query.to) : undefined,
+      });
+      res.json({ days });
+    } catch (error: any) {
+      console.error("GET /production-line/daily-records error:", error);
+      sendError(res, error, "Failed to load daily production records");
+    }
+  }
+);
+
+/**
  * GET /production-line/plans/:planId — full station view for one plan.
  */
 router.get(

@@ -1,7 +1,8 @@
 import { prisma } from '../lib/db.js';
 import { ConsignmentStatus, LedgerEventType } from '@prisma/client';
 import { postLedgerEntry } from '../lib/ledger.js';
-import { buildLotCode, buildYearCode, nextSetNumber } from '../lib/lotCode.js';
+import { buildLotCode, buildYearCode, isValidSetNumber, nextSetNumber } from '../lib/lotCode.js';
+import { recomputePurchaseOrderStatus } from './purchaseOrderStatus.js';
 
 /**
  * Consignment Service
@@ -13,42 +14,271 @@ import { buildLotCode, buildYearCode, nextSetNumber } from '../lib/lotCode.js';
 // ============================================================================
 
 /**
- * Create a new consignment
+ * Create a consignment — this IS the receipt.
+ *
+ * The store officer opens a purchase order, ticks the lines that actually
+ * arrived and enters how much of each came in. Saving the consignment:
+ *   - records the received quantities (PO lines advance, the rest stays
+ *     outstanding and shows up next time the same PO is opened),
+ *   - posts the stock to the ledger,
+ *   - creates the inbound lot and the QA inspection records.
+ *
+ * There is no separate "receive consignment" step afterwards.
  */
 export async function createConsignment(data: {
   supplierId: string;
   warehouseId: string;
   createdById: string;
+  poId: string;
+  notes?: string | null;
   poNumbers?: string;
   shipDate?: Date;
   expectedDelivery?: Date;
+  /** The single date this delivery was received. */
+  receivedAt?: Date;
+  items: Array<{
+    poItemId?: string | null;
+    materialId: string;
+    quantity: number;
+    unitOfMeasure: string;
+    expiryDate?: string | Date | null;
+    supplierBatchNumber?: string | null;
+    /** Lot set number override (SOP lot code), when the officer supplied one. */
+    setNumber?: number | string | null;
+    /** Per-line destination warehouse; defaults to the consignment warehouse. */
+    warehouseId?: string | null;
+    unitCost?: number | string | null;
+  }>;
 }) {
-  const consignmentNumber = `CSN-${Date.now()}-${Math.random().toString(36).substr(2, 9).toUpperCase()}`;
+  const consignmentNumber = `CSN-${Date.now()}-${Math.random().toString(36).slice(2, 11).toUpperCase()}`;
+  const yearCode = buildYearCode();
+  // One receipt date for the whole shipment — backdatable, and each revisit of
+  // a partly delivered PO gets its own stamp.
+  const receivedAt = data.receivedAt ?? new Date();
 
-  const consignment = await prisma.consignment.create({
-    data: {
-      consignmentNumber,
-      supplierId: data.supplierId,
-      warehouseId: data.warehouseId,
-      createdById: data.createdById,
-      status: ConsignmentStatus.DRAFT,
-      poNumbers: data.poNumbers,
-      shipDate: data.shipDate,
-      expectedDelivery: data.expectedDelivery,
-    },
-    include: {
-      supplier: true,
-      warehouse: true,
-      createdBy: true,
-      items: {
-        include: {
-          material: true,
+  return prisma.$transaction(async (tx) => {
+    const po = await tx.purchaseOrder.findUnique({
+      where: { id: data.poId },
+      include: { items: { include: { material: true } } },
+    });
+
+    if (!po) throw new Error('Purchase order not found');
+    if (po.status === 'CLOSED') throw new Error('Purchase order is closed');
+    if (po.supplierId !== data.supplierId) {
+      throw new Error('The consignment supplier must match the purchase order supplier');
+    }
+
+    const supplier = await tx.supplier.findUniqueOrThrow({
+      where: { id: data.supplierId },
+      select: { id: true, name: true, vendorCode: true },
+    });
+
+    const items = data.items ?? [];
+    if (items.length === 0) throw new Error('Select at least one material that arrived');
+
+    // Quantities already committed to shipments that have not arrived yet are
+    // still outstanding on the PO, so they cannot be received twice.
+    const linkedPoItemIds = items.map((i) => i.poItemId).filter(Boolean) as string[];
+    const alreadyConsigned = new Map<string, number>();
+    if (linkedPoItemIds.length > 0) {
+      const openLines = await tx.consignmentItem.findMany({
+        where: {
+          poItemId: { in: linkedPoItemIds },
+          consignment: {
+            status: { in: ['DRAFT', 'READY_FOR_SHIPMENT', 'IN_TRANSIT', 'PARTIALLY_RECEIVED'] },
+          },
+        },
+        select: { poItemId: true, quantity: true, receivedQty: true },
+      });
+      for (const line of openLines) {
+        if (!line.poItemId) continue;
+        const open = Number(line.quantity) - Number(line.receivedQty);
+        if (open <= 0) continue;
+        alreadyConsigned.set(line.poItemId, (alreadyConsigned.get(line.poItemId) ?? 0) + open);
+      }
+    }
+
+    for (const item of items) {
+      if (!item.materialId || !item.quantity || Number(item.quantity) <= 0) {
+        throw new Error('Each consignment line needs a material and a positive quantity');
+      }
+      const poItem = item.poItemId ? po.items.find((p) => p.id === item.poItemId) : null;
+      if (!item.poItemId || !poItem) throw new Error('Each consignment line must come from a purchase order line');
+      if (poItem.materialId !== item.materialId) {
+        throw new Error('Consignment line material does not match the purchase order line');
+      }
+      const remaining = Number(poItem.quantity) - Number(poItem.receivedQty);
+      const available = remaining - (alreadyConsigned.get(poItem.id) ?? 0);
+      if (Number(item.quantity) > available) {
+        throw new Error(
+          `Only ${available} ${poItem.unitOfMeasure} is still outstanding on ${po.number} for ${poItem.material.name}`
+        );
+      }
+    }
+
+    // 1. The shipment itself. Everything on it has physically arrived, so it is
+    //    recorded as received in the same step.
+    const consignment = await tx.consignment.create({
+      data: {
+        consignmentNumber,
+        supplierId: data.supplierId,
+        warehouseId: data.warehouseId,
+        createdById: data.createdById,
+        poId: po.id,
+        status: ConsignmentStatus.RECEIVED,
+        poNumbers: data.poNumbers ?? po.number,
+        shipDate: data.shipDate,
+        expectedDelivery: data.expectedDelivery,
+        receivedAt,
+        receivedById: data.createdById,
+      },
+    });
+
+    // 2. One GRN behind the shipment so the stock, lots and QA records have a
+    //    single document to hang off.
+    const grnNumber = `GRN-CSN-${Date.now().toString().slice(-8)}`;
+    const receipt = await tx.goodsReceipt.create({
+      data: {
+        number: grnNumber,
+        poId: po.id,
+        consignmentId: consignment.id,
+        supplierId: data.supplierId,
+        source: 'CONSIGNMENT',
+        receivedById: data.createdById,
+        status: 'PENDING_QA',
+        receivedAt,
+        notes: data.notes?.trim()
+          ? data.notes.trim()
+          : `Received via Consignment: ${consignmentNumber}`,
+      },
+    });
+
+    let lineIndex = 0;
+    for (const item of items) {
+      const poItem = po.items.find((p) => p.id === item.poItemId)!;
+      const material = poItem.material;
+      const quantity = Number(item.quantity);
+      lineIndex += 1;
+
+      // Lot code (SOP KIB/QCA/010). The officer may have supplied a set number;
+      // otherwise the next one in sequence is used.
+      const requestedSet = item.setNumber === undefined || item.setNumber === null || item.setNumber === ''
+        ? null
+        : Number(item.setNumber);
+      if (requestedSet !== null && !isValidSetNumber(requestedSet)) {
+        throw new Error('Set number must be a positive whole number');
+      }
+      const setNumber =
+        requestedSet ??
+        (await nextSetNumber(tx, {
+          supplierId: data.supplierId,
+          materialId: material.id,
+          yearCode,
+        }));
+      const lotCode = buildLotCode({
+        vendorCode: supplier.vendorCode,
+        ingredientCode: material.traceabilityCode,
+        setNumber,
+        yearCode,
+      });
+      // Batch number is assigned by QA on inspection; the provisional reference
+      // only keeps the lot identifiable until then.
+      const batchNumber =
+        lotCode ?? `PENDING-${consignmentNumber}-${String(lineIndex).padStart(2, '0')}`;
+
+      const batchLot = await tx.batchLot.upsert({
+        where: { materialId_batchNumber: { materialId: material.id, batchNumber } },
+        update: {},
+        create: {
+          materialId: material.id,
+          batchNumber,
+          status: 'QUARANTINE',
+          expiryDate: item.expiryDate ? new Date(item.expiryDate) : material.defaultExpiryDate,
+          origin: 'INBOUND',
+          lotCode,
+          setNumber,
+          vendorCode: supplier.vendorCode,
+          ingredientCode: material.traceabilityCode,
+          yearCode,
+          supplierBatchNumber: item.supplierBatchNumber ? String(item.supplierBatchNumber).trim() : null,
+          supplierId: data.supplierId,
+        },
+      });
+
+      const consignmentItem = await tx.consignmentItem.create({
+        data: {
+          consignmentId: consignment.id,
+          materialId: material.id,
+          poItemId: poItem.id,
+          quantity,
+          receivedQty: quantity,
+          unitOfMeasure: item.unitOfMeasure,
+          distributedQty: 0,
+        },
+      });
+
+      await tx.goodsReceiptItem.create({
+        data: {
+          grnId: receipt.id,
+          materialId: material.id,
+          batchLotId: batchLot.id,
+          quantity,
+          unitOfMeasure: item.unitOfMeasure,
+          unitCost: Number(item.unitCost ?? poItem.unitCost),
+        },
+      });
+
+      const lineWarehouseId = item.warehouseId || data.warehouseId;
+
+      await postLedgerEntry(tx, {
+        eventType: LedgerEventType.PO_RECEIPT,
+        materialId: material.id,
+        batchLotId: batchLot.id,
+        warehouseId: lineWarehouseId,
+        consignmentItemId: consignmentItem.id,
+        quantity,
+        unitOfMeasure: item.unitOfMeasure,
+        referenceType: 'GRN',
+        referenceId: receipt.id,
+        createdById: data.createdById,
+        notes: `GRN ${grnNumber} via Consignment ${consignmentNumber}`,
+      });
+
+      await tx.inspectionRecord.create({
+        data: {
+          inspectionType: 'GRN',
+          materialId: material.id,
+          batchLotId: batchLot.id,
+          referenceId: receipt.id,
+          result: 'PENDING',
+        },
+      });
+
+      await tx.purchaseOrderItem.update({
+        where: { id: poItem.id },
+        data: { receivedQty: { increment: quantity } },
+      });
+    }
+
+    await recomputePurchaseOrderStatus(tx, po.id);
+
+    return tx.consignment.findUniqueOrThrow({
+      where: { id: consignment.id },
+      include: {
+        supplier: true,
+        warehouse: true,
+        po: { select: { id: true, number: true, status: true } },
+        createdBy: true,
+        goodsReceipts: { select: { id: true, number: true, status: true } },
+        items: {
+          include: {
+            material: true,
+            poItem: { select: { id: true, quantity: true, receivedQty: true, unitCost: true } },
+          },
         },
       },
-    },
+    });
   });
-
-  return consignment;
 }
 
 /**
@@ -70,11 +300,13 @@ export async function getConsignments(filters?: {
     include: {
       supplier: true,
       warehouse: true,
+      po: { select: { id: true, number: true, status: true } },
       createdBy: true,
       receivedBy: true,
       items: {
         include: {
           material: true,
+          poItem: { select: { id: true, quantity: true, receivedQty: true, unitCost: true } },
         },
       },
       qualityApproval: {
@@ -101,11 +333,13 @@ export async function getConsignment(id: string) {
     include: {
       supplier: true,
       warehouse: true,
+      po: { select: { id: true, number: true, status: true } },
       createdBy: true,
       receivedBy: true,
       items: {
         include: {
           material: true,
+          poItem: { select: { id: true, quantity: true, receivedQty: true, unitCost: true } },
           distributions: {
             include: {
               bin: {
@@ -142,10 +376,12 @@ export async function addItemToConsignment(data: {
   materialId: string;
   quantity: number;
   unitOfMeasure: string;
+  poItemId?: string | null;
 }) {
   // Verify consignment exists and is in DRAFT state
   const consignment = await prisma.consignment.findUniqueOrThrow({
     where: { id: data.consignmentId },
+    include: { po: { include: { items: true } } },
   });
 
   if (consignment.status !== ConsignmentStatus.DRAFT) {
@@ -157,16 +393,31 @@ export async function addItemToConsignment(data: {
     where: { id: data.materialId },
   });
 
+  if (data.poItemId) {
+    const poItem = consignment.po?.items.find((p) => p.id === data.poItemId);
+    if (!poItem) throw new Error('Purchase order line not found on this consignment\'s PO');
+    if (poItem.materialId !== data.materialId) {
+      throw new Error('Consignment line material does not match the purchase order line');
+    }
+    const remaining = Number(poItem.quantity) - Number(poItem.receivedQty);
+    if (Number(data.quantity) > remaining) {
+      throw new Error(`Only ${remaining} ${poItem.unitOfMeasure} remaining on the purchase order for this material`);
+    }
+  }
+
   const item = await prisma.consignmentItem.create({
     data: {
       consignmentId: data.consignmentId,
       materialId: data.materialId,
+      poItemId: data.poItemId ?? null,
       quantity: data.quantity,
       unitOfMeasure: data.unitOfMeasure,
+      receivedQty: 0,
       distributedQty: 0,
     },
     include: {
       material: true,
+      poItem: { select: { id: true, quantity: true, receivedQty: true, unitCost: true } },
       consignment: true,
     },
   });

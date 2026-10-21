@@ -185,6 +185,310 @@ export async function getStationQueue(station: 'ISSUE' | 'GRINDING' | 'FINISHING
 }
 
 // ---------------------------------------------------------------------------
+// Notifications — one per station when work is planned or issued
+// ---------------------------------------------------------------------------
+
+const STATION_ROLES = [
+  'STORE_OFFICER',
+  'GRINDING_SUPERVISOR',
+  'PRODUCTION_MANAGER',
+  'PRODUCTION_SUPERVISOR',
+] as const;
+
+/**
+ * Notify the ingredient, grinding and production stations that work exists.
+ * One notification row per active user in those roles; it also renders on each
+ * station page because the page lists the same plan queue.
+ */
+export async function notifyStations(input: {
+  planId: string;
+  planNumber: string;
+  title: string;
+  body: string;
+}) {
+  const users = await prisma.user.findMany({
+    where: { role: { in: STATION_ROLES as unknown as any[] }, isActive: true },
+    select: { id: true },
+  });
+  if (users.length === 0) return;
+
+  await prisma.notification.createMany({
+    data: users.map((u) => ({
+      userId: u.id,
+      title: input.title,
+      body: input.body,
+      type: 'SYSTEM',
+      notificationType: 'SYSTEM',
+      referenceId: input.planId,
+      isActionable: true,
+    })),
+    skipDuplicates: false,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Daily records — expected vs achieved per day, with WIP carry-over
+// ---------------------------------------------------------------------------
+
+export interface DailyRecordDay {
+  date: string;
+  complete: boolean;
+  achieved: {
+    outputQty: number;
+    outputValue: number;
+    grindingQty: number;
+    lines: Array<{
+      id: string;
+      stage: 'GRINDING' | 'FINISHING';
+      planNumber: string;
+      product: string;
+      expected: number;
+      achieved: number;
+      unit: string;
+      value: number;
+    }>;
+    materials: Array<{
+      materialId: string;
+      name: string;
+      sku: string;
+      unit: string;
+      quantity: number;
+      lots: Array<{ batchNumber: string; quantity: number }>;
+    }>;
+    ingredients: Array<{
+      materialId: string;
+      name: string;
+      sku: string;
+      unit: string;
+      quantity: number;
+      value: number;
+      lots: Array<{ batchNumber: string; quantity: number }>;
+    }>;
+  };
+  wip: {
+    quantity: number;
+    value: number;
+    lines: Array<{
+      arm: 'INGREDIENTS' | 'GRINDING' | 'PRODUCTION';
+      materialId: string | null;
+      name: string;
+      unit: string;
+      quantity: number;
+      value: number;
+      lots: Array<{ batchNumber: string; quantity: number }>;
+    }>;
+  };
+}
+
+const dayKey = (date: Date) =>
+  `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+
+/**
+ * Daily production records.
+ *
+ * Groups stage records by production date and returns, for each day:
+ *  - achieved: what each arm actually did (with the per-receipt breakdown),
+ *  - wip: what is left over and rolls to the next day,
+ *  - complete: nothing left over for the day.
+ */
+export async function getDailyRecords(filters?: { from?: string; to?: string }) {
+  const to = filters?.to ? new Date(filters.to) : new Date();
+  to.setHours(23, 59, 59, 999);
+  const from = filters?.from ? new Date(filters.from) : new Date(to.getTime() - 29 * 24 * 60 * 60 * 1000);
+  from.setHours(0, 0, 0, 0);
+
+  const [stageRecords, issueLines] = await Promise.all([
+    prisma.productionStageRecord.findMany({
+      where: { productionDate: { gte: from, lte: to } },
+      include: {
+        productionPlan: { select: { id: true, planNumber: true } },
+        planItem: {
+          select: {
+            targetQuantity: true,
+            bom: {
+              select: {
+                productName: true,
+                finishedSku: { select: { name: true, unitOfMeasure: true } },
+              },
+            },
+          },
+        },
+        remainders: true,
+        grindingInputs: {
+          include: {
+            material: { select: { id: true, name: true, sku: true, unitOfMeasure: true, standardCost: true } },
+            batchLot: { select: { batchNumber: true } },
+          },
+        },
+      },
+      orderBy: { productionDate: 'asc' },
+    }),
+    prisma.planIngredientIssue.findMany({
+      where: { issuedAt: { gte: from, lte: to } },
+      include: {
+        material: { select: { id: true, name: true, sku: true, unitOfMeasure: true } },
+      },
+      orderBy: { issuedAt: 'asc' },
+    }),
+  ]);
+
+  // Materials / lots referenced by remainder rows (they are scalar ids).
+  const remainderMaterialIds = [...new Set(stageRecords.flatMap((r) => r.remainders.map((x) => x.materialId)))];
+  const remainderLotIds = [
+    ...new Set(stageRecords.flatMap((r) => r.remainders.map((x) => x.batchLotId).filter(Boolean))),
+  ] as string[];
+
+  const [remainderMaterials, remainderLots] = await Promise.all([
+    remainderMaterialIds.length
+      ? prisma.material.findMany({
+          where: { id: { in: remainderMaterialIds } },
+          select: { id: true, name: true, sku: true, unitOfMeasure: true, standardCost: true },
+        })
+      : Promise.resolve([]),
+    remainderLotIds.length
+      ? prisma.batchLot.findMany({ where: { id: { in: remainderLotIds } }, select: { id: true, batchNumber: true } })
+      : Promise.resolve([]),
+  ]);
+  const materialMap = new Map(remainderMaterials.map((m) => [m.id, m]));
+  const lotMap = new Map(remainderLots.map((l) => [l.id, l.batchNumber]));
+
+  const days = new Map<string, DailyRecordDay>();
+  const day = (date: Date) => {
+    const key = dayKey(date);
+    let entry = days.get(key);
+    if (!entry) {
+      entry = {
+        date: key,
+        complete: true,
+        achieved: { outputQty: 0, outputValue: 0, grindingQty: 0, lines: [], materials: [], ingredients: [] },
+        wip: { quantity: 0, value: 0, lines: [] },
+      };
+      days.set(key, entry);
+    }
+    return entry;
+  };
+
+  for (const record of stageRecords) {
+    const entry = day(new Date(record.productionDate));
+    const product = record.planItem?.bom?.finishedSku?.name ?? record.planItem?.bom?.productName ?? '—';
+    const expected = Number(record.inputQuantity);
+    const achieved = Number(record.achievedQuantity);
+    const value = achieved * Number(record.unitCost ?? 0);
+
+    entry.achieved.lines.push({
+      id: record.id,
+      stage: record.stage as 'GRINDING' | 'FINISHING',
+      planNumber: record.productionPlan?.planNumber ?? '—',
+      product,
+      expected,
+      achieved,
+      unit: record.unitOfMeasure,
+      value,
+    });
+
+    if (record.stage === 'FINISHING') {
+      entry.achieved.outputQty += achieved;
+      entry.achieved.outputValue += value;
+    } else {
+      entry.achieved.grindingQty += achieved;
+    }
+
+    // Grinding inputs: the "Turmeric 200 kg (20 kg × 10 receipts)" breakdown.
+    for (const input of record.grindingInputs) {
+      const existing = entry.achieved.materials.find((m) => m.materialId === input.materialId);
+      const lot = {
+        batchNumber: input.batchLot?.batchNumber ?? '—',
+        quantity: Number(input.quantity),
+      };
+      if (existing) {
+        existing.quantity += lot.quantity;
+        existing.lots.push(lot);
+      } else {
+        entry.achieved.materials.push({
+          materialId: input.materialId,
+          name: input.material.name,
+          sku: input.material.sku,
+          unit: input.unitOfMeasure,
+          quantity: lot.quantity,
+          lots: [lot],
+        });
+      }
+    }
+
+    // Remainders become WIP for the next day.
+    for (const remainder of record.remainders) {
+      const material = materialMap.get(remainder.materialId);
+      const unitCost = Number(material?.standardCost ?? 0);
+      const quantity = Number(remainder.quantity);
+      entry.wip.lines.push({
+        arm: record.stage === 'FINISHING' ? 'PRODUCTION' : 'GRINDING',
+        materialId: remainder.materialId,
+        name: material?.name ?? 'Material',
+        unit: remainder.unitOfMeasure,
+        quantity,
+        value: quantity * unitCost,
+        lots: [
+          {
+            batchNumber: remainder.batchLotId ? lotMap.get(remainder.batchLotId) ?? '—' : '—',
+            quantity,
+          },
+        ],
+      });
+    }
+
+    // A finishing record with a remainder keeps the product itself in WIP.
+    if (record.stage === 'FINISHING' && Number(record.remainderQuantity) > 0 && record.remainders.length === 0) {
+      const quantity = Number(record.remainderQuantity);
+      entry.wip.lines.push({
+        arm: 'PRODUCTION',
+        materialId: null,
+        name: product,
+        unit: record.unitOfMeasure,
+        quantity,
+        value: quantity * Number(record.unitCost ?? 0),
+        lots: [{ batchNumber: record.batchNumber ?? '—', quantity }],
+      });
+    }
+
+    if (record.remainders.length > 0 || Number(record.remainderQuantity) > 0) {
+      entry.complete = false;
+    }
+  }
+
+  for (const issue of issueLines) {
+    const entry = day(new Date(issue.issuedAt));
+    const quantity = Number(issue.quantity);
+    const value = quantity * Number(issue.unitCost ?? 0);
+    const existing = entry.achieved.ingredients.find((i) => i.materialId === issue.materialId);
+    const lot = { batchNumber: '—', quantity };
+
+    if (existing) {
+      existing.quantity += quantity;
+      existing.value += value;
+      existing.lots.push(lot);
+    } else {
+      entry.achieved.ingredients.push({
+        materialId: issue.materialId,
+        name: issue.material.name,
+        sku: issue.material.sku,
+        unit: issue.unitOfMeasure,
+        quantity,
+        value,
+        lots: [lot],
+      });
+    }
+  }
+
+  const result = [...days.values()].sort((a, b) => b.date.localeCompare(a.date));
+  for (const entry of result) {
+    entry.wip.quantity = entry.wip.lines.reduce((sum, l) => sum + l.quantity, 0);
+    entry.wip.value = entry.wip.lines.reduce((sum, l) => sum + l.value, 0);
+    if (entry.wip.quantity > 0) entry.complete = false;
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
 // Station 1 — Stock Manager issues ingredients
 // ---------------------------------------------------------------------------
 
@@ -231,6 +535,13 @@ export async function issuePlanIngredients(data: {
     }
   }
 
+  // Unit costs are captured at issue time so ingredient value stays historical.
+  const costRows = await prisma.material.findMany({
+    where: { id: { in: [...new Set(plan.aggregatedIngredients.map((a) => a.materialId))] } },
+    select: { id: true, standardCost: true },
+  });
+  const costByMaterial = new Map(costRows.map((m) => [m.id, Number(m.standardCost ?? 0)]));
+
   await prisma.$transaction(async (tx) => {
     for (const line of data.lines) {
       const agg = plan.aggregatedIngredients.find((a) => a.id === line.aggregatedIngredientId);
@@ -250,6 +561,21 @@ export async function issuePlanIngredients(data: {
         referenceId: plan.id,
         createdById: data.issuedById,
         notes: `Issued to production plan ${plan.planNumber}`,
+      });
+
+      // One line per issue: material + receipt lot + qty + snapshot cost.
+      await tx.planIngredientIssue.create({
+        data: {
+          productionPlanId: plan.id,
+          aggregatedIngredientId: agg.id,
+          materialId: agg.materialId,
+          batchLotId: line.batchLotId ?? null,
+          quantity,
+          unitOfMeasure: agg.unitOfMeasure,
+          unitCost: costByMaterial.get(agg.materialId) ?? 0,
+          warehouseId: data.warehouseId,
+          issuedById: data.issuedById,
+        },
       });
 
       await tx.planAggregatedIngredient.update({
@@ -281,6 +607,14 @@ export async function issuePlanIngredients(data: {
     entityType: 'ProductionPlan',
     entityId: plan.id,
   });
+
+  // Grinding and production stations now have work waiting.
+  await notifyStations({
+    planId: plan.id,
+    planNumber: plan.planNumber,
+    title: `Ingredients issued — ${plan.planNumber}`,
+    body: `Ingredients for ${plan.planNumber} have been issued. Grinding can start.`,
+  }).catch((error) => console.error('notifyStations (issue) failed:', error));
 
   return getPlanStationView(plan.id);
 }
@@ -458,7 +792,7 @@ export async function submitFinishingRecord(data: {
     where: { id: data.planItemId },
     include: {
       bom: {
-        include: { finishedSku: { select: { id: true, name: true, unitOfMeasure: true } } },
+        include: { finishedSku: { select: { id: true, name: true, unitOfMeasure: true, standardCost: true } } },
       },
       productionPlan: { select: { id: true, planNumber: true } },
     },
@@ -541,6 +875,8 @@ export async function submitFinishingRecord(data: {
         remainderQuantity: Number(data.remainderQuantity ?? 0),
         carryoverUsedQuantity: carryoverUsed,
         unitOfMeasure: data.unitOfMeasure ?? finishedSku.unitOfMeasure ?? 'kg',
+        // Snapshot the output cost so the day's value never drifts.
+        unitCost: Number(finishedSku.standardCost ?? 0),
         batchNumber: data.batchNumber,
         warehouseId: data.warehouseId,
         finishedBatchLotId,

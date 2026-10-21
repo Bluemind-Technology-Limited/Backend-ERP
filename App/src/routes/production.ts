@@ -69,11 +69,27 @@ router.post(
     try {
       const { productName, description, expectedYield, yieldUnit, finishedSkuId, ingredients } = req.body;
 
-      if (!productName || !finishedSkuId || expectedYield === undefined || !yieldUnit) {
+      if (!finishedSkuId || expectedYield === undefined || !yieldUnit) {
         return res.status(400).json({
-          error: "productName, finishedSkuId, expectedYield, and yieldUnit are required",
+          error: "finishedSkuId, expectedYield, and yieldUnit are required",
         });
       }
+
+      // The formulation's product name always comes from the finished good it
+      // produces, so the two can never drift apart.
+      const finishedProduct = await prisma.material.findUnique({
+        where: { id: finishedSkuId },
+        select: { name: true, type: true },
+      });
+      if (!finishedProduct) {
+        return res.status(404).json({ error: "Finished product not found" });
+      }
+      if (finishedProduct.type !== "FINISHED") {
+        return res.status(400).json({
+          error: `"${finishedProduct.name}" is not a finished product. Pick a product from Master Data → Products.`,
+        });
+      }
+      const resolvedProductName = finishedProduct.name;
 
       if (!Array.isArray(ingredients) || ingredients.length === 0) {
         return res.status(400).json({ error: "At least one ingredient is required" });
@@ -93,7 +109,7 @@ router.post(
       }
 
       const bom = await createBatchFormulation({
-        productName,
+        productName: resolvedProductName,
         description,
         expectedYield: Number(expectedYield),
         yieldUnit,
@@ -341,16 +357,28 @@ router.post(
   requirePermission("production", "create"),
   async (req: Request, res: Response) => {
     try {
-      const { description, scheduledFor } = req.body;
+      const { description, scheduledFor, items } = req.body;
 
       const plan = await createProductionPlan({
         description,
         scheduledFor: scheduledFor ? new Date(scheduledFor) : undefined,
         createdById: req.user!.id,
+        items: Array.isArray(items)
+          ? items.map((it: any) => ({
+              bomId: String(it.bomId),
+              targetQuantity: Number(it.targetQuantity),
+            }))
+          : undefined,
       });
 
       res.status(201).json({ productionPlan: plan });
     } catch (error: any) {
+      // Validation failures (duplicate product, missing quantity, unapproved
+      // formulation) are user-facing, not server errors.
+      if (error instanceof Error && !("code" in error)) {
+        console.error("POST /production/production-plans rejected:", error.message);
+        return res.status(400).json({ error: error.message });
+      }
       console.error("POST /production/production-plans error:", error);
       res.status(500).json({ error: error?.message || "Database error" });
     }
@@ -694,6 +722,93 @@ router.post("/production-orders", requirePermission("production", "create"), asy
   } catch (error) {
     console.error("POST /production/production-orders error:", error);
     res.status(500).json({ error: "Database error" });
+  }
+});
+
+/**
+ * POST /production-orders/batch — plan several products in one go.
+ *
+ * All orders are created in a single transaction, so a failure (inactive
+ * formulation, duplicate product, bad quantity) creates none of them.
+ */
+router.post("/production-orders/batch", requirePermission("production", "create"), async (req: Request, res: Response) => {
+  try {
+    const { orders, scheduledStart, machineId, shiftId } = req.body;
+
+    if (!Array.isArray(orders) || orders.length === 0) {
+      return res.status(400).json({ error: "Select at least one product to produce" });
+    }
+
+    const bomIds = orders.map((o: any) => String(o.bomId));
+    if (new Set(bomIds).size !== bomIds.length) {
+      return res.status(400).json({ error: "Each product can only be ordered once" });
+    }
+    const badQty = orders.find((o: any) => !o.bomId || !(Number(o.targetQuantity) > 0));
+    if (badQty) {
+      return res.status(400).json({ error: "Every selected product needs a positive target quantity" });
+    }
+
+    const boms = await prisma.bom.findMany({
+      where: { id: { in: bomIds } },
+      include: { ingredients: true },
+    });
+    if (boms.length !== bomIds.length) {
+      return res.status(404).json({ error: "One or more batch formulations were not found" });
+    }
+
+    const notActive = boms.find((b) => b.status !== "ACTIVE");
+    if (notActive) {
+      return res.status(400).json({
+        error: `"${notActive.productName}" is ${notActive.status}. Set the formulation to ACTIVE before planning it.`,
+      });
+    }
+
+    const stamp = Date.now().toString().slice(-8);
+
+    const created = await prisma.$transaction(async (tx) => {
+      const results = [];
+      for (let i = 0; i < orders.length; i++) {
+        const bom = boms.find((b) => b.id === orders[i].bomId)!;
+        const targetQuantity = Number(orders[i].targetQuantity);
+
+        const order = await tx.productionOrder.create({
+          data: {
+            orderNumber: `PRD-${stamp}${i}`,
+            bomId: bom.id,
+            targetQuantity,
+            status: "SCHEDULED",
+            scheduledStart: scheduledStart ? new Date(scheduledStart) : null,
+            machineId: machineId ?? null,
+            shiftId: shiftId ?? null,
+            createdById: req.user!.id,
+          },
+          include: { bom: true },
+        });
+
+        for (const ing of bom.ingredients) {
+          const scale = targetQuantity / Number(bom.expectedYield ?? 1);
+          const projectedQty = ing.isPercentage
+            ? (Number(ing.quantity) / 100) * scale * Number(bom.expectedYield ?? 1)
+            : Number(ing.quantity) * scale;
+
+          await tx.productionIngredient.create({
+            data: {
+              productionOrderId: order.id,
+              materialId: ing.materialId,
+              projectedQuantity: projectedQty,
+            },
+          });
+        }
+
+        results.push(order);
+      }
+      return results;
+    });
+
+    res.status(201).json({ productionOrders: created });
+  } catch (error: any) {
+    console.error("POST /production/production-orders/batch error:", error);
+    res.status(500).json({ error: error?.message || "Database error" });
   }
 });
 

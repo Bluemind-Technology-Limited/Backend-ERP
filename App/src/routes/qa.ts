@@ -1,12 +1,46 @@
-import { Router, type Request, type Response } from "express";
+import { Router, raw, type Request, type Response } from "express";
 import { requireAuth } from "../middleware/auth.js";
 import { requirePermission } from "../middleware/rbac.js";
 import { prisma } from "../lib/db.js";
 import { postLedgerEntry } from "../lib/ledger.js";
-import { LedgerEventType } from "@prisma/client";
+import { LedgerEventType, type Prisma } from "@prisma/client";
+import {
+  buildR2PublicUrl,
+  deleteR2Object,
+  isR2Configured,
+  sanitizeFileName,
+  uploadR2Object,
+} from "../lib/r2.js";
+import { logActivity } from "../services/userActivityLogger.js";
 
 const router: Router = Router();
 router.use(requireAuth);
+
+/**
+ * QA assigns the physical batch number during inspection. Receiving only
+ * creates a provisional lot reference (the SOP lot code, or `PENDING-…`), which
+ * this replaces. Two lots of the same material can never share a number.
+ */
+async function assignBatchNumber(
+  tx: Prisma.TransactionClient,
+  batchLotId: string,
+  materialId: string,
+  rawBatchNumber: unknown
+) {
+  const batchNumber = String(rawBatchNumber ?? "").trim();
+  if (!batchNumber) return null;
+
+  const clash = await tx.batchLot.findFirst({
+    where: { materialId, batchNumber, NOT: { id: batchLotId } },
+    select: { id: true },
+  });
+  if (clash) {
+    throw new Error(`Batch number "${batchNumber}" is already used for this material`);
+  }
+
+  await tx.batchLot.update({ where: { id: batchLotId }, data: { batchNumber } });
+  return batchNumber;
+}
 
 // ---------------------------------------------------------------------------
 // QA Inspections — incoming GRNs + finished production batches
@@ -81,7 +115,7 @@ router.get("/inspections", requirePermission("qa", "read"), async (req: Request,
  */
 router.post("/inspections/:id/release", requirePermission("qa", "approve"), async (req: Request, res: Response) => {
   try {
-    const { notes } = req.body;
+    const { notes, batchNumber } = req.body;
     const inspection = await prisma.inspectionRecord.findUnique({
       where: { id: req.params.id },
       include: { batchLot: true },
@@ -91,7 +125,20 @@ router.post("/inspections/:id/release", requirePermission("qa", "approve"), asyn
       return res.status(400).json({ error: "Only PENDING inspections can be released" });
     }
 
+    // Receiving never assigns a batch number — QA must do it before release.
+    if (
+      inspection.batchLot &&
+      !String(batchNumber ?? "").trim() &&
+      inspection.batchLot.batchNumber.startsWith("PENDING-")
+    ) {
+      return res.status(400).json({ error: "Assign a batch number before releasing this batch" });
+    }
+
     const result = await prisma.$transaction(async (tx) => {
+      if (inspection.batchLot) {
+        await assignBatchNumber(tx, inspection.batchLot.id, inspection.materialId, batchNumber);
+      }
+
       const updated = await tx.inspectionRecord.update({
         where: { id: inspection.id },
         data: { result: "PASSED", notes: notes ?? inspection.notes, inspectedById: req.user!.id, inspectedAt: new Date() },
@@ -124,8 +171,11 @@ router.post("/inspections/:id/release", requirePermission("qa", "approve"), asyn
       return updated;
     });
 
-    res.json({ ok: true, inspection: result, message: `Batch ${inspection.batchLot?.batchNumber ?? ""} released to stock` });
+    res.json({ ok: true, inspection: result, message: `Batch ${(batchNumber ?? inspection.batchLot?.batchNumber) || ""} released to stock` });
   } catch (error: any) {
+    if (error?.message?.includes("already used")) {
+      return res.status(409).json({ error: error.message });
+    }
     console.error("POST /qa/inspections/:id/release error:", error);
     res.status(500).json({ error: error?.message || "Database error" });
   }
@@ -137,7 +187,7 @@ router.post("/inspections/:id/release", requirePermission("qa", "approve"), asyn
  */
 router.post("/inspections/:id/reject", requirePermission("qa", "approve"), async (req: Request, res: Response) => {
   try {
-    const { notes } = req.body;
+    const { notes, batchNumber } = req.body;
     const inspection = await prisma.inspectionRecord.findUnique({
       where: { id: req.params.id },
       include: { batchLot: true },
@@ -148,6 +198,10 @@ router.post("/inspections/:id/reject", requirePermission("qa", "approve"), async
     }
 
     const result = await prisma.$transaction(async (tx) => {
+      if (inspection.batchLot) {
+        await assignBatchNumber(tx, inspection.batchLot.id, inspection.materialId, batchNumber);
+      }
+
       const updated = await tx.inspectionRecord.update({
         where: { id: inspection.id },
         data: { result: "FAILED", notes: notes ?? inspection.notes, inspectedById: req.user!.id, inspectedAt: new Date() },
@@ -191,11 +245,203 @@ router.post("/inspections/:id/reject", requirePermission("qa", "approve"), async
       return updated;
     });
 
-    res.json({ ok: true, inspection: result, message: `Batch ${inspection.batchLot?.batchNumber ?? ""} rejected and quarantined stock reversed` });
+    res.json({ ok: true, inspection: result, message: `Batch ${(batchNumber ?? inspection.batchLot?.batchNumber) || ""} rejected and quarantined stock reversed` });
   } catch (error: any) {
+    if (error?.message?.includes("already used")) {
+      return res.status(409).json({ error: error.message });
+    }
     console.error("POST /qa/inspections/:id/reject error:", error);
     res.status(500).json({ error: error?.message || "Database error" });
   }
 });
+
+// ---------------------------------------------------------------------------
+// QA review document (Cloudflare R2)
+//
+// The browser uploads directly to R2 and posts back only the resulting URL.
+// If the browser is blocked (bucket CORS), it falls back to the upload route
+// below, which streams the file from the API to R2 instead.
+// ---------------------------------------------------------------------------
+
+/**
+ * POST /inspections/:id/review-document/upload?fileName=...
+ * Fallback upload: raw file body, MIME type in `x-file-type`.
+ */
+router.post(
+  "/inspections/:id/review-document/upload",
+  requirePermission("qa", "update"),
+  raw({ type: "application/octet-stream", limit: "25mb" }),
+  async (req: Request, res: Response) => {
+    try {
+      if (!isR2Configured()) {
+        return res.status(503).json({ error: "Review document storage is not configured" });
+      }
+      if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+        return res.status(400).json({ error: "file body is required" });
+      }
+
+      const inspection = await prisma.inspectionRecord.findUnique({
+        where: { id: req.params.id },
+        select: { id: true },
+      });
+      if (!inspection) return res.status(404).json({ error: "Inspection record not found" });
+
+      const fileName =
+        typeof req.query.fileName === "string" && req.query.fileName.trim()
+          ? req.query.fileName.trim()
+          : "document";
+      const contentType =
+        typeof req.headers["x-file-type"] === "string" && req.headers["x-file-type"].trim()
+          ? req.headers["x-file-type"].trim()
+          : "application/octet-stream";
+
+      const stamp = Date.now();
+      const rand = Math.random().toString(36).slice(2, 10);
+      const key = `inspections/${inspection.id}/review-docs/${stamp}-${rand}-${sanitizeFileName(fileName)}`;
+
+      const url = await uploadR2Object(key, req.body, contentType);
+      res.status(201).json({ url, key });
+    } catch (error: any) {
+      console.error("POST /qa/inspections/:id/review-document/upload error:", error);
+      res.status(500).json({ error: error?.message || "Failed to upload review document" });
+    }
+  }
+);
+
+/**
+ * POST /inspections/:id/review-document
+ * Body: { url, fileName, mimeType?, fileSize? }
+ * Persists the URL returned by the direct browser -> R2 upload. The key is
+ * derived from the URL so the object can still be replaced/deleted.
+ */
+router.post(
+  "/inspections/:id/review-document",
+  requirePermission("qa", "update"),
+  async (req: Request, res: Response) => {
+    try {
+      const { url, fileName, mimeType, fileSize } = req.body ?? {};
+      if (typeof url !== "string" || !url.trim()) {
+        return res.status(400).json({ error: "url is required" });
+      }
+      if (typeof fileName !== "string" || !fileName.trim()) {
+        return res.status(400).json({ error: "fileName is required" });
+      }
+      if (!isR2Configured()) {
+        return res.status(503).json({ error: "Review document storage is not configured" });
+      }
+
+      const expectedPrefix = buildR2PublicUrl(
+        `inspections/${req.params.id}/review-docs/`
+      );
+      const cleanUrl = url.trim();
+      if (!cleanUrl.startsWith(expectedPrefix)) {
+        return res.status(400).json({ error: "url does not belong to this inspection" });
+      }
+
+      const key = cleanUrl.slice(expectedPrefix.length);
+
+      const inspection = await prisma.inspectionRecord.findUnique({
+        where: { id: req.params.id },
+        select: { id: true, reviewDocumentKey: true },
+      });
+      if (!inspection) return res.status(404).json({ error: "Inspection record not found" });
+
+      const updated = await prisma.inspectionRecord.update({
+        where: { id: inspection.id },
+        data: {
+          reviewDocumentUrl: cleanUrl,
+          reviewDocumentKey: key,
+          reviewDocumentName: fileName.trim(),
+          reviewDocumentMime:
+            typeof mimeType === "string" && mimeType.trim()
+              ? mimeType.trim()
+              : "application/octet-stream",
+          reviewDocumentSize:
+            Number.isFinite(Number(fileSize)) && Number(fileSize) > 0
+              ? Math.round(Number(fileSize))
+              : null,
+          reviewDocumentUploadedAt: new Date(),
+          reviewDocumentUploadedById: req.user!.id,
+        },
+      });
+
+      // Replacing a document: remove the previous object (best effort).
+      if (inspection.reviewDocumentKey && inspection.reviewDocumentKey !== key) {
+        deleteR2Object(inspection.reviewDocumentKey).catch((err) =>
+          console.error("Failed to remove previous review document:", err)
+        );
+      }
+
+      await logActivity({
+        userId: req.user!.id,
+        activityType: "UPDATE",
+        module: "qa",
+        description: `Attached review document ${fileName.trim()} to inspection ${inspection.id}`,
+        entityType: "InspectionRecord",
+        entityId: inspection.id,
+        details: { fileName: fileName.trim(), url: cleanUrl },
+      });
+
+      res.status(201).json({ inspection: updated });
+    } catch (error: any) {
+      console.error("POST /qa/inspections/:id/review-document error:", error);
+      res.status(500).json({ error: error?.message || "Failed to save review document" });
+    }
+  }
+);
+
+/**
+ * DELETE /inspections/:id/review-document
+ * Removes the object from R2 and clears the stored document fields.
+ */
+router.delete(
+  "/inspections/:id/review-document",
+  requirePermission("qa", "update"),
+  async (req: Request, res: Response) => {
+    try {
+      const inspection = await prisma.inspectionRecord.findUnique({
+        where: { id: req.params.id },
+        select: { id: true, reviewDocumentKey: true },
+      });
+      if (!inspection) return res.status(404).json({ error: "Inspection record not found" });
+
+      if (inspection.reviewDocumentKey) {
+        try {
+          await deleteR2Object(inspection.reviewDocumentKey);
+        } catch (error) {
+          // Still clear the row so the UI isn't stuck showing a broken link.
+          console.error("Failed to remove review document object:", error);
+        }
+      }
+
+      await prisma.inspectionRecord.update({
+        where: { id: inspection.id },
+        data: {
+          reviewDocumentUrl: null,
+          reviewDocumentKey: null,
+          reviewDocumentName: null,
+          reviewDocumentMime: null,
+          reviewDocumentSize: null,
+          reviewDocumentUploadedAt: null,
+          reviewDocumentUploadedById: null,
+        },
+      });
+
+      await logActivity({
+        userId: req.user!.id,
+        activityType: "DELETE",
+        module: "qa",
+        description: `Removed review document from inspection ${inspection.id}`,
+        entityType: "InspectionRecord",
+        entityId: inspection.id,
+      });
+
+      res.json({ ok: true });
+    } catch (error: any) {
+      console.error("DELETE /qa/inspections/:id/review-document error:", error);
+      res.status(500).json({ error: error?.message || "Failed to remove review document" });
+    }
+  }
+);
 
 export default router;

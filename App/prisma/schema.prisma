@@ -61,7 +61,7 @@ enum RequisitionStatus {
 enum PurchaseOrderStatus {
   DRAFT
   SENT
-  PARTIAL
+  PARTIALLY_RECEIVED
   RECEIVED
   CLOSED
 }
@@ -70,6 +70,14 @@ enum GoodsReceiptStatus {
   PENDING_QA
   APPROVED
   REJECTED
+}
+
+/// How the goods arrived. Direct receipts are contingency receipts with no PO
+/// or consignment behind them.
+enum GoodsReceiptSource {
+  PURCHASE_ORDER
+  CONSIGNMENT
+  DIRECT
 }
 
 enum ProductionOrderStatus {
@@ -103,6 +111,7 @@ enum ConsignmentStatus {
   DRAFT
   READY_FOR_SHIPMENT
   IN_TRANSIT
+  PARTIALLY_RECEIVED
   RECEIVED
   QUALITY_PENDING
   QUALITY_APPROVED
@@ -286,6 +295,7 @@ model Material {
   productionIngredients     ProductionIngredient[]
   bomFinishedSku            Bom[]                      @relation("finished_sku")
   planAggregatedIngredients PlanAggregatedIngredient[] @relation("plan_ingredients")
+  planIngredientIssues      PlanIngredientIssue[]
   consignmentItems          ConsignmentItem[]          @relation("consignment_items")
   quantityAdjustments       QuantityAdjustment[]
   grindingInputs            ProductionGrindingInput[]
@@ -359,6 +369,8 @@ model Supplier {
   materials      MaterialSupplier[]
   consignments   Consignment[]
   batchLots      BatchLot[]         @relation("supplier_lots")
+  purchaseOrderItems PurchaseOrderItem[] @relation("po_item_supplier")
+  goodsReceipts  GoodsReceipt[]
 
   @@map("suppliers")
 }
@@ -509,6 +521,8 @@ model PurchaseOrder {
   sentAt           DateTime?           @map("sent_at")
   receivedAt       DateTime?           @map("received_at")
   closedAt         DateTime?           @map("closed_at")
+  /// Per-supplier LPO email results (lpoNumber, email, success, error, sentAt).
+  lpoEmails        Json?               @map("lpo_emails")
   notes            String?
   createdAt        DateTime            @default(now()) @map("created_at")
   updatedAt        DateTime            @updatedAt @map("updated_at")
@@ -518,6 +532,7 @@ model PurchaseOrder {
   createdBy     User                @relation(fields: [createdById], references: [id])
   items         PurchaseOrderItem[]
   goodsReceipts GoodsReceipt[]
+  consignments  Consignment[]
 
   @@map("purchase_orders")
 }
@@ -530,10 +545,16 @@ model PurchaseOrderItem {
   unitCost      Decimal @map("unit_cost") @db.Decimal(15, 4)
   receivedQty   Decimal @default(0) @map("received_qty") @db.Decimal(15, 4)
   unitOfMeasure String  @map("unit_of_measure")
+  /// Supplier this line is bought from. Nullable for legacy rows; set when an
+  /// LPO is generated so one internal PO can be split across suppliers.
+  supplierId    String? @map("supplier_id")
 
   po       PurchaseOrder @relation(fields: [poId], references: [id], onDelete: Cascade)
   material Material      @relation(fields: [materialId], references: [id])
+  supplier Supplier?     @relation("po_item_supplier", fields: [supplierId], references: [id])
+  consignmentItems ConsignmentItem[]
 
+  @@index([supplierId])
   @@map("purchase_order_items")
 }
 
@@ -542,6 +563,9 @@ model GoodsReceipt {
   number        String             @unique
   poId          String?            @map("po_id")
   consignmentId String?            @map("consignment_id")
+  supplierId    String?            @map("supplier_id")
+  /// Distinguishes PO-backed, consignment-backed and contingency receipts.
+  source        GoodsReceiptSource @default(PURCHASE_ORDER)
   receivedById  String             @map("received_by_id")
   status        GoodsReceiptStatus @default(PENDING_QA)
   receivedAt    DateTime           @default(now()) @map("received_at")
@@ -553,9 +577,12 @@ model GoodsReceipt {
 
   po          PurchaseOrder?     @relation(fields: [poId], references: [id])
   consignment Consignment?       @relation(fields: [consignmentId], references: [id])
+  supplier    Supplier?          @relation(fields: [supplierId], references: [id])
   receivedBy  User               @relation(fields: [receivedById], references: [id])
   items       GoodsReceiptItem[]
 
+  @@index([source])
+  @@index([supplierId])
   @@map("goods_receipts")
 }
 
@@ -889,6 +916,7 @@ model ProductionPlan {
   createdBy             User                            @relation(fields: [createdById], references: [id])
   items                 ProductionPlanItem[]
   aggregatedIngredients PlanAggregatedIngredient[]
+  ingredientIssues      PlanIngredientIssue[]
   stageRecords          ProductionStageRecord[]
   reconciliations       DailyProductionReconciliation[]
 
@@ -952,6 +980,9 @@ model ProductionStageRecord {
   remainderQuantity     Decimal               @default(0) @map("remainder_quantity") @db.Decimal(15, 4)
   carryoverUsedQuantity Decimal               @default(0) @map("carryover_used_quantity") @db.Decimal(15, 4)
   unitOfMeasure         String                @map("unit_of_measure")
+  /// Snapshot of the output unit cost when the stage was recorded, so a day's
+  /// output value never changes when master-data costs are updated later.
+  unitCost              Decimal?              @default(0) @map("unit_cost") @db.Decimal(15, 4)
   batchNumber           String?               @map("batch_number")
   machineId             String?               @map("machine_id")
   warehouseId           String?               @map("warehouse_id")
@@ -1017,6 +1048,32 @@ model ProductionGrindingInput {
   @@map("production_grinding_inputs")
 }
 
+/// One row per ingredient issue line: which material, which receipt lot and how
+/// much, with the unit cost captured at issue time. This is what lets the
+/// ingredient arm show "Turmeric 200 kg (20 kg × 10 receipts)" and its value.
+model PlanIngredientIssue {
+  id                     String   @id @default(uuid())
+  productionPlanId       String   @map("production_plan_id")
+  planItemId             String?  @map("plan_item_id")
+  aggregatedIngredientId String   @map("aggregated_ingredient_id")
+  materialId             String   @map("material_id")
+  batchLotId             String?  @map("batch_lot_id")
+  quantity               Decimal  @db.Decimal(15, 4)
+  unitOfMeasure          String   @map("unit_of_measure")
+  unitCost               Decimal? @default(0) @map("unit_cost") @db.Decimal(15, 4)
+  warehouseId            String?  @map("warehouse_id")
+  issuedById             String   @map("issued_by_id")
+  issuedAt               DateTime @default(now()) @map("issued_at")
+
+  productionPlan ProductionPlan @relation(fields: [productionPlanId], references: [id], onDelete: Cascade)
+  material       Material       @relation(fields: [materialId], references: [id])
+
+  @@index([productionPlanId])
+  @@index([materialId])
+  @@index([issuedAt])
+  @@map("plan_ingredient_issues")
+}
+
 // ---------------------------------------------------------------------------
 // Consignment System (Warehouse Stocking via Grouped Shipments)
 // ---------------------------------------------------------------------------
@@ -1026,8 +1083,11 @@ model Consignment {
   consignmentNumber String            @unique @map("consignment_number")
   supplierId        String            @map("supplier_id")
   warehouseId       String            @map("warehouse_id")
+  /// Purchase order this shipment is drawn from. A consignment only carries a
+  /// subset of the PO's lines; the rest stays outstanding on the PO.
+  poId              String?           @map("po_id")
   status            ConsignmentStatus @default(DRAFT)
-  poNumbers         String?           @map("po_numbers") // CSV of related PO numbers
+  poNumbers         String?           @map("po_numbers") // CSV of related PO numbers (legacy display)
   shipDate          DateTime?         @map("ship_date")
   expectedDelivery  DateTime?         @map("expected_delivery")
   receivedAt        DateTime?         @map("received_at")
@@ -1039,6 +1099,7 @@ model Consignment {
 
   supplier            Supplier                  @relation(fields: [supplierId], references: [id])
   warehouse           Warehouse                 @relation(fields: [warehouseId], references: [id])
+  po                  PurchaseOrder?            @relation(fields: [poId], references: [id], onDelete: SetNull)
   createdBy           User                      @relation("consignment_creator", fields: [createdById], references: [id])
   receivedBy          User?                     @relation("consignment_receiver", fields: [receivedById], references: [id])
   items               ConsignmentItem[]
@@ -1051,6 +1112,7 @@ model Consignment {
   @@index([status])
   @@index([supplierId])
   @@index([warehouseId])
+  @@index([poId])
   @@index([shipDate])
   @@map("consignments")
 }
@@ -1059,11 +1121,16 @@ model ConsignmentItem {
   id             String  @id @default(uuid())
   consignmentId  String  @map("consignment_id")
   materialId     String  @map("material_id")
+  /// Purchase order line this shipment line is fulfilling, when it came from a PO.
+  poItemId       String? @map("po_item_id")
   quantity       Decimal @db.Decimal(15, 4)
+  /// How much of `quantity` has actually been received through a GRN so far.
+  receivedQty    Decimal @default(0) @map("received_qty") @db.Decimal(15, 4)
   unitOfMeasure  String  @map("unit_of_measure")
   distributedQty Decimal @default(0) @map("distributed_qty") @db.Decimal(15, 4)
 
   consignment           Consignment               @relation(fields: [consignmentId], references: [id], onDelete: Cascade)
+  poItem                PurchaseOrderItem?        @relation(fields: [poItemId], references: [id], onDelete: SetNull)
   material              Material                  @relation("consignment_items", fields: [materialId], references: [id])
   distributions         ConsignmentDistribution[]
   qualityChecks         QualityCheckItem[]        @relation("quality_checks")
@@ -1072,6 +1139,7 @@ model ConsignmentItem {
 
   @@index([consignmentId])
   @@index([materialId])
+  @@index([poItemId])
   @@map("consignment_items")
 }
 
@@ -1227,6 +1295,16 @@ model InspectionRecord {
   inspectedById  String?          @map("inspected_by_id")
   inspectedAt    DateTime?        @map("inspected_at")
   createdAt      DateTime         @default(now()) @map("created_at")
+
+  // QA review document uploaded by the inspector (Cloudflare R2 object).
+  // The URL is public; the key is retained so the object can be replaced or deleted.
+  reviewDocumentUrl          String?   @map("review_document_url")
+  reviewDocumentKey          String?   @map("review_document_key")
+  reviewDocumentName         String?   @map("review_document_name")
+  reviewDocumentMime         String?   @map("review_document_mime")
+  reviewDocumentSize         Int?      @map("review_document_size")
+  reviewDocumentUploadedAt   DateTime? @map("review_document_uploaded_at")
+  reviewDocumentUploadedById String?   @map("review_document_uploaded_by_id")
 
   material  Material  @relation(fields: [materialId], references: [id])
   batchLot  BatchLot? @relation(fields: [batchLotId], references: [id])

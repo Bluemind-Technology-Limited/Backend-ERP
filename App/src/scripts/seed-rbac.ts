@@ -51,7 +51,7 @@ const MATRIX: Record<UserRole, Record<(typeof MODULES)[number], Matrix>> = {
   },
   PRODUCTION_MANAGER: {
     master_data: { read: true },
-    procurement: { read: true, approve: true }, // Can approve requisitions
+    procurement: { read: true, update: true, approve: true }, // Can edit and approve requisitions
     inventory: { read: true },
     production: { create: true, read: true, update: true, approve: true }, // BOMs, orders, scheduling
     qa: {},

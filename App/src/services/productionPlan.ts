@@ -1,9 +1,12 @@
 import { prisma } from "../lib/db.js";
+import { notifyStations } from "./productionLineService.js";
 
 export interface CreateProductionPlanInput {
   description?: string;
   scheduledFor?: Date;
   createdById: string;
+  /** Products (batch formulations) to run on this plan, in order. */
+  items?: Array<{ bomId: string; targetQuantity: number }>;
 }
 
 export interface AggregatedIngredient {
@@ -17,10 +20,43 @@ export interface AggregatedIngredient {
 
 /**
  * Create a new production plan (starts in DRAFT status).
+ *
+ * The selected batch formulations are created with the plan in one write, so a
+ * plan can never end up half-built if one product fails validation.
  */
 export async function createProductionPlan(input: CreateProductionPlanInput) {
   try {
     const planNumber = `PLAN-${Date.now().toString().slice(-8)}`;
+    const items = input.items ?? [];
+
+    if (items.length > 0) {
+      const bomIds = items.map((item) => item.bomId);
+      if (new Set(bomIds).size !== bomIds.length) {
+        throw new Error("Each product can only be added to the plan once");
+      }
+
+      const invalid = items.find(
+        (item) => !item.bomId || !Number.isFinite(item.targetQuantity) || item.targetQuantity <= 0
+      );
+      if (invalid) {
+        throw new Error("Every selected product needs a positive target quantity");
+      }
+
+      const boms = await prisma.bom.findMany({
+        where: { id: { in: bomIds } },
+        select: { id: true, productName: true, status: true },
+      });
+      if (boms.length !== bomIds.length) {
+        throw new Error("One or more batch formulations were not found");
+      }
+
+      const notReady = boms.find((b) => b.status !== "ACTIVE" && b.status !== "APPROVED");
+      if (notReady) {
+        throw new Error(
+          `"${notReady.productName}" is ${notReady.status}. Approve the batch formulation before planning it.`
+        );
+      }
+    }
 
     const plan = await prisma.productionPlan.create({
       data: {
@@ -29,6 +65,15 @@ export async function createProductionPlan(input: CreateProductionPlanInput) {
         status: "DRAFT",
         scheduledFor: input.scheduledFor ? new Date(input.scheduledFor) : null,
         createdById: input.createdById,
+        items: items.length
+          ? {
+              create: items.map((item, index) => ({
+                bomId: item.bomId,
+                targetQuantity: Number(item.targetQuantity),
+                sequence: index + 1,
+              })),
+            }
+          : undefined,
       },
       include: {
         items: {
@@ -37,12 +82,26 @@ export async function createProductionPlan(input: CreateProductionPlanInput) {
               select: { id: true, productName: true, finishedSku: { select: { sku: true } } },
             },
           },
+          orderBy: { sequence: "asc" },
         },
         createdBy: { select: { id: true, fullName: true, email: true } },
       },
     });
 
-    console.log(`✓ Created production plan: ${plan.planNumber}`);
+    // Aggregated ingredients are a derived cache of the plan's items.
+    if (items.length > 0) {
+      await aggregateIngredientsForPlan(plan.id);
+
+      // Ingredient, grinding and production stations are told work is planned.
+      await notifyStations({
+        planId: plan.id,
+        planNumber: plan.planNumber,
+        title: `New production plan ${plan.planNumber}`,
+        body: `${items.length} product(s) planned. Ingredient station: issue the ingredients.`,
+      }).catch((error) => console.error("notifyStations (plan) failed:", error));
+    }
+
+    console.log(`✓ Created production plan: ${plan.planNumber} (${items.length} product(s))`);
     return plan;
   } catch (error) {
     console.error("createProductionPlan error:", error);
