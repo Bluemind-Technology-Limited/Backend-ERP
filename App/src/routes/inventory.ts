@@ -8,6 +8,33 @@ import { LedgerEventType } from "@prisma/client";
 const router: Router = Router();
 router.use(requireAuth);
 
+/** Error carrying the HTTP status to return (stock guards). */
+class HttpError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
+/** Derived balance for one material in one warehouse (optionally one batch). */
+async function currentBalance(
+  db: any,
+  materialId: string,
+  warehouseId: string,
+  batchLotId?: string | null
+): Promise<number> {
+  const sum = await db.inventoryTransaction.aggregate({
+    where: {
+      materialId,
+      warehouseId,
+      ...(batchLotId ? { batchLotId } : {}),
+    },
+    _sum: { quantity: true },
+  });
+  return Number(sum._sum.quantity ?? 0);
+}
+
 /**
  * GET /stock — derived current stock (SUM of ledger entries).
  * Query: ?materialId=&warehouseId=&batchLotId=
@@ -62,7 +89,21 @@ router.post("/stock/transfer", requirePermission("inventory", "create"), async (
       return res.status(400).json({ error: "Source and destination warehouses must differ" });
     }
 
+    const qty = Number(quantity);
+    if (!Number.isFinite(qty) || qty <= 0) {
+      return res.status(400).json({ error: "Quantity must be greater than zero" });
+    }
+
     const result = await prisma.$transaction(async (tx) => {
+      // Stock can never go below zero: check the source before posting the pair.
+      const available = await currentBalance(tx, materialId, fromWarehouseId, batchLotId ?? null);
+      if (available <= 0) {
+        throw new HttpError(400, "There is no stock left to transfer from the source warehouse.");
+      }
+      if (qty > available) {
+        throw new HttpError(400, `Only ${available} ${unitOfMeasure} available in the source warehouse.`);
+      }
+
       // OUT from source
       await postLedgerEntry(tx, {
         eventType: LedgerEventType.TRANSFER_OUT,
@@ -70,7 +111,7 @@ router.post("/stock/transfer", requirePermission("inventory", "create"), async (
         batchLotId: batchLotId ?? null,
         warehouseId: fromWarehouseId,
         binId: fromBinId ?? null,
-        quantity: -Number(quantity),
+        quantity: -qty,
         unitOfMeasure,
         referenceType: "TRANSFER",
         createdById: req.user!.id,
@@ -83,7 +124,7 @@ router.post("/stock/transfer", requirePermission("inventory", "create"), async (
         batchLotId: batchLotId ?? null,
         warehouseId: toWarehouseId,
         binId: toBinId ?? null,
-        quantity: Number(quantity),
+        quantity: qty,
         unitOfMeasure,
         referenceType: "TRANSFER",
         createdById: req.user!.id,
@@ -94,8 +135,8 @@ router.post("/stock/transfer", requirePermission("inventory", "create"), async (
 
     res.status(201).json({ transaction: result });
   } catch (error: any) {
-    console.error("POST /stock/transfer error:", error);
-    res.status(500).json({ error: error?.message || "Database error" });
+    if (!(error instanceof HttpError)) console.error("POST /stock/transfer error:", error);
+    res.status(error?.status ?? 500).json({ error: error?.message || "Database error" });
   }
 });
 
@@ -121,22 +162,37 @@ router.post("/stock/adjustment", requirePermission("inventory", "create"), async
     const material = await prisma.material.findUnique({ where: { id: materialId } });
     if (!material) return res.status(404).json({ error: "Material not found" });
 
-    const entry = await postLedgerEntry(prisma, {
-      eventType: LedgerEventType.ADJUSTMENT,
-      materialId,
-      batchLotId: batchLotId ?? null,
-      warehouseId,
-      quantity: Number(quantity),
-      unitOfMeasure,
-      referenceType: "ADJUSTMENT",
-      createdById: req.user!.id,
-      notes: reason ?? null,
+    const qty = Number(quantity);
+
+    const entry = await prisma.$transaction(async (tx) => {
+      // A reduction may empty a batch, never overdraw it.
+      if (qty < 0) {
+        const available = await currentBalance(tx, materialId, warehouseId, batchLotId ?? null);
+        if (available + qty < 0) {
+          throw new HttpError(
+            400,
+            `Only ${available} ${unitOfMeasure} available — stock cannot go below zero.`
+          );
+        }
+      }
+
+      return postLedgerEntry(tx, {
+        eventType: LedgerEventType.ADJUSTMENT,
+        materialId,
+        batchLotId: batchLotId ?? null,
+        warehouseId,
+        quantity: qty,
+        unitOfMeasure,
+        referenceType: "ADJUSTMENT",
+        createdById: req.user!.id,
+        notes: reason ?? null,
+      });
     });
 
     res.status(201).json({ adjustment: entry });
   } catch (error: any) {
-    console.error("POST /stock/adjustment error:", error);
-    res.status(500).json({ error: error?.message || "Database error" });
+    if (!(error instanceof HttpError)) console.error("POST /stock/adjustment error:", error);
+    res.status(error?.status ?? 500).json({ error: error?.message || "Database error" });
   }
 });
 

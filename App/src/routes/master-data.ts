@@ -205,10 +205,19 @@ router.get("/materials", requirePermission("master_data", "read"), async (req: R
 
 router.post("/materials", requirePermission("master_data", "create"), async (req: Request, res: Response) => {
   try {
-    const { name, sku, type, category, unitOfMeasure, barcode, defaultExpiryDate, requiresLot, attachments, supplierIds, traceabilityCode } = req.body;
+    const { name, sku, type, category, unitOfMeasure, barcode, defaultExpiryDate, shelfLifeDays, requiresLot, attachments, supplierIds, traceabilityCode } = req.body;
     if (!name || !type || !unitOfMeasure) {
       return res.status(400).json({ error: "name, type and unitOfMeasure are required" });
     }
+    const shelfLife = shelfLifeDays === undefined || shelfLifeDays === null || shelfLifeDays === "" ? null : Number(shelfLifeDays);
+    if (shelfLife !== null && (!Number.isFinite(shelfLife) || shelfLife <= 0)) {
+      return res.status(400).json({ error: "shelfLifeDays must be a positive number of days" });
+    }
+    const expiry = defaultExpiryDate
+      ? new Date(defaultExpiryDate)
+      : shelfLife !== null
+        ? new Date(Date.now() + shelfLife * 86_400_000)
+        : null;
     const finalSku = sku && sku.trim() !== "" ? sku : `SKU-${Date.now().toString().slice(-6)}${Math.floor(Math.random() * 1000).toString().padStart(3, '0')}`;
     const material = await prisma.material.create({
       data: {
@@ -218,7 +227,8 @@ router.post("/materials", requirePermission("master_data", "create"), async (req
         category: category ?? null,
         unitOfMeasure,
         barcode: barcode ?? null,
-        defaultExpiryDate: defaultExpiryDate ? new Date(defaultExpiryDate) : null,
+        defaultExpiryDate: expiry,
+        shelfLifeDays: shelfLife,
         requiresLot: requiresLot ?? true,
         traceabilityCode: traceabilityCode ? String(traceabilityCode).trim() : null,
         attachments: attachments ?? [],
@@ -237,7 +247,15 @@ router.post("/materials", requirePermission("master_data", "create"), async (req
 
 router.patch("/materials/:id", requirePermission("master_data", "update"), async (req: Request, res: Response) => {
   try {
-    const { name, type, category, unitOfMeasure, barcode, defaultExpiryDate, requiresLot, attachments, status, supplierIds, traceabilityCode } = req.body;
+    const { name, type, category, unitOfMeasure, barcode, defaultExpiryDate, shelfLifeDays, requiresLot, attachments, status, supplierIds, traceabilityCode } = req.body;
+    const shelfLife = shelfLifeDays === undefined
+      ? undefined
+      : shelfLifeDays === null || shelfLifeDays === ""
+        ? null
+        : Number(shelfLifeDays);
+    if (shelfLife !== undefined && shelfLife !== null && (!Number.isFinite(shelfLife) || shelfLife <= 0)) {
+      return res.status(400).json({ error: "shelfLifeDays must be a positive number of days" });
+    }
     const material = await prisma.material.update({
       where: { id: req.params.id },
       data: {
@@ -246,7 +264,13 @@ router.patch("/materials/:id", requirePermission("master_data", "update"), async
         category,
         unitOfMeasure,
         barcode,
-        defaultExpiryDate: defaultExpiryDate !== undefined ? (defaultExpiryDate ? new Date(defaultExpiryDate) : null) : undefined,
+        shelfLifeDays: shelfLife,
+        defaultExpiryDate:
+          defaultExpiryDate !== undefined
+            ? (defaultExpiryDate ? new Date(defaultExpiryDate) : null)
+            : shelfLife !== undefined && shelfLife !== null
+              ? new Date(Date.now() + shelfLife * 86_400_000)
+              : undefined,
         requiresLot,
         traceabilityCode: traceabilityCode !== undefined ? (traceabilityCode ? String(traceabilityCode).trim() : null) : undefined,
         attachments,

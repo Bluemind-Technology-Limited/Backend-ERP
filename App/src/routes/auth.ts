@@ -3,6 +3,7 @@ import { createClient } from "@supabase/supabase-js";
 import { requireAuth } from "../middleware/auth.js";
 import { requirePermission } from "../middleware/rbac.js";
 import { prisma } from "../lib/db.js";
+import { logActivity } from "../services/userActivityLogger.js";
 
 const router: Router = Router();
 
@@ -213,15 +214,36 @@ router.get("/profile", requireAuth, async (req: Request, res: Response) => {
 });
 
 /**
- * PATCH /auth/profile — update current user profile
+ * PATCH /auth/profile — update current user profile.
+ * Only the fields a user owns are editable: display name, phone, tour flag.
+ * Email/role stay under admin control (PUT /auth/users/:id).
  */
 router.patch("/profile", requireAuth, async (req: Request, res: Response) => {
   try {
-    const { phoneNumber, hasSeenTour } = req.body;
+    const { fullName, phoneNumber, hasSeenTour } = req.body ?? {};
+
+    if (fullName !== undefined) {
+      if (typeof fullName !== "string" || !fullName.trim()) {
+        return res.status(400).json({ error: "Full name cannot be empty" });
+      }
+      if (fullName.trim().length > 120) {
+        return res.status(400).json({ error: "Full name is too long (max 120 characters)" });
+      }
+    }
+    if (phoneNumber !== undefined && phoneNumber !== null) {
+      if (typeof phoneNumber !== "string") {
+        return res.status(400).json({ error: "Phone number must be text" });
+      }
+      if (phoneNumber.trim().length > 32) {
+        return res.status(400).json({ error: "Phone number is too long" });
+      }
+    }
+
     const profile = await prisma.user.update({
       where: { id: req.user!.id },
       data: {
-        ...(phoneNumber !== undefined ? { phoneNumber } : {}),
+        ...(fullName !== undefined ? { fullName: fullName.trim() } : {}),
+        ...(phoneNumber !== undefined ? { phoneNumber: phoneNumber?.trim() || null } : {}),
         ...(hasSeenTour !== undefined ? { hasSeenTour } : {}),
       },
       select: {
@@ -236,10 +258,75 @@ router.patch("/profile", requireAuth, async (req: Request, res: Response) => {
         createdAt: true,
       },
     });
+
     res.json({ profile });
   } catch (error) {
     console.error("PATCH /auth/profile error:", error);
     res.status(500).json({ error: "Database error" });
+  }
+});
+
+/**
+ * POST /auth/change-password — change the signed-in user's own password.
+ *
+ * The current password is verified against Supabase's password grant before
+ * the service-role client applies the change, so knowing the temporary or
+ * existing password is required.
+ */
+router.post("/change-password", requireAuth, async (req: Request, res: Response) => {
+  try {
+    const { currentPassword, newPassword } = req.body ?? {};
+
+    if (typeof currentPassword !== "string" || !currentPassword) {
+      return res.status(400).json({ error: "Enter your current password" });
+    }
+    if (typeof newPassword !== "string" || newPassword.length < 8) {
+      return res.status(400).json({ error: "New password must be at least 8 characters" });
+    }
+    if (newPassword.length > 72) {
+      return res.status(400).json({ error: "New password is too long (max 72 characters)" });
+    }
+    if (newPassword === currentPassword) {
+      return res.status(400).json({ error: "New password must be different from the current one" });
+    }
+
+    const supabaseUrl = process.env.SUPABASE_URL;
+    const anonKey = process.env.SUPABASE_ANON_KEY;
+    const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+    if (!supabaseUrl || !anonKey || !serviceRoleKey) {
+      return res.status(503).json({ error: "Password changes are not configured on this server" });
+    }
+
+    const verified = await fetch(`${supabaseUrl}/auth/v1/token?grant_type=password`, {
+      method: "POST",
+      headers: { apikey: anonKey, "Content-Type": "application/json" },
+      body: JSON.stringify({ email: req.user!.email, password: currentPassword }),
+    });
+    if (!verified.ok) {
+      return res.status(400).json({ error: "Current password is incorrect" });
+    }
+
+    const admin = createClient(supabaseUrl, serviceRoleKey, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const { error } = await admin.auth.admin.updateUserById(req.user!.id, { password: newPassword });
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    await logActivity({
+      userId: req.user!.id,
+      activityType: "UPDATE",
+      module: "admin",
+      description: "Changed their account password",
+      entityType: "User",
+      entityId: req.user!.id,
+    });
+
+    res.json({ success: true });
+  } catch (error: any) {
+    console.error("POST /auth/change-password error:", error);
+    res.status(500).json({ error: error?.message || "Could not change the password" });
   }
 });
 

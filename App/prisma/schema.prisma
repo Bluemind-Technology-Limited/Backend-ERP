@@ -271,6 +271,8 @@ model Material {
   unitOfMeasure     String       @map("unit_of_measure") // kg, liters, units
   barcode           String?
   defaultExpiryDate DateTime?    @map("default_expiry_date") // Default expiry (e.g., 2 years out)
+  /// Shelf life in days (e.g. 730 = 2 years). Drives the default expiry date.
+  shelfLifeDays     Int?         @map("shelf_life_days")
   requiresLot       Boolean      @default(true) @map("requires_lot")
   minQuantity       Decimal?     @default(0) @map("min_quantity") @db.Decimal(15, 4)
   /// SOP KIB/QCA/010 lot-coding: numeric ingredient code (1, 2, 3…). Optional so
