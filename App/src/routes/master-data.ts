@@ -156,6 +156,48 @@ router.delete("/bins/:id", requirePermission("master_data", "delete"), async (re
   }
 });
 
+/**
+ * GET /warehouse-bins — flat, active-bin list for pickers (e.g. distributing a
+ * consignment to a bin). Query: ?warehouseId=
+ */
+router.get("/warehouse-bins", requirePermission("master_data", "read"), async (req: Request, res: Response) => {
+  try {
+    const { warehouseId } = req.query;
+    const bins = await prisma.warehouseBin.findMany({
+      where: {
+        ...(warehouseId ? { warehouseId: String(warehouseId) } : {}),
+        status: "ACTIVE",
+      },
+      select: {
+        id: true,
+        name: true,
+        code: true,
+        zoneId: true,
+        warehouseId: true,
+        status: true,
+        zone: { select: { name: true } },
+      },
+      orderBy: [{ warehouseId: "asc" }, { code: "asc" }],
+    });
+
+    res.json({
+      bins: bins.map((bin) => ({
+        id: bin.id,
+        name: bin.name,
+        code: bin.code,
+        // Older views read `binCode`; keep it as an alias of `code`.
+        binCode: bin.code,
+        zoneId: bin.zoneId,
+        zoneName: bin.zone?.name ?? null,
+        warehouseId: bin.warehouseId,
+        status: bin.status,
+      })),
+    });
+  } catch (error) {
+    return handleApiError(error, res, "GET /master-data/warehouse-bins");
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Materials (Material Master)
 // ---------------------------------------------------------------------------
