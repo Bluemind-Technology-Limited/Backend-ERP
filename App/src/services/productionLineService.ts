@@ -21,6 +21,113 @@ import { logActivity } from './userActivityLogger.js';
 const ISSUABLE_PLAN_STATUSES = ['SCHEDULED', 'IN_PROGRESS'];
 const ACTIVE_PLAN_STATUSES = ['SCHEDULED', 'IN_PROGRESS', 'COMPLETED'];
 
+/** Sequence key for the continuous grinding batch number. */
+export const GRINDING_BATCH_SEQUENCE_KEY = 'grinding_batch_number';
+
+/**
+ * Current grinding batch serial. `lastNumber` is the highest number used so far
+ * (null until the operator seeds it). `nextNumber` is what the next batch gets.
+ */
+export async function getGrindingBatchSequence() {
+  const [counter, highest] = await Promise.all([
+    prisma.sequenceCounter.findUnique({ where: { key: GRINDING_BATCH_SEQUENCE_KEY } }),
+    prisma.productionStageRecord.aggregate({
+      where: { grindingBatchNumber: { not: null } },
+      _max: { grindingBatchNumber: true },
+    }),
+  ]);
+
+  const counterValue = counter?.value ?? 0;
+  const usedValue = Number(highest._max.grindingBatchNumber ?? 0);
+  const lastNumber = Math.max(counterValue, usedValue) || null;
+
+  return { lastNumber, nextNumber: lastNumber === null ? null : lastNumber + 1 };
+}
+
+/** Seed/correct the serial. It can never be set below a number already used. */
+export async function setGrindingBatchSequence(lastNumber: number) {
+  if (!Number.isInteger(lastNumber) || lastNumber < 0) {
+    throw new Error('Last grinding batch number must be a whole number, zero or greater');
+  }
+
+  const highest = await prisma.productionStageRecord.aggregate({
+    where: { grindingBatchNumber: { not: null } },
+    _max: { grindingBatchNumber: true },
+  });
+  const used = Number(highest._max.grindingBatchNumber ?? 0);
+  if (lastNumber < used) {
+    throw new Error(`Cannot be lower than the last assigned grinding batch number (${used})`);
+  }
+
+  await prisma.sequenceCounter.upsert({
+    where: { key: GRINDING_BATCH_SEQUENCE_KEY },
+    update: { value: lastNumber },
+    create: { key: GRINDING_BATCH_SEQUENCE_KEY, value: lastNumber },
+  });
+
+  return { lastNumber, nextNumber: lastNumber + 1 };
+}
+
+/**
+ * Resolve the batch number for a grinding record.
+ *
+ * A provided number is accepted when it is not already used (an operator
+ * override/seed); otherwise the serial advances atomically by one. The counter
+ * always ends up at the highest number issued.
+ */
+async function claimGrindingBatchNumber(
+  tx: any,
+  rawNumber: unknown
+): Promise<number> {
+  const provided =
+    rawNumber === undefined || rawNumber === null || String(rawNumber).trim() === ''
+      ? null
+      : Number(rawNumber);
+
+  if (provided === null) {
+    // Atomic increment. The row must have been seeded by the operator first.
+    const updated = await tx.sequenceCounter
+      .update({
+        where: { key: GRINDING_BATCH_SEQUENCE_KEY },
+        data: { value: { increment: 1 } },
+        select: { value: true },
+      })
+      .catch((error: any) => {
+        if (error?.code === 'P2025') {
+          throw new Error('A grinding batch number is required — set the last grinding batch number first');
+        }
+        throw error;
+      });
+    return Number(updated.value);
+  }
+
+  if (!Number.isInteger(provided) || provided <= 0) {
+    throw new Error('Grinding batch number must be a positive whole number');
+  }
+
+  const clash = await tx.productionStageRecord.findFirst({
+    where: { grindingBatchNumber: provided },
+    select: { id: true },
+  });
+  if (clash) throw new Error(`Grinding batch number ${provided} is already used`);
+
+  const counter = await tx.sequenceCounter.findUnique({
+    where: { key: GRINDING_BATCH_SEQUENCE_KEY },
+  });
+  if (!counter) {
+    await tx.sequenceCounter.create({
+      data: { key: GRINDING_BATCH_SEQUENCE_KEY, value: provided },
+    });
+  } else if (provided > counter.value) {
+    await tx.sequenceCounter.update({
+      where: { key: GRINDING_BATCH_SEQUENCE_KEY },
+      data: { value: provided },
+    });
+  }
+
+  return provided;
+}
+
 /**
  * WIP carryover pool per BOM: unused ground output from prior finishing records,
  * minus whatever later batches already drew on. Purely computed — no ledger.
@@ -633,6 +740,8 @@ export async function submitGrindingRecord(data: {
   inputs?: Array<{ materialId: string; quantity: number; batchLotId?: string | null }>;
   machineId?: string | null;
   batchNumber?: string | null;
+  /** Serial grinding batch number. Omit to take the next number automatically. */
+  grindingBatchNumber?: number | string | null;
   productionDate?: string;
   unitOfMeasure?: string;
   remarks?: string;
@@ -670,6 +779,8 @@ export async function submitGrindingRecord(data: {
     : Number(data.remainderQuantity ?? 0);
 
   const record = await prisma.$transaction(async (tx) => {
+    const grindingBatchNumber = await claimGrindingBatchNumber(tx, data.grindingBatchNumber);
+
     const created = await tx.productionStageRecord.create({
       data: {
         productionPlanId: data.planId,
@@ -681,6 +792,7 @@ export async function submitGrindingRecord(data: {
         unitOfMeasure: data.unitOfMeasure ?? 'kg',
         machineId: data.machineId ?? null,
         batchNumber: data.batchNumber ?? null,
+        grindingBatchNumber,
         productionDate: data.productionDate ? new Date(data.productionDate) : new Date(),
         remarks: data.remarks,
         recordedById: data.recordedById,
@@ -829,7 +941,8 @@ export async function submitFinishingRecord(data: {
         create: {
           materialId: finishedSku.id,
           batchNumber: data.batchNumber,
-          status: 'QUARANTINE',
+          // QA reviews received goods only — finished output goes straight to stock.
+          status: 'ACTIVE',
           // The date the supervisor recorded the batch, so the finished lot
           // carries its own production date in every list and trace.
           manufacturingDate: data.productionDate ? new Date(data.productionDate) : new Date(),
@@ -851,17 +964,6 @@ export async function submitFinishingRecord(data: {
         referenceId: planId,
         createdById: data.recordedById,
         notes: `Finished output for plan ${item.productionPlan.planNumber}`,
-      });
-
-      // Finished goods wait for QA, same as the production-order completion flow.
-      await tx.inspectionRecord.create({
-        data: {
-          inspectionType: 'FINISHED_BATCH',
-          materialId: finishedSku.id,
-          batchLotId: batchLot.id,
-          referenceId: item.id,
-          result: 'PENDING',
-        },
       });
     }
 

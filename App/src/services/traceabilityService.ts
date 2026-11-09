@@ -494,6 +494,7 @@ export async function buildTraceTree(batchId: string) {
             unitOfMeasure: grinding.unitOfMeasure,
             machineId: grinding.machineId,
             batchNumber: grinding.batchNumber,
+            grindingBatchNumber: grinding.grindingBatchNumber,
             productionDate: grinding.productionDate,
             status: grinding.status,
             remainders: grinding.remainders.map((r: any) => ({
@@ -560,6 +561,8 @@ export async function buildTraceTree(batchId: string) {
     batch: {
       id: batch.id,
       batchNumber: batch.batchNumber,
+      lotCode: batch.lotCode,
+      qcBatchNumber: batch.qcBatchNumber,
       status: batch.status,
       manufacturingDate: batch.manufacturingDate,
       expiryDate: batch.expiryDate,

@@ -907,7 +907,7 @@ router.post("/production-orders/:id/release", requirePermission("production", "u
       ok: true,
       stockDeducted: !planLinked,
       message: planLinked
-        ? `Ingredients recorded for ${order.orderNumber}. Stock is deducted at the Stock Issue station for plan ${planNumber}.`
+        ? `Ingredients recorded for ${order.orderNumber}. Stock is deducted at the Ingredients Station for plan ${planNumber}.`
         : `Ingredients released for ${order.orderNumber}`,
     });
   } catch (error: any) {
@@ -1054,7 +1054,8 @@ router.post("/production-orders/:id/complete", requirePermission("production", "
           batchNumber,
           manufacturingDate: new Date(),
           expiryDate: expiryDate,
-          status: "QUARANTINE",
+          // QA inspects received goods only — finished output is available at once.
+          status: "ACTIVE",
           // Finished production batch — the supervisor typed this batch number.
           origin: "FINISHED",
         },
@@ -1071,16 +1072,6 @@ router.post("/production-orders/:id/complete", requirePermission("production", "
         referenceId: order.id,
         createdById: req.user!.id,
         notes: `Output for ${order.orderNumber} (batch ${batchNumber})`,
-      });
-
-      await tx.inspectionRecord.create({
-        data: {
-          inspectionType: "FINISHED_BATCH",
-          materialId: finishedSkuId!,
-          batchLotId: batchLot.id,
-          referenceId: order.id,
-          result: "PENDING",
-        },
       });
 
       await tx.productionOrder.update({

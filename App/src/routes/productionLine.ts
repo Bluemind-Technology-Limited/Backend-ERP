@@ -9,11 +9,59 @@ router.use(requireAuth);
 function sendError(res: Response, error: any, fallback: string) {
   const message = error?.message || fallback;
   if (/not found/i.test(message)) return res.status(404).json({ error: message });
+  if (/already used|already exists/i.test(message)) {
+    return res.status(409).json({ error: message });
+  }
   if (/cannot|must|required|does not belong|not part of|only/i.test(message)) {
     return res.status(400).json({ error: message });
   }
   return res.status(500).json({ error: message });
 }
+
+// ---------------------------------------------------------------------------
+// Grinding batch serial
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /production-line/grinding-batch-sequence
+ * `lastNumber` is null until the operator seeds it; `nextNumber` is what the
+ * next grinding record will get.
+ */
+router.get(
+  "/grinding-batch-sequence",
+  requirePermission("production", "read"),
+  async (_req: Request, res: Response) => {
+    try {
+      const sequence = await productionLineService.getGrindingBatchSequence();
+      res.json(sequence);
+    } catch (error: any) {
+      console.error("GET /production-line/grinding-batch-sequence error:", error);
+      sendError(res, error, "Failed to load the grinding batch sequence");
+    }
+  }
+);
+
+/**
+ * PUT /production-line/grinding-batch-sequence
+ * The grinding manager seeds/corrects the last used number.
+ */
+router.put(
+  "/grinding-batch-sequence",
+  requirePermission("production", "update"),
+  async (req: Request, res: Response) => {
+    try {
+      const { lastNumber } = req.body ?? {};
+      if (lastNumber === undefined || lastNumber === null || lastNumber === "") {
+        return res.status(400).json({ error: "lastNumber is required" });
+      }
+      const sequence = await productionLineService.setGrindingBatchSequence(Number(lastNumber));
+      res.json(sequence);
+    } catch (error: any) {
+      console.error("PUT /production-line/grinding-batch-sequence error:", error);
+      sendError(res, error, "Failed to update the grinding batch sequence");
+    }
+  }
+);
 
 // ---------------------------------------------------------------------------
 // Views / queues
@@ -163,6 +211,7 @@ router.post(
         inputs,
         machineId,
         batchNumber,
+        grindingBatchNumber,
         productionDate,
         unitOfMeasure,
         remarks,
@@ -198,6 +247,7 @@ router.post(
           : undefined,
         machineId: machineId ?? null,
         batchNumber: batchNumber ?? null,
+        grindingBatchNumber: grindingBatchNumber ?? null,
         productionDate,
         unitOfMeasure,
         remarks,

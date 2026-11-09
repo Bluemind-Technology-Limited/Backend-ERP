@@ -17,29 +17,30 @@ const router: Router = Router();
 router.use(requireAuth);
 
 /**
- * QA assigns the physical batch number during inspection. Receiving only
- * creates a provisional lot reference (the SOP lot code, or `PENDING-…`), which
- * this replaces. Two lots of the same material can never share a number.
+ * QA assigns the QC Ingredient Batch Number during inspection. This is a NEW
+ * identifier: it never overwrites the lot code or the receiving batch number —
+ * those remain the link back to the GRN / supplier. Two lots of the same
+ * material can never share a QC batch number.
  */
-async function assignBatchNumber(
+async function assignQcBatchNumber(
   tx: Prisma.TransactionClient,
   batchLotId: string,
   materialId: string,
-  rawBatchNumber: unknown
+  rawQcBatchNumber: unknown
 ) {
-  const batchNumber = String(rawBatchNumber ?? "").trim();
-  if (!batchNumber) return null;
+  const qcBatchNumber = String(rawQcBatchNumber ?? "").trim();
+  if (!qcBatchNumber) return null;
 
   const clash = await tx.batchLot.findFirst({
-    where: { materialId, batchNumber, NOT: { id: batchLotId } },
+    where: { materialId, qcBatchNumber, NOT: { id: batchLotId } },
     select: { id: true },
   });
   if (clash) {
-    throw new Error(`Batch number "${batchNumber}" is already used for this material`);
+    throw new Error(`QC batch number "${qcBatchNumber}" is already used for this material`);
   }
 
-  await tx.batchLot.update({ where: { id: batchLotId }, data: { batchNumber } });
-  return batchNumber;
+  await tx.batchLot.update({ where: { id: batchLotId }, data: { qcBatchNumber } });
+  return qcBatchNumber;
 }
 
 // ---------------------------------------------------------------------------
@@ -48,16 +49,16 @@ async function assignBatchNumber(
 
 router.get("/inspections", requirePermission("qa", "read"), async (req: Request, res: Response) => {
   try {
-    const { result, type } = req.query;
-    const where: any = {};
+    const { result } = req.query;
+    // QA inspects received goods only — finished batches are never reviewed here.
+    const where: any = { inspectionType: "GRN" };
     if (result) where.result = result;
-    if (type) where.inspectionType = type;
 
     const inspections = await prisma.inspectionRecord.findMany({
       where,
       include: {
         material: { select: { id: true, name: true, sku: true, unitOfMeasure: true } },
-        batchLot: { select: { id: true, batchNumber: true, status: true, expiryDate: true } },
+        batchLot: { select: { id: true, batchNumber: true, qcBatchNumber: true, lotCode: true, status: true, expiryDate: true } },
         inspector: { select: { fullName: true } },
       },
       orderBy: { createdAt: "desc" },
@@ -115,7 +116,7 @@ router.get("/inspections", requirePermission("qa", "read"), async (req: Request,
  */
 router.post("/inspections/:id/release", requirePermission("qa", "approve"), async (req: Request, res: Response) => {
   try {
-    const { notes, batchNumber } = req.body;
+    const { notes, qcBatchNumber } = req.body;
     const inspection = await prisma.inspectionRecord.findUnique({
       where: { id: req.params.id },
       include: { batchLot: true },
@@ -125,18 +126,18 @@ router.post("/inspections/:id/release", requirePermission("qa", "approve"), asyn
       return res.status(400).json({ error: "Only PENDING inspections can be released" });
     }
 
-    // Receiving never assigns a batch number — QA must do it before release.
+    // QA must stamp the reviewed ingredient batch with its QC batch number.
     if (
+      inspection.inspectionType === "GRN" &&
       inspection.batchLot &&
-      !String(batchNumber ?? "").trim() &&
-      inspection.batchLot.batchNumber.startsWith("PENDING-")
+      !String(qcBatchNumber ?? inspection.batchLot.qcBatchNumber ?? "").trim()
     ) {
-      return res.status(400).json({ error: "Assign a batch number before releasing this batch" });
+      return res.status(400).json({ error: "Assign the QC ingredient batch number before releasing this item" });
     }
 
     const result = await prisma.$transaction(async (tx) => {
       if (inspection.batchLot) {
-        await assignBatchNumber(tx, inspection.batchLot.id, inspection.materialId, batchNumber);
+        await assignQcBatchNumber(tx, inspection.batchLot.id, inspection.materialId, qcBatchNumber);
       }
 
       const updated = await tx.inspectionRecord.update({
@@ -171,7 +172,11 @@ router.post("/inspections/:id/release", requirePermission("qa", "approve"), asyn
       return updated;
     });
 
-    res.json({ ok: true, inspection: result, message: `Batch ${(batchNumber ?? inspection.batchLot?.batchNumber) || ""} released to stock` });
+    res.json({
+      ok: true,
+      inspection: result,
+      message: `QC batch ${(qcBatchNumber ?? inspection.batchLot?.qcBatchNumber) || ""} released to stock`,
+    });
   } catch (error: any) {
     if (error?.message?.includes("already used")) {
       return res.status(409).json({ error: error.message });
@@ -187,7 +192,7 @@ router.post("/inspections/:id/release", requirePermission("qa", "approve"), asyn
  */
 router.post("/inspections/:id/reject", requirePermission("qa", "approve"), async (req: Request, res: Response) => {
   try {
-    const { notes, batchNumber } = req.body;
+    const { notes, qcBatchNumber } = req.body;
     const inspection = await prisma.inspectionRecord.findUnique({
       where: { id: req.params.id },
       include: { batchLot: true },
@@ -199,7 +204,7 @@ router.post("/inspections/:id/reject", requirePermission("qa", "approve"), async
 
     const result = await prisma.$transaction(async (tx) => {
       if (inspection.batchLot) {
-        await assignBatchNumber(tx, inspection.batchLot.id, inspection.materialId, batchNumber);
+        await assignQcBatchNumber(tx, inspection.batchLot.id, inspection.materialId, qcBatchNumber);
       }
 
       const updated = await tx.inspectionRecord.update({
@@ -230,7 +235,7 @@ router.post("/inspections/:id/reject", requirePermission("qa", "approve"), async
             referenceType: "QA_REJECT",
             referenceId: inspection.id,
             createdById: req.user!.id,
-            notes: `Rejected batch ${inspection.batchLot.batchNumber} (${notes ?? "failed inspection"})`,
+            notes: `Rejected lot ${inspection.batchLot.lotCode ?? inspection.batchLot.batchNumber} (${notes ?? "failed inspection"})`,
           });
         }
       }
@@ -245,7 +250,11 @@ router.post("/inspections/:id/reject", requirePermission("qa", "approve"), async
       return updated;
     });
 
-    res.json({ ok: true, inspection: result, message: `Batch ${(batchNumber ?? inspection.batchLot?.batchNumber) || ""} rejected and quarantined stock reversed` });
+    res.json({
+      ok: true,
+      inspection: result,
+      message: `QC batch ${(qcBatchNumber ?? inspection.batchLot?.qcBatchNumber) || ""} rejected and quarantined stock reversed`,
+    });
   } catch (error: any) {
     if (error?.message?.includes("already used")) {
       return res.status(409).json({ error: error.message });

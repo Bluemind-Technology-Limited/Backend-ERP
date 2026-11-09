@@ -426,6 +426,10 @@ model BatchLot {
   /// The supplier's own batch number, where they provide one (sits on the label).
   supplierBatchNumber String?        @map("supplier_batch_number")
   supplierId          String?        @map("supplier_id")
+  /// QC Ingredient Batch Number — assigned by QA after inspecting this lot.
+  /// Distinct from `lotCode` / `batchNumber`: it identifies the reviewed batch
+  /// and is what production traceability references.
+  qcBatchNumber       String?        @map("qc_batch_number")
 
   material              Material                  @relation(fields: [materialId], references: [id])
   supplier              Supplier?                 @relation("supplier_lots", fields: [supplierId], references: [id])
@@ -437,6 +441,7 @@ model BatchLot {
   grindingInputs        ProductionGrindingInput[]
 
   @@unique([materialId, batchNumber])
+  @@unique([materialId, qcBatchNumber])
   @@index([vendorCode])
   @@index([ingredientCode])
   @@index([origin])
@@ -996,6 +1001,8 @@ model ProductionStageRecord {
   /// output value never changes when master-data costs are updated later.
   unitCost              Decimal?              @default(0) @map("unit_cost") @db.Decimal(15, 4)
   batchNumber           String?               @map("batch_number")
+  /// Serial grinding batch number (global counter, assigned by the station).
+  grindingBatchNumber   Int?                  @unique @map("grinding_batch_number")
   machineId             String?               @map("machine_id")
   warehouseId           String?               @map("warehouse_id")
   finishedBatchLotId    String?               @map("finished_batch_lot_id")
@@ -1326,7 +1333,21 @@ model InspectionRecord {
 }
 
 // ---------------------------------------------------------------------------
-// 7. User Activity Tracking
+// 7. Sequences (serial counters)
+// ---------------------------------------------------------------------------
+
+/// Generic serial counter. Used for codes that run continuously in the real
+/// operation (e.g. the grinding batch number, which is already beyond 800,000).
+model SequenceCounter {
+  key       String   @id
+  value     Int      @default(0)
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("sequence_counters")
+}
+
+// ---------------------------------------------------------------------------
+// 8. User Activity Tracking
 // ---------------------------------------------------------------------------
 
 model UserActivity {
