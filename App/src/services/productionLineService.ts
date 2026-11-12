@@ -167,8 +167,19 @@ function summarize(plan: any) {
   const items: any[] = plan.items ?? [];
   const aggs: any[] = plan.aggregatedIngredients ?? [];
 
-  const grindingDone = items.filter((i) => i.stageRecords?.some((r: any) => r.stage === 'GRINDING')).length;
-  const finishingDone = items.filter((i) => i.stageRecords?.some((r: any) => r.stage === 'FINISHING')).length;
+  const totalOf = (item: any, stage: string, field: string) =>
+    (item.stageRecords ?? [])
+      .filter((record: any) => record.stage === stage)
+      .reduce((sum: number, record: any) => sum + Number(record[field] ?? 0), 0);
+
+  const grindingDone = items.filter((item) => {
+    const target = Number(item.targetQuantity ?? 0);
+    return target > 0 && totalOf(item, 'GRINDING', 'achievedQuantity') >= target - 0.0001;
+  }).length;
+  const finishingDone = items.filter((item) => {
+    const target = Number(item.targetQuantity ?? 0);
+    return target > 0 && totalOf(item, 'FINISHING', 'achievedQuantity') >= target - 0.0001;
+  }).length;
   const issuedIngredients = aggs.filter((a) => a.status === 'RELEASED').length;
 
   return {
@@ -190,19 +201,62 @@ function summarize(plan: any) {
   };
 }
 
-/** Per-item view: how much was ground (available to finish) and what was output. */
+/** Per-item view: expected vs received vs processed vs finished, with WIP. */
 function enrichItems(plan: any, carryover?: Map<string, number>) {
   const items: any[] = plan.items ?? [];
   return items.map((item) => {
     const stageRecords: any[] = item.stageRecords ?? [];
     const grinding = stageRecords.filter((r) => r.stage === 'GRINDING');
     const finishing = stageRecords.filter((r) => r.stage === 'FINISHING');
+
+    const target = Number(item.targetQuantity ?? 0);
+    const expectedYield = Number(item.bom?.expectedYield ?? 0);
+    const expectedBatches = expectedYield > 0 ? target / expectedYield : 0;
+
+    const groundQuantity = grinding.reduce((sum, r) => sum + Number(r.achievedQuantity), 0);
+    const receivedQuantity = grinding.reduce(
+      (sum, r) => sum + Number(r.receivedQuantity ?? r.inputQuantity),
+      0
+    );
+    const batchesGround = grinding.reduce((sum, r) => sum + Number(r.batchesProcessed ?? 0), 0);
+    const achievedQuantity = finishing.reduce((sum, r) => sum + Number(r.achievedQuantity), 0);
+    const rejectedQuantity = finishing.reduce((sum, r) => sum + Number(r.rejectedQuantity ?? 0), 0);
+
+    const grindingOutstanding = Math.max(0, Number((target - groundQuantity).toFixed(4)));
+    const finishingOutstanding = Math.max(0, Number((target - achievedQuantity).toFixed(4)));
+    const grindingStatus =
+      grindingOutstanding <= 0.0001
+        ? 'COMPLETED'
+        : groundQuantity > 0 || receivedQuantity > 0
+          ? 'IN_PROGRESS'
+          : 'PENDING';
+    const finishingStatus =
+      finishingOutstanding <= 0.0001
+        ? 'COMPLETED'
+        : achievedQuantity > 0 || groundQuantity > 0
+          ? 'IN_PROGRESS'
+          : 'PENDING';
+
     return {
       ...item,
-      grindingRecord: grinding[0] ?? null,
-      finishingRecord: finishing[0] ?? null,
-      groundQuantity: grinding.reduce((sum, r) => sum + Number(r.achievedQuantity), 0),
-      achievedQuantity: finishing.reduce((sum, r) => sum + Number(r.achievedQuantity), 0),
+      grindingRecords: grinding,
+      finishingRecords: finishing,
+      // Backwards-compatible convenience fields.
+      grindingRecord: grinding[grinding.length - 1] ?? null,
+      finishingRecord: finishing[finishing.length - 1] ?? null,
+      expectedYield: Number(expectedYield.toFixed(4)),
+      expectedBatches: Number(expectedBatches.toFixed(4)),
+      groundQuantity: Number(groundQuantity.toFixed(4)),
+      receivedQuantity: Number(receivedQuantity.toFixed(4)),
+      batchesGround: Number(batchesGround.toFixed(4)),
+      achievedQuantity: Number(achievedQuantity.toFixed(4)),
+      rejectedQuantity: Number(rejectedQuantity.toFixed(4)),
+      grindingOutstanding,
+      finishingOutstanding,
+      variance: Number((achievedQuantity - target).toFixed(4)),
+      grindingStatus,
+      finishingStatus,
+      stationStatus: finishingStatus,
       // Unfinished output from earlier batches of this product.
       carryoverAvailable: carryover?.get(item.bomId) ?? 0,
     };
@@ -220,8 +274,12 @@ function serializePlan(plan: any, carryover?: Map<string, number>) {
     startedAt: plan.startedAt,
     completedAt: plan.completedAt,
     createdBy: plan.createdBy ?? null,
+    releasedAt: plan.releasedAt ?? null,
+    outstandingClosedAt: plan.outstandingClosedAt ?? null,
+    outstandingCloseReason: plan.outstandingCloseReason ?? null,
     items: enrichItems(plan, carryover),
     aggregatedIngredients: plan.aggregatedIngredients ?? [],
+    ingredientIssues: plan.ingredientIssues ?? [],
     stationWorkOrders: STATION_ORDER.map((station) => {
       const order = orders.find((row) => row.station === station);
       const expected = Number(order?.expectedQuantity ?? 0);
@@ -253,12 +311,19 @@ const PLAN_INCLUDE = {
         },
       },
       stageRecords: { include: { remainders: true }, orderBy: { recordedAt: 'desc' as const } },
+      batchLot: {
+        select: { id: true, batchNumber: true, lotCode: true, setNumber: true, status: true },
+      },
     },
     orderBy: { sequence: 'asc' as const },
   },
   aggregatedIngredients: {
     include: { material: { select: { id: true, name: true, sku: true, unitOfMeasure: true } } },
     orderBy: { materialId: 'asc' as const },
+  },
+  ingredientIssues: {
+    include: { material: { select: { id: true, name: true, sku: true, unitOfMeasure: true } } },
+    orderBy: { issuedAt: 'desc' as const },
   },
   stationWorkOrders: true,
 } as const;
@@ -317,9 +382,20 @@ export async function getStationQueue(station: 'ISSUE' | 'GRINDING' | 'FINISHING
       );
     }
     if (station === 'GRINDING') {
-      return plan.status === 'IN_PROGRESS' && plan.items.some((i: any) => !i.grindingRecord);
+      return (
+        plan.status === 'IN_PROGRESS' &&
+        plan.items.some((item: any) => Number(item.grindingOutstanding ?? item.targetQuantity) > 0.0001)
+      );
     }
-    return plan.items.some((i: any) => i.grindingRecord && !i.finishingRecord);
+    return (
+      plan.status !== 'COMPLETED' &&
+      plan.status !== 'CANCELLED' &&
+      plan.items.some(
+        (item: any) =>
+          Number(item.groundQuantity ?? 0) > 0 &&
+          Number(item.finishingOutstanding ?? item.targetQuantity) > 0.0001
+      )
+    );
   });
 }
 
@@ -774,6 +850,10 @@ export async function submitGrindingRecord(data: {
   planItemId: string;
   inputQuantity: number;
   achievedQuantity: number;
+  /** Actual quantity received from the Ingredient Station for this record. */
+  receivedQuantity?: number;
+  /** Number of formula batches processed in this record. */
+  batchesProcessed?: number;
   remainderQuantity?: number;
   remainders?: Array<{ materialId: string; quantity: number; batchLotId?: string | null; warehouseId?: string | null }>;
   inputs?: Array<{ materialId: string; quantity: number; batchLotId?: string | null }>;
@@ -791,20 +871,43 @@ export async function submitGrindingRecord(data: {
       bom: {
         select: { productName: true, finishedSku: { select: { unitOfMeasure: true } } },
       },
-      productionPlan: { select: { id: true, planNumber: true } },
+      batchLot: {
+        select: { id: true, batchNumber: true, lotCode: true, status: true },
+      },
+      productionPlan: { select: { id: true, planNumber: true, status: true } },
     },
   });
   if (!item) throw new Error('Plan item not found');
   if (item.productionPlanId !== data.planId) throw new Error('Plan item does not belong to this plan');
+  if (item.productionPlan.status === 'COMPLETED' || item.productionPlan.status === 'CANCELLED') {
+    throw new Error(`This production plan is ${item.productionPlan.status.toLowerCase()} and cannot be processed`);
+  }
 
   const input = Number(data.inputQuantity);
   const achieved = Number(data.achievedQuantity);
+  const received = data.receivedQuantity === undefined ? input : Number(data.receivedQuantity);
+  const batchesProcessed =
+    data.batchesProcessed === undefined ? 0 : Number(data.batchesProcessed);
   const remainders = (data.remainders ?? []).filter((r) => Number(r.quantity) > 0);
 
   if (!Number.isFinite(input) || !Number.isFinite(achieved) || input <= 0 || achieved < 0) {
     throw new Error('Input quantity must be greater than zero and achieved quantity cannot be negative');
   }
   if (achieved > input) throw new Error('Achieved quantity cannot exceed the input quantity');
+  if (!Number.isFinite(received) || received < 0) {
+    throw new Error('Received quantity cannot be negative');
+  }
+  if (!Number.isFinite(batchesProcessed) || batchesProcessed < 0) {
+    throw new Error('Batches processed cannot be negative');
+  }
+
+  if (!item.batchLotId || !item.batchLot) {
+    throw new Error('This batch has no QA batch code yet — release the ingredients first');
+  }
+  if (item.batchLot.status === 'REJECTED') {
+    throw new Error('This batch was rejected by QA and cannot be produced');
+  }
+  const approvedBatchLot = item.batchLot;
 
   const plan = await prisma.productionPlan.findUnique({
     where: { id: data.planId },
@@ -833,10 +936,13 @@ export async function submitGrindingRecord(data: {
         stage: 'GRINDING',
         inputQuantity: input,
         achievedQuantity: achieved,
+        receivedQuantity: received,
+        batchesProcessed,
         remainderQuantity: remainderTotal,
         unitOfMeasure: item.bom.finishedSku?.unitOfMeasure ?? 'kg',
         machineId: data.machineId ?? null,
-        batchNumber: data.batchNumber ?? null,
+        batchNumber: approvedBatchLot.lotCode ?? approvedBatchLot.batchNumber,
+        batchLotId: approvedBatchLot.id,
         grindingBatchNumber,
         productionDate: data.productionDate ? new Date(data.productionDate) : new Date(),
         remarks: data.remarks,
@@ -947,15 +1053,17 @@ export async function submitFinishingRecord(data: {
   achievedQuantity: number;
   remainderQuantity?: number;
   carryoverUsedQuantity?: number;
+  /** Finished goods rejected/lost during this production record. */
+  rejectedQuantity?: number;
   warehouseId: string;
-  batchNumber: string;
+  /** Legacy field kept for API compatibility — the QA-approved lot code wins. */
+  batchNumber?: string | null;
   expiryDate?: string;
   productionDate?: string;
   remarks?: string;
   recordedById: string;
 }) {
   if (!data.warehouseId) throw new Error('A receiving warehouse is required');
-  if (!data.batchNumber) throw new Error('A finished batch number is required');
 
   const item = await prisma.productionPlanItem.findUnique({
     where: { id: data.planItemId },
@@ -963,17 +1071,35 @@ export async function submitFinishingRecord(data: {
       bom: {
         include: { finishedSku: { select: { id: true, name: true, unitOfMeasure: true, standardCost: true } } },
       },
-      productionPlan: { select: { id: true, planNumber: true } },
+      batchLot: {
+        select: { id: true, batchNumber: true, lotCode: true, status: true, expiryDate: true },
+      },
+      productionPlan: { select: { id: true, planNumber: true, status: true } },
     },
   });
   if (!item) throw new Error('Plan item not found');
   if (item.productionPlanId !== data.planId) throw new Error('Plan item does not belong to this plan');
+  if (item.productionPlan.status === 'COMPLETED' || item.productionPlan.status === 'CANCELLED') {
+    throw new Error(`This production plan is ${item.productionPlan.status.toLowerCase()} and cannot be processed`);
+  }
 
   const finishedSku = item.bom?.finishedSku;
   if (!finishedSku) throw new Error('This plan item\'s BOM has no finished SKU configured');
 
+  if (!item.batchLotId || !item.batchLot) {
+    throw new Error('This batch has no QA batch code yet — release the ingredients first');
+  }
+  if (item.batchLot.status === 'REJECTED') {
+    throw new Error('This batch was rejected by QA and cannot be finished');
+  }
+  const approvedBatchNumber = item.batchLot.lotCode ?? item.batchLot.batchNumber;
+
   const achieved = Number(data.achievedQuantity);
   if (!(achieved >= 0)) throw new Error('Achieved quantity must be zero or greater');
+  const rejected = Number(data.rejectedQuantity ?? 0);
+  if (!Number.isFinite(rejected) || rejected < 0) {
+    throw new Error('Rejected quantity cannot be negative');
+  }
 
   const required = Number(item.targetQuantity);
   const planId = item.productionPlanId;
@@ -989,31 +1115,13 @@ export async function submitFinishingRecord(data: {
   }
 
   const record = await prisma.$transaction(async (tx) => {
-    let finishedBatchLotId: string | null = null;
+    const finishedBatchLotId = item.batchLotId;
 
     if (achieved > 0) {
-      const batchLot = await tx.batchLot.upsert({
-        where: { materialId_batchNumber: { materialId: finishedSku.id, batchNumber: data.batchNumber } },
-        update: {},
-        create: {
-          materialId: finishedSku.id,
-          batchNumber: data.batchNumber,
-          // QA reviews received goods only — finished output goes straight to stock.
-          status: 'ACTIVE',
-          // The date the supervisor recorded the batch, so the finished lot
-          // carries its own production date in every list and trace.
-          manufacturingDate: data.productionDate ? new Date(data.productionDate) : new Date(),
-          expiryDate: data.expiryDate ? new Date(data.expiryDate) : null,
-          // Finished production batch — batch number comes from the station.
-          origin: 'FINISHED',
-        },
-      });
-      finishedBatchLotId = batchLot.id;
-
       await postLedgerEntry(tx, {
         eventType: LedgerEventType.PROD_OUTPUT,
         materialId: finishedSku.id,
-        batchLotId: batchLot.id,
+        batchLotId: finishedBatchLotId,
         warehouseId: data.warehouseId,
         quantity: achieved,
         unitOfMeasure: finishedSku.unitOfMeasure ?? 'kg',
@@ -1031,12 +1139,14 @@ export async function submitFinishingRecord(data: {
         stage: 'FINISHING',
         inputQuantity: required,
         achievedQuantity: achieved,
+        rejectedQuantity: rejected,
         remainderQuantity: Number(data.remainderQuantity ?? 0),
         carryoverUsedQuantity: carryoverUsed,
         unitOfMeasure: finishedSku.unitOfMeasure ?? 'kg',
         // Snapshot the output cost so the day's value never drifts.
         unitCost: Number(finishedSku.standardCost ?? 0),
-        batchNumber: data.batchNumber,
+        batchNumber: approvedBatchNumber,
+        batchLotId: finishedBatchLotId,
         warehouseId: data.warehouseId,
         finishedBatchLotId,
         productionDate: data.productionDate ? new Date(data.productionDate) : new Date(),
@@ -1045,19 +1155,30 @@ export async function submitFinishingRecord(data: {
       },
     });
 
+    // actualYield is the cumulative finished quantity for this batch, not just
+    // the last partial record.
+    const finishedTotal = await tx.productionStageRecord.aggregate({
+      where: { planItemId: item.id, stage: 'FINISHING' },
+      _sum: { achievedQuantity: true },
+    });
     await tx.productionPlanItem.update({
       where: { id: item.id },
-      data: { actualYield: achieved },
+      data: { actualYield: Number(finishedTotal._sum.achievedQuantity ?? 0) },
     });
 
-    // Complete the plan once every item has a finishing record.
+    // Complete only when every batch's required quantity is fully accounted
+    // for. Outstanding quantities must be explicitly reconciled/closed first.
     const allItems = await tx.productionPlanItem.findMany({
       where: { productionPlanId: planId },
       include: { stageRecords: true },
     });
-    const allFinished = allItems.every((i) =>
-      i.stageRecords.some((r) => r.stage === 'FINISHING')
-    );
+    const allFinished = allItems.every((planItem) => {
+      const target = Number(planItem.targetQuantity);
+      const finished = planItem.stageRecords
+        .filter((record) => record.stage === 'FINISHING')
+        .reduce((sum, record) => sum + Number(record.achievedQuantity), 0);
+      return target > 0 && finished >= target - 0.0001;
+    });
     if (allFinished) {
       await tx.productionPlan.update({
         where: { id: planId },
@@ -1086,6 +1207,93 @@ export async function submitFinishingRecord(data: {
   );
 
   return getPlanStationView(planId);
+}
+
+/**
+ * Explicitly reconcile and close outstanding production quantities.
+ * A plan with a shortfall can only complete through this action — the WIP pool
+ * is closed with the reason and the audit trail records it.
+ */
+export async function closePlanOutstanding(data: {
+  planId: string;
+  userId: string;
+  reason: string;
+}) {
+  const reason = String(data.reason ?? '').trim();
+  if (!reason) throw new Error('A reconciliation reason is required');
+
+  const plan = await prisma.productionPlan.findUnique({
+    where: { id: data.planId },
+    select: {
+      id: true,
+      planNumber: true,
+      status: true,
+      items: { include: { stageRecords: true } },
+    },
+  });
+  if (!plan) throw new Error('Production plan not found');
+  if (plan.status === 'COMPLETED') throw new Error('Production plan is already completed');
+  if (plan.status === 'CANCELLED') throw new Error('Cancelled production plans cannot be reconciled');
+
+  const outstanding = plan.items.map((item) => {
+    const target = Number(item.targetQuantity);
+    const finished = item.stageRecords
+      .filter((record) => record.stage === 'FINISHING')
+      .reduce((sum, record) => sum + Number(record.achievedQuantity), 0);
+    return {
+      planItemId: item.id,
+      target,
+      finished,
+      outstanding: Math.max(0, Number((target - finished).toFixed(4))),
+    };
+  });
+  const totalOutstanding = Number(
+    outstanding.reduce((sum, row) => sum + row.outstanding, 0).toFixed(4)
+  );
+
+  await prisma.$transaction(async (tx) => {
+    await tx.workInProgress.updateMany({
+      where: {
+        productionPlanId: plan.id,
+        status: { in: ['OPEN', 'PARTIAL'] as any },
+      },
+      data: {
+        status: 'CLOSED' as any,
+        closedAt: new Date(),
+        notes: `Closed during production reconciliation: ${reason}`,
+      },
+    });
+
+    await tx.productionPlan.update({
+      where: { id: plan.id },
+      data: {
+        status: 'COMPLETED',
+        completedAt: new Date(),
+        outstandingClosedAt: new Date(),
+        outstandingClosedById: data.userId,
+        outstandingCloseReason: reason,
+      },
+    });
+  });
+
+  await logActivity({
+    userId: data.userId,
+    activityType: 'ADJUST',
+    module: 'production',
+    description: `Closed ${totalOutstanding} outstanding unit(s) on plan ${plan.planNumber}: ${reason}`,
+    entityType: 'ProductionPlan',
+    entityId: plan.id,
+    details: { totalOutstanding, reason, items: outstanding },
+  });
+
+  await refreshStationWorkOrders(plan.id).catch((error) =>
+    console.error('refreshStationWorkOrders (close outstanding) failed:', error)
+  );
+
+  return {
+    plan: await getPlanStationView(plan.id),
+    reconciliation: { totalOutstanding, reason, items: outstanding },
+  };
 }
 
 // ---------------------------------------------------------------------------

@@ -13,6 +13,10 @@ import {
 } from "../lib/r2.js";
 import { logActivity } from "../services/userActivityLogger.js";
 import { updateBatchLotSetNumber, type SetNumberEditResult } from "../lib/lotCode.js";
+import {
+  applyFinishedBatchApproval,
+  applyFinishedBatchRejection,
+} from "../services/productionBatchService.js";
 
 const router: Router = Router();
 router.use(requireAuth);
@@ -49,8 +53,8 @@ async function logSetNumberChange(
 router.get("/inspections", requirePermission("qa", "read"), async (req: Request, res: Response) => {
   try {
     const { result } = req.query;
-    // QA inspects received goods only — finished batches are never reviewed here.
-    const where: any = { inspectionType: "GRN" };
+    // QA reviews received goods and finished production batches.
+    const where: any = { inspectionType: { in: ["GRN", "FINISHED_BATCH"] } };
     if (result) where.result = result;
 
     const inspections = await prisma.inspectionRecord.findMany({
@@ -138,20 +142,33 @@ router.post("/inspections/:id/release", requirePermission("qa", "approve"), asyn
     }
 
     const { updated, codeChange } = await prisma.$transaction(async (tx) => {
+      const isFinishedBatch = inspection.inspectionType === "FINISHED_BATCH";
       const codeChange =
-        inspection.batchLot && inspection.inspectionType === "GRN"
+        inspection.batchLot
           ? await updateBatchLotSetNumber(tx, inspection.batchLot.id, setNumber)
           : null;
 
-      const updated = await tx.inspectionRecord.update({
-        where: { id: inspection.id },
-        data: { result: "PASSED", notes: notes ?? inspection.notes, inspectedById: req.user!.id, inspectedAt: new Date() },
-      });
-      if (inspection.batchLot) {
-        await tx.batchLot.update({
-          where: { id: inspection.batchLot.id },
-          data: { status: "ACTIVE" },
+      let updated;
+      if (isFinishedBatch && inspection.batchLot) {
+        await applyFinishedBatchApproval(tx, {
+          inspectionId: inspection.id,
+          batchLotId: inspection.batchLot.id,
+          userId: req.user!.id,
+          notes: notes ?? null,
+          lotCode: codeChange?.lotCode ?? inspection.batchLot.lotCode,
         });
+        updated = await tx.inspectionRecord.findUnique({ where: { id: inspection.id } });
+      } else {
+        updated = await tx.inspectionRecord.update({
+          where: { id: inspection.id },
+          data: { result: "PASSED", notes: notes ?? inspection.notes, inspectedById: req.user!.id, inspectedAt: new Date() },
+        });
+        if (inspection.batchLot) {
+          await tx.batchLot.update({
+            where: { id: inspection.batchLot.id },
+            data: { status: "ACTIVE" },
+          });
+        }
       }
 
       // If this is a GRN inspection, check if all inspections for this GRN are now PASSED
@@ -213,22 +230,35 @@ router.post("/inspections/:id/reject", requirePermission("qa", "approve"), async
     }
 
     const { updated, codeChange } = await prisma.$transaction(async (tx) => {
+      const isFinishedBatch = inspection.inspectionType === "FINISHED_BATCH";
       const codeChange =
-        inspection.batchLot && inspection.inspectionType === "GRN"
+        inspection.batchLot
           ? await updateBatchLotSetNumber(tx, inspection.batchLot.id, setNumber)
           : null;
 
-      const updated = await tx.inspectionRecord.update({
-        where: { id: inspection.id },
-        data: { result: "FAILED", notes: notes ?? inspection.notes, inspectedById: req.user!.id, inspectedAt: new Date() },
-      });
+      let updated;
+      if (isFinishedBatch && inspection.batchLot) {
+        await applyFinishedBatchRejection(tx, {
+          inspectionId: inspection.id,
+          batchLotId: inspection.batchLot.id,
+          userId: req.user!.id,
+          notes: notes ?? inspection.notes,
+        });
+        updated = await tx.inspectionRecord.findUnique({ where: { id: inspection.id } });
+      } else {
+        updated = await tx.inspectionRecord.update({
+          where: { id: inspection.id },
+          data: { result: "FAILED", notes: notes ?? inspection.notes, inspectedById: req.user!.id, inspectedAt: new Date() },
+        });
+        if (inspection.batchLot) {
+          await tx.batchLot.update({
+            where: { id: inspection.batchLot.id },
+            data: { status: "REJECTED" },
+          });
+        }
+      }
 
       if (inspection.batchLot) {
-        await tx.batchLot.update({
-          where: { id: inspection.batchLot.id },
-          data: { status: "REJECTED" },
-        });
-
         // Reverse the stock this batch put in (PO_RECEIPT / PROD_OUTPUT) via a WASTE entry.
         const incoming = await tx.inventoryTransaction.findMany({
           where: { batchLotId: inspection.batchLot.id, quantity: { gt: 0 } },
@@ -246,7 +276,7 @@ router.post("/inspections/:id/reject", requirePermission("qa", "approve"), async
             referenceType: "QA_REJECT",
             referenceId: inspection.id,
             createdById: req.user!.id,
-            notes: `Rejected lot ${inspection.batchLot.lotCode ?? inspection.batchLot.batchNumber} (${notes ?? "failed inspection"})`,
+            notes: `Rejected lot ${codeChange?.lotCode ?? inspection.batchLot.lotCode ?? inspection.batchLot.batchNumber} (${notes ?? "failed inspection"})`,
           });
         }
       }
@@ -313,9 +343,16 @@ router.patch(
 
       const { updated, codeChange } = await prisma.$transaction(async (tx) => {
         const codeChange =
-          inspection.batchLotId && inspection.inspectionType === "GRN"
+          inspection.batchLotId
             ? await updateBatchLotSetNumber(tx, inspection.batchLotId, setNumber)
             : null;
+
+        if (codeChange?.lotCode && inspection.batchLotId) {
+          await tx.productionStageRecord.updateMany({
+            where: { batchLotId: inspection.batchLotId },
+            data: { batchNumber: codeChange.lotCode },
+          });
+        }
 
         const updated = await tx.inspectionRecord.update({
           where: { id: inspection.id },

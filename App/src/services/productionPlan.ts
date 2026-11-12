@@ -1,6 +1,7 @@
 import { prisma } from "../lib/db.js";
 import { packWeightFrom, percentageIngredientPacks } from "../lib/uom.js";
 import { notifyStationWorkOrders, refreshStationWorkOrders } from "./productionStationService.js";
+import { provisionPlanBatches } from "./productionBatchService.js";
 import { logActivity } from "./userActivityLogger.js";
 
 export interface CreateProductionPlanInput {
@@ -226,6 +227,10 @@ export async function getProductionPlans(filters?: {
                 },
               },
             },
+            batchLot: {
+              select: { id: true, batchNumber: true, lotCode: true, setNumber: true, status: true },
+            },
+            batchApprovedBy: { select: { id: true, fullName: true } },
           },
           orderBy: { sequence: "asc" },
         },
@@ -267,6 +272,10 @@ export async function getProductionPlan(planId: string) {
                 finishedSku: { select: { id: true, sku: true, name: true } },
               },
             },
+            batchLot: {
+              select: { id: true, batchNumber: true, lotCode: true, setNumber: true, status: true },
+            },
+            batchApprovedBy: { select: { id: true, fullName: true } },
           },
           orderBy: { sequence: "asc" },
         },
@@ -663,6 +672,9 @@ export async function getPlanIngredientRequirements(planId: string) {
             },
             orderBy: { material: { name: "asc" } },
           },
+          batchLot: {
+            select: { id: true, batchNumber: true, lotCode: true, setNumber: true, status: true },
+          },
         },
         orderBy: { sequence: "asc" },
       },
@@ -730,6 +742,9 @@ export async function getPlanIngredientRequirements(planId: string) {
       yieldUnit: item.bom?.yieldUnit ?? "",
       targetQuantity: round(targetQuantity),
       batchCount: round(batchCount),
+      batchCode: item.batchLot?.lotCode ?? item.batchLot?.batchNumber ?? null,
+      batchStatus: item.batchLot?.status ?? null,
+      batchApprovedAt: item.batchApprovedAt ?? null,
       ingredients,
       totalWeightKg: round(
         ingredients.reduce((sum, line) => sum + Number(line.totalWeightKg ?? 0), 0)
@@ -943,6 +958,17 @@ export async function releasePlanIngredients(input: {
       );
     }
 
+    // Give every plan item its one authoritative production batch lot and the
+    // pending QA inspection. Stations only ever reference these lots.
+    try {
+      await provisionPlanBatches(tx, plan.id, scheduledFor);
+    } catch (error: any) {
+      throw new PlanReleaseError(
+        error?.message ?? "Failed to provision the production batch codes",
+        400
+      );
+    }
+
     await notifyStationWorkOrders({
       planId: plan.id,
       tx,
@@ -956,7 +982,7 @@ export async function releasePlanIngredients(input: {
       scheduledFor,
       releasedAt,
     };
-  });
+  }, { timeout: 15000, maxWait: 5000 });
 
   await logActivity({
     userId: input.releasedById,
@@ -967,18 +993,31 @@ export async function releasePlanIngredients(input: {
     entityId: outcome.planId,
   }).catch((error) => console.error("releasePlanIngredients audit log failed:", error));
 
-  const requirements = await getPlanIngredientRequirements(outcome.planId);
-  return {
-    ...outcome,
-    summary: {
+  // The release is already committed. A summary read failure must not turn a
+  // successful release into an error the user would retry (and get a 409).
+  let summary = {
+    productionOrder: outcome.planNumber,
+    productionDate: outcome.scheduledFor,
+    products: [] as string[],
+    totalBatches: 0,
+    ingredientCount: 0,
+    totalWeightKg: 0,
+  };
+  try {
+    const requirements = await getPlanIngredientRequirements(outcome.planId);
+    summary = {
       productionOrder: outcome.planNumber,
       productionDate: outcome.scheduledFor,
       products: requirements.formulas.map((formula) => formula.productName),
       totalBatches: requirements.totals.batches,
       ingredientCount: requirements.totals.ingredients,
       totalWeightKg: requirements.totals.totalWeightKg,
-    },
-  };
+    };
+  } catch (error) {
+    console.error("releasePlanIngredients summary failed:", error);
+  }
+
+  return { ...outcome, summary };
 }
 
 /**

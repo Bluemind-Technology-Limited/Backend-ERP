@@ -275,6 +275,8 @@ router.post(
       const {
         inputQuantity,
         achievedQuantity,
+        receivedQuantity,
+        batchesProcessed,
         remainderQuantity,
         remainders,
         inputs,
@@ -296,6 +298,10 @@ router.post(
         planItemId: req.params.itemId,
         inputQuantity: Number(inputQuantity),
         achievedQuantity: Number(achievedQuantity),
+        receivedQuantity:
+          receivedQuantity === undefined ? undefined : Number(receivedQuantity),
+        batchesProcessed:
+          batchesProcessed === undefined ? undefined : Number(batchesProcessed),
         remainderQuantity:
           remainderQuantity === undefined ? undefined : Number(remainderQuantity),
         remainders: Array.isArray(remainders)
@@ -347,6 +353,7 @@ router.post(
         achievedQuantity,
         remainderQuantity,
         carryoverUsedQuantity,
+        rejectedQuantity,
         warehouseId,
         batchNumber,
         expiryDate,
@@ -366,6 +373,8 @@ router.post(
           remainderQuantity === undefined ? undefined : Number(remainderQuantity),
         carryoverUsedQuantity:
           carryoverUsedQuantity === undefined ? undefined : Number(carryoverUsedQuantity),
+        rejectedQuantity:
+          rejectedQuantity === undefined ? undefined : Number(rejectedQuantity),
         warehouseId,
         batchNumber,
         expiryDate,
@@ -378,6 +387,32 @@ router.post(
     } catch (error: any) {
       console.error("POST /production-line/plans/:planId/items/:itemId/finishing error:", error);
       sendError(res, error, "Failed to record finished output");
+    }
+  }
+);
+
+/**
+ * POST /production-line/plans/:planId/close-outstanding
+ * Explicit reconciliation of unfinished production quantities.
+ */
+router.post(
+  "/plans/:planId/close-outstanding",
+  requirePermission("production", "update"),
+  async (req: Request, res: Response) => {
+    try {
+      const { reason } = req.body ?? {};
+      if (!reason || !String(reason).trim()) {
+        return res.status(400).json({ error: "reason is required" });
+      }
+      const result = await productionLineService.closePlanOutstanding({
+        planId: req.params.planId,
+        userId: req.user!.id,
+        reason: String(reason),
+      });
+      res.json({ message: "Outstanding production closed", ...result });
+    } catch (error: any) {
+      console.error("POST /production-line/plans/:planId/close-outstanding error:", error);
+      sendError(res, error, "Failed to close outstanding production");
     }
   }
 );

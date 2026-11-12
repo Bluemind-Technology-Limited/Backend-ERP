@@ -4,6 +4,7 @@ import { requirePermission } from "../middleware/rbac.js";
 import { prisma } from "../lib/db.js";
 import { handleApiError, validateRequired } from "../lib/errorHandler.js";
 import { buildPackLabel, normalizePackUnit, parsePackLabel } from "../lib/uom.js";
+import { logActivity } from "../services/userActivityLogger.js";
 import { MaterialType, RecordStatus } from "@prisma/client";
 
 const router: Router = Router();
@@ -36,8 +37,8 @@ function resolvePackInput(body: any) {
   }
 }
 
-/** Refuse pack changes once the material is referenced — the unit is a promise. */
-async function assertPackCanChange(materialId: string) {
+/** How much history a material has — drives the pack-change confirmation. */
+async function getMaterialUsage(materialId: string) {
   const [batches, ledger, poLines, bomLines, consignmentLines, requisitionLines] =
     await Promise.all([
       prisma.batchLot.count({ where: { materialId } }),
@@ -47,12 +48,16 @@ async function assertPackCanChange(materialId: string) {
       prisma.consignmentItem.count({ where: { materialId } }),
       prisma.requisitionItem.count({ where: { materialId } }),
     ]);
-  if (batches + ledger + poLines + bomLines + consignmentLines + requisitionLines > 0) {
-    throw Object.assign(
-      new Error("Pack size/unit cannot change once the material has batches, stock, BOM or purchasing history"),
-      { statusCode: 409 }
-    );
-  }
+
+  return {
+    batches,
+    ledger,
+    poLines,
+    bomLines,
+    consignmentLines,
+    requisitionLines,
+    total: batches + ledger + poLines + bomLines + consignmentLines + requisitionLines,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -343,7 +348,8 @@ router.post("/materials", requirePermission("master_data", "create"), async (req
 
 router.patch("/materials/:id", requirePermission("master_data", "update"), async (req: Request, res: Response) => {
   try {
-    const { name, type, category, unitOfMeasure, packSize, packUnit, barcode, defaultExpiryDate, shelfLifeDays, requiresLot, attachments, status, supplierIds, traceabilityCode } = req.body;
+    const { name, type, category, unitOfMeasure, packSize, packUnit, barcode, defaultExpiryDate, shelfLifeDays, requiresLot, attachments, status, supplierIds, traceabilityCode, forcePackChange } = req.body;
+    const forcedPackChange = forcePackChange === true || forcePackChange === "true";
     const shelfLife = shelfLifeDays === undefined
       ? undefined
       : shelfLifeDays === null || shelfLifeDays === ""
@@ -353,12 +359,19 @@ router.patch("/materials/:id", requirePermission("master_data", "update"), async
       return res.status(400).json({ error: "shelfLifeDays must be a positive number of days" });
     }
 
-    // Pack edits are only allowed before the material is used anywhere.
+    // Pack edits are allowed freely for unused materials. If the material has
+    // history, the client must explicitly confirm the change (forcePackChange),
+    // which is recorded in the audit trail.
     let packUpdate: { packSize: number; packUnit: string; unitOfMeasure: string } | null = null;
+    let packChangeAudit: {
+      oldLabel: string;
+      newLabel: string;
+      usage: Awaited<ReturnType<typeof getMaterialUsage>>;
+    } | null = null;
     if (packSize !== undefined || packUnit !== undefined || unitOfMeasure !== undefined) {
       const existing = await prisma.material.findUnique({
         where: { id: req.params.id },
-        select: { packSize: true, packUnit: true },
+        select: { packSize: true, packUnit: true, unitOfMeasure: true },
       });
       if (!existing) return res.status(404).json({ error: "Material not found" });
 
@@ -374,7 +387,40 @@ router.patch("/materials/:id", requirePermission("master_data", "update"), async
         const changed =
           Number(requested.packSize) !== Number(existing.packSize) ||
           normalizePackUnit(requested.packUnit) !== normalizePackUnit(existing.packUnit);
-        if (changed) await assertPackCanChange(req.params.id);
+
+        if (changed) {
+          const usage = await getMaterialUsage(req.params.id);
+          const requestedLabel = buildPackLabel(requested.packSize, requested.packUnit);
+
+          if (usage.total > 0 && !forcedPackChange) {
+            return res.status(409).json({
+              error:
+                "This material already has stock, batch, BOM or purchasing history. Confirm the pack change to save it.",
+              code: "PACK_CHANGE_REQUIRES_CONFIRMATION",
+              requiresConfirmation: true,
+              usage: usage.total,
+              currentPack: {
+                packSize: Number(existing.packSize),
+                packUnit: existing.packUnit,
+                unitOfMeasure: existing.unitOfMeasure,
+              },
+              requestedPack: {
+                packSize: requested.packSize,
+                packUnit: requested.packUnit,
+                unitOfMeasure: requestedLabel,
+              },
+            });
+          }
+
+          if (usage.total > 0) {
+            packChangeAudit = {
+              oldLabel: existing.unitOfMeasure,
+              newLabel: requestedLabel,
+              usage,
+            };
+          }
+        }
+
         packUpdate = {
           packSize: requested.packSize,
           packUnit: requested.packUnit,
@@ -412,9 +458,29 @@ router.patch("/materials/:id", requirePermission("master_data", "update"), async
           : {}),
       },
     });
+
+    if (packChangeAudit) {
+      await logActivity({
+        userId: req.user!.id,
+        activityType: "UPDATE",
+        module: "admin",
+        description: `Pack changed for ${material.name}: ${packChangeAudit.oldLabel} → ${packChangeAudit.newLabel} (confirmed despite existing history)`,
+        entityType: "Material",
+        entityId: material.id,
+        details: {
+          oldPack: packChangeAudit.oldLabel,
+          newPack: packChangeAudit.newLabel,
+          usage: packChangeAudit.usage,
+        },
+      });
+    }
+
     res.json({ material });
   } catch (error: any) {
     if (error?.statusCode) return res.status(error.statusCode).json({ error: error.message });
+    if (error?.code === "P2002") {
+      return res.status(409).json({ error: `SKU "${req.body.sku ?? ""}" already exists` });
+    }
     if (error?.message?.includes("Pack size") || error?.message?.includes("Unit must be")) {
       return res.status(400).json({ error: error.message });
     }

@@ -245,6 +245,8 @@ model User {
   bomUpdatedBy                 Bom[]                           @relation("bom_updated_by")
   productionPlans              ProductionPlan[]
   releasedPlans                ProductionPlan[]                @relation("plan_released_by")
+  closedPlanOutstanding        ProductionPlan[]                @relation("plan_outstanding_closer")
+  approvedPlanBatches          ProductionPlanItem[]            @relation("plan_batch_approver")
   consignmentsCreated          Consignment[]                   @relation("consignment_creator")
   consignmentsReceived         Consignment[]                   @relation("consignment_receiver")
   consignmentDistributions     ConsignmentDistribution[]
@@ -463,6 +465,8 @@ model BatchLot {
   inspections           InspectionRecord[]
   productionIngredients ProductionIngredient[]
   grindingInputs        ProductionGrindingInput[]
+  planItems             ProductionPlanItem[]       @relation("plan_item_batch")
+  stageRecords          ProductionStageRecord[]    @relation("stage_batch")
 
   @@unique([materialId, batchNumber])
   @@index([vendorCode])
@@ -954,12 +958,17 @@ model ProductionPlan {
   /// Ingredient release audit: who released the requirements and when.
   releasedById String?              @map("released_by_id")
   releasedAt   DateTime?            @map("released_at")
+  /// Explicit reconciliation of unfinished production quantities.
+  outstandingClosedAt   DateTime?  @map("outstanding_closed_at")
+  outstandingClosedById String?    @map("outstanding_closed_by_id")
+  outstandingCloseReason String?   @map("outstanding_close_reason")
   createdById  String               @map("created_by_id")
   createdAt    DateTime             @default(now()) @map("created_at")
   updatedAt    DateTime             @updatedAt @map("updated_at")
 
   createdBy             User                            @relation(fields: [createdById], references: [id])
   releasedBy            User?                           @relation("plan_released_by", fields: [releasedById], references: [id])
+  outstandingClosedBy   User?                           @relation("plan_outstanding_closer", fields: [outstandingClosedById], references: [id])
   items                 ProductionPlanItem[]
   aggregatedIngredients PlanAggregatedIngredient[]
   ingredientIssues      PlanIngredientIssue[]
@@ -981,15 +990,22 @@ model ProductionPlanItem {
   targetQuantity   Decimal  @map("target_quantity") @db.Decimal(15, 4)
   actualYield      Decimal? @map("actual_yield") @db.Decimal(15, 4)
   sequence         Int      @default(1) // Order in which products are produced
+  /// QA-approved production batch identity for this formula/batch.
+  batchLotId       String?  @map("batch_lot_id")
+  batchApprovedAt  DateTime? @map("batch_approved_at")
+  batchApprovedById String? @map("batch_approved_by_id")
 
   productionPlan          ProductionPlan           @relation(fields: [productionPlanId], references: [id], onDelete: Cascade)
   bom                     Bom                      @relation(fields: [bomId], references: [id])
+  batchLot                BatchLot?                @relation("plan_item_batch", fields: [batchLotId], references: [id])
+  batchApprovedBy         User?                    @relation("plan_batch_approver", fields: [batchApprovedById], references: [id])
   batchMachineAllocations BatchMachineAllocation[]
   stageRecords            ProductionStageRecord[]
   ingredientRequirements  PlanIngredientRequirement[]
 
   @@index([productionPlanId])
   @@index([bomId])
+  @@index([batchLotId])
   @@map("production_plan_items")
 }
 
@@ -1027,6 +1043,12 @@ model ProductionStageRecord {
   stage                 ProductionStage
   inputQuantity         Decimal               @map("input_quantity") @db.Decimal(15, 4)
   achievedQuantity      Decimal               @map("achieved_quantity") @db.Decimal(15, 4)
+  /// Actual quantity received from the previous station for this record.
+  receivedQuantity      Decimal               @default(0) @map("received_quantity") @db.Decimal(15, 4)
+  /// Number of formula batches processed in this record (grinding usually).
+  batchesProcessed      Decimal               @default(0) @map("batches_processed") @db.Decimal(15, 4)
+  /// Finished goods rejected/lost in this record (production station).
+  rejectedQuantity      Decimal               @default(0) @map("rejected_quantity") @db.Decimal(15, 4)
   remainderQuantity     Decimal               @default(0) @map("remainder_quantity") @db.Decimal(15, 4)
   carryoverUsedQuantity Decimal               @default(0) @map("carryover_used_quantity") @db.Decimal(15, 4)
   unitOfMeasure         String                @map("unit_of_measure")
@@ -1034,6 +1056,8 @@ model ProductionStageRecord {
   /// output value never changes when master-data costs are updated later.
   unitCost              Decimal?              @default(0) @map("unit_cost") @db.Decimal(15, 4)
   batchNumber           String?               @map("batch_number")
+  /// QA-approved production batch identity this stage belongs to.
+  batchLotId            String?               @map("batch_lot_id")
   /// Serial grinding batch number (global counter, assigned by the station).
   grindingBatchNumber   Int?                  @unique @map("grinding_batch_number")
   machineId             String?               @map("machine_id")
@@ -1050,6 +1074,7 @@ model ProductionStageRecord {
 
   productionPlan ProductionPlan             @relation(fields: [productionPlanId], references: [id], onDelete: Cascade)
   planItem       ProductionPlanItem         @relation(fields: [planItemId], references: [id], onDelete: Cascade)
+  batchLot       BatchLot?                  @relation("stage_batch", fields: [batchLotId], references: [id])
   remainders     ProductionStageRemainder[]
   grindingInputs ProductionGrindingInput[]
 

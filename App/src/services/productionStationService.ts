@@ -91,6 +91,7 @@ async function loadPlanFlow(planId: string, db: any = prisma): Promise<PlanFlow>
               },
             },
           },
+          batchLot: { select: { id: true, lotCode: true, batchNumber: true } },
           stageRecords: true,
         },
         orderBy: { sequence: 'asc' },
@@ -309,6 +310,7 @@ export async function notifyStationWorkOrders(input: {
       items: {
         include: {
           bom: { include: { finishedSku: { select: { name: true } } } },
+          batchLot: { select: { lotCode: true, batchNumber: true } },
         },
         orderBy: { sequence: 'asc' },
       },
@@ -323,6 +325,11 @@ export async function notifyStationWorkOrders(input: {
       .map((item: any) => item.bom?.finishedSku?.name ?? item.bom?.productName)
       .filter(Boolean)
       .join(', ') || 'No products';
+  const batchCodes =
+    plan.items
+      .map((item: any) => item.batchLot?.lotCode ?? item.batchLot?.batchNumber)
+      .filter(Boolean)
+      .join(', ') || 'Pending QA';
 
   for (const order of orders) {
     const station = order.station as StationCode;
@@ -339,6 +346,7 @@ export async function notifyStationWorkOrders(input: {
       `Production order ${plan.planNumber}`,
       `Date ${dateLabel}`,
       `Products: ${products}`,
+      `Batch codes: ${batchCodes}`,
       `Expected: ${expected} ${order.unitOfMeasure}`,
       input.action ?? STATION_ACTIONS[station],
     ].join(' · ');
@@ -439,8 +447,8 @@ export async function syncWorkInProgress(planId: string) {
       stationWorkOrderId: orderByStation.get('GRINDING')?.id ?? null,
       productionDate: last.productionDate ?? productionDate,
       productName: item.bom?.finishedSku?.name ?? item.bom?.productName ?? null,
-      batchNumber: last.batchNumber ?? (last.grindingBatchNumber ? String(last.grindingBatchNumber) : null),
-      batchLotId: null,
+      batchNumber: item.batchLot?.lotCode ?? item.batchLot?.batchNumber ?? last.batchNumber ?? (last.grindingBatchNumber ? String(last.grindingBatchNumber) : null),
+      batchLotId: item.batchLotId ?? null,
       materialId: item.bom?.finishedSku?.id ?? null,
       originStation: 'GRINDING',
       destinationStation: 'PRODUCTION',
@@ -467,8 +475,8 @@ export async function syncWorkInProgress(planId: string) {
       stationWorkOrderId: orderByStation.get('PRODUCTION')?.id ?? null,
       productionDate: last.productionDate ?? productionDate,
       productName: item.bom?.finishedSku?.name ?? item.bom?.productName ?? null,
-      batchNumber: last.batchNumber ?? null,
-      batchLotId: last.finishedBatchLotId ?? null,
+      batchNumber: item.batchLot?.lotCode ?? item.batchLot?.batchNumber ?? last.batchNumber ?? null,
+      batchLotId: item.batchLotId ?? last.finishedBatchLotId ?? null,
       materialId: item.bom?.finishedSku?.id ?? null,
       originStation: 'PRODUCTION',
       destinationStation: null,

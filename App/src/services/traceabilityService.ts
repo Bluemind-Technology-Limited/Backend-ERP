@@ -557,6 +557,20 @@ export async function buildTraceTree(batchId: string) {
 
   const downstream = await buildDownstream(batch.id);
 
+  // Quality approval that authorised this batch code (inbound or production).
+  const qaInspection = await prisma.inspectionRecord.findFirst({
+    where: { batchLotId: batch.id },
+    orderBy: { createdAt: 'desc' },
+    select: {
+      id: true,
+      inspectionType: true,
+      result: true,
+      notes: true,
+      inspectedAt: true,
+      inspector: { select: { fullName: true } },
+    },
+  });
+
   return {
     batch: {
       id: batch.id,
@@ -574,6 +588,16 @@ export async function buildTraceTree(batchId: string) {
         : inbound
           ? 'INBOUND'
           : 'UNKNOWN',
+    qaApproval: qaInspection
+      ? {
+          inspectionId: qaInspection.id,
+          inspectionType: qaInspection.inspectionType,
+          result: qaInspection.result,
+          notes: qaInspection.notes,
+          inspectedAt: qaInspection.inspectedAt,
+          inspectedBy: qaInspection.inspector?.fullName ?? null,
+        }
+      : null,
     inbound,
     producedBy,
     stages,
