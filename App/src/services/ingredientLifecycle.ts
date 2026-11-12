@@ -218,7 +218,7 @@ export async function completeProductionAndProcessWaste(data: {
     where: { id: data.productionOrderId },
     include: {
       productionIngredients: { include: { material: true, batchLot: true } },
-      bom: true,
+      bom: { include: { finishedSku: { select: { unitOfMeasure: true } } } },
     },
   });
 
@@ -269,7 +269,7 @@ export async function completeProductionAndProcessWaste(data: {
           batchLotId: order.finishedBatchId,
           warehouseId: data.warehouseId,
           quantity: Number(order.actualYield),
-          unitOfMeasure: order.bom.yieldUnit || 'units',
+          unitOfMeasure: order.bom.finishedSku?.unitOfMeasure || order.bom.yieldUnit || 'units',
           referenceType: 'PRODUCTION_ORDER',
           referenceId: order.id,
           createdById: data.completedById,

@@ -3,10 +3,57 @@ import { requireAuth } from "../middleware/auth.js";
 import { requirePermission } from "../middleware/rbac.js";
 import { prisma } from "../lib/db.js";
 import { handleApiError, validateRequired } from "../lib/errorHandler.js";
+import { buildPackLabel, normalizePackUnit, parsePackLabel } from "../lib/uom.js";
 import { MaterialType, RecordStatus } from "@prisma/client";
 
 const router: Router = Router();
 router.use(requireAuth);
+
+/**
+ * Resolve the pack definition from a request body.
+ *
+ * Preferred: `packSize` + `packUnit` (25 + KG). Legacy `unitOfMeasure` inputs
+ * are accepted when they look like a rendered label ("25 KG") or a plain unit
+ * ("kg", treated as 1 × KG).
+ */
+function resolvePackInput(body: any) {
+  const hasPack = body?.packSize !== undefined || body?.packUnit !== undefined;
+  if (hasPack) {
+    const packSize = Number(body.packSize ?? 1);
+    if (!Number.isFinite(packSize) || packSize <= 0) {
+      throw new Error("Pack size must be greater than zero");
+    }
+    return { packSize, packUnit: normalizePackUnit(body.packUnit ?? "KG") };
+  }
+
+  const parsed = parsePackLabel(body?.unitOfMeasure);
+  if (parsed) return parsed;
+
+  try {
+    return { packSize: 1, packUnit: normalizePackUnit(body?.unitOfMeasure ?? "KG") };
+  } catch {
+    return { packSize: 1, packUnit: "KG" as const };
+  }
+}
+
+/** Refuse pack changes once the material is referenced — the unit is a promise. */
+async function assertPackCanChange(materialId: string) {
+  const [batches, ledger, poLines, bomLines, consignmentLines, requisitionLines] =
+    await Promise.all([
+      prisma.batchLot.count({ where: { materialId } }),
+      prisma.inventoryTransaction.count({ where: { materialId } }),
+      prisma.purchaseOrderItem.count({ where: { materialId } }),
+      prisma.bomIngredient.count({ where: { materialId } }),
+      prisma.consignmentItem.count({ where: { materialId } }),
+      prisma.requisitionItem.count({ where: { materialId } }),
+    ]);
+  if (batches + ledger + poLines + bomLines + consignmentLines + requisitionLines > 0) {
+    throw Object.assign(
+      new Error("Pack size/unit cannot change once the material has batches, stock, BOM or purchasing history"),
+      { statusCode: 409 }
+    );
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Warehouses
@@ -247,10 +294,12 @@ router.get("/materials", requirePermission("master_data", "read"), async (req: R
 
 router.post("/materials", requirePermission("master_data", "create"), async (req: Request, res: Response) => {
   try {
-    const { name, sku, type, category, unitOfMeasure, barcode, defaultExpiryDate, shelfLifeDays, requiresLot, attachments, supplierIds, traceabilityCode } = req.body;
-    if (!name || !type || !unitOfMeasure) {
-      return res.status(400).json({ error: "name, type and unitOfMeasure are required" });
+    const { name, sku, type, category, unitOfMeasure, packSize, packUnit, barcode, defaultExpiryDate, shelfLifeDays, requiresLot, attachments, supplierIds, traceabilityCode } = req.body;
+    if (!name || !type) {
+      return res.status(400).json({ error: "name and type are required" });
     }
+    const pack = resolvePackInput(req.body);
+    const unitLabel = buildPackLabel(pack.packSize, pack.packUnit);
     const shelfLife = shelfLifeDays === undefined || shelfLifeDays === null || shelfLifeDays === "" ? null : Number(shelfLifeDays);
     if (shelfLife !== null && (!Number.isFinite(shelfLife) || shelfLife <= 0)) {
       return res.status(400).json({ error: "shelfLifeDays must be a positive number of days" });
@@ -267,7 +316,9 @@ router.post("/materials", requirePermission("master_data", "create"), async (req
         sku: finalSku,
         type,
         category: category ?? null,
-        unitOfMeasure,
+        unitOfMeasure: unitLabel,
+        packSize: pack.packSize,
+        packUnit: pack.packUnit,
         barcode: barcode ?? null,
         defaultExpiryDate: expiry,
         shelfLifeDays: shelfLife,
@@ -282,6 +333,9 @@ router.post("/materials", requirePermission("master_data", "create"), async (req
     res.status(201).json({ material });
   } catch (error: any) {
     if (error?.code === "P2002") return res.status(409).json({ error: `SKU "${req.body.sku}" already exists` });
+    if (error?.message?.includes("Pack size") || error?.message?.includes("Unit must be")) {
+      return res.status(400).json({ error: error.message });
+    }
     console.error("POST /master-data/materials error:", error);
     res.status(500).json({ error: "Database error" });
   }
@@ -289,7 +343,7 @@ router.post("/materials", requirePermission("master_data", "create"), async (req
 
 router.patch("/materials/:id", requirePermission("master_data", "update"), async (req: Request, res: Response) => {
   try {
-    const { name, type, category, unitOfMeasure, barcode, defaultExpiryDate, shelfLifeDays, requiresLot, attachments, status, supplierIds, traceabilityCode } = req.body;
+    const { name, type, category, unitOfMeasure, packSize, packUnit, barcode, defaultExpiryDate, shelfLifeDays, requiresLot, attachments, status, supplierIds, traceabilityCode } = req.body;
     const shelfLife = shelfLifeDays === undefined
       ? undefined
       : shelfLifeDays === null || shelfLifeDays === ""
@@ -298,13 +352,44 @@ router.patch("/materials/:id", requirePermission("master_data", "update"), async
     if (shelfLife !== undefined && shelfLife !== null && (!Number.isFinite(shelfLife) || shelfLife <= 0)) {
       return res.status(400).json({ error: "shelfLifeDays must be a positive number of days" });
     }
+
+    // Pack edits are only allowed before the material is used anywhere.
+    let packUpdate: { packSize: number; packUnit: string; unitOfMeasure: string } | null = null;
+    if (packSize !== undefined || packUnit !== undefined || unitOfMeasure !== undefined) {
+      const existing = await prisma.material.findUnique({
+        where: { id: req.params.id },
+        select: { packSize: true, packUnit: true },
+      });
+      if (!existing) return res.status(404).json({ error: "Material not found" });
+
+      const requested =
+        packSize !== undefined || packUnit !== undefined
+          ? resolvePackInput({
+              packSize: packSize ?? existing.packSize,
+              packUnit: packUnit ?? existing.packUnit,
+            })
+          : parsePackLabel(unitOfMeasure);
+
+      if (requested) {
+        const changed =
+          Number(requested.packSize) !== Number(existing.packSize) ||
+          normalizePackUnit(requested.packUnit) !== normalizePackUnit(existing.packUnit);
+        if (changed) await assertPackCanChange(req.params.id);
+        packUpdate = {
+          packSize: requested.packSize,
+          packUnit: requested.packUnit,
+          unitOfMeasure: buildPackLabel(requested.packSize, requested.packUnit),
+        };
+      }
+    }
+
     const material = await prisma.material.update({
       where: { id: req.params.id },
       data: {
         name,
         type,
         category,
-        unitOfMeasure,
+        ...(packUpdate ?? {}),
         barcode,
         shelfLifeDays: shelfLife,
         defaultExpiryDate:
@@ -328,7 +413,11 @@ router.patch("/materials/:id", requirePermission("master_data", "update"), async
       },
     });
     res.json({ material });
-  } catch (error) {
+  } catch (error: any) {
+    if (error?.statusCode) return res.status(error.statusCode).json({ error: error.message });
+    if (error?.message?.includes("Pack size") || error?.message?.includes("Unit must be")) {
+      return res.status(400).json({ error: error.message });
+    }
     console.error("PATCH /master-data/materials/:id error:", error);
     res.status(500).json({ error: "Database error" });
   }

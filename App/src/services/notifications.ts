@@ -1,5 +1,6 @@
 import { prisma } from "../lib/db.js";
 import { getStock } from "../lib/ledger.js";
+import { formatPackQuantity } from "../lib/uom.js";
 
 /**
  * Scan for expiry dates, low stock, and pending approvals,
@@ -34,7 +35,7 @@ export async function generateNotifications() {
     alerts.push({
       type: "LOW_STOCK",
       title: `${s.materialName} is out of stock`,
-      body: `${s.sku} · ${s.warehouseName} · on hand ${Number(s.quantity)} ${s.unitOfMeasure}`,
+      body: `${s.sku} · ${s.warehouseName} · on hand ${formatPackQuantity(s.quantity, s.unitOfMeasure)}`,
     });
   }
 
@@ -135,7 +136,7 @@ export async function checkMinimumQuantities() {
           data: {
             userId: user.id,
             title: `Low Stock Alert: ${material.materialName}`,
-            body: `${material.materialName} (${material.sku}) is at ${material.quantity} ${material.unitOfMeasure} — below minimum of ${material.minQuantity} ${material.unitOfMeasure}. Variance: -${variance} ${material.unitOfMeasure}`,
+            body: `${material.materialName} (${material.sku}) is at ${formatPackQuantity(material.quantity, material.unitOfMeasure)} — below minimum of ${formatPackQuantity(material.minQuantity, material.unitOfMeasure)}. Variance: ${formatPackQuantity(-variance, material.unitOfMeasure)}`,
             type: "LOW_STOCK",
             notificationType: "LOW_STOCK_ALERT",
             referenceId: material.materialId,

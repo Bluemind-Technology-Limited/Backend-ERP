@@ -1,5 +1,7 @@
 import { prisma } from "../lib/db.js";
-import { notifyStations } from "./productionLineService.js";
+import { packWeightFrom, percentageIngredientPacks } from "../lib/uom.js";
+import { notifyStationWorkOrders, refreshStationWorkOrders } from "./productionStationService.js";
+import { logActivity } from "./userActivityLogger.js";
 
 export interface CreateProductionPlanInput {
   description?: string;
@@ -92,19 +94,94 @@ export async function createProductionPlan(input: CreateProductionPlanInput) {
     if (items.length > 0) {
       await aggregateIngredientsForPlan(plan.id);
 
-      // Ingredient, grinding and production stations are told work is planned.
-      await notifyStations({
-        planId: plan.id,
-        planNumber: plan.planNumber,
-        title: `New production plan ${plan.planNumber}`,
-        body: `${items.length} product(s) planned. Ingredient station: issue the ingredients.`,
-      }).catch((error) => console.error("notifyStations (plan) failed:", error));
+      // Work orders exist as soon as the plan has requirements; stations are
+      // notified when the plan is actually released.
+      await refreshStationWorkOrders(plan.id).catch((error) =>
+        console.error("refreshStationWorkOrders (plan) failed:", error)
+      );
     }
 
     console.log(`✓ Created production plan: ${plan.planNumber} (${items.length} product(s))`);
     return plan;
   } catch (error) {
     console.error("createProductionPlan error:", error);
+    throw error;
+  }
+}
+
+/**
+ * Edit a DRAFT production plan: description/date and the full set of batch
+ * formulations (each keeps its own target quantity and identity).
+ */
+export async function updateProductionPlan(
+  planId: string,
+  data: {
+    description?: string | null;
+    scheduledFor?: Date | null;
+    items: Array<{ bomId: string; targetQuantity: number }>;
+  }
+) {
+  try {
+    const plan = await prisma.productionPlan.findUnique({
+      where: { id: planId },
+      select: { id: true, status: true },
+    });
+    if (!plan) throw new Error(`Production plan not found: ${planId}`);
+    if (plan.status !== "DRAFT") {
+      throw new Error(
+        `Only DRAFT production plans can be edited. Current status: ${plan.status}`
+      );
+    }
+
+    const items = data.items ?? [];
+    if (items.length === 0) throw new Error("Select at least one batch formulation");
+    if (items.some((item) => !item.bomId || !(Number(item.targetQuantity) > 0))) {
+      throw new Error("Every batch formulation needs a positive target quantity");
+    }
+
+    const bomIds = items.map((item) => item.bomId);
+    if (new Set(bomIds).size !== bomIds.length) {
+      throw new Error("Each batch formulation can only be added once");
+    }
+
+    const boms = await prisma.bom.findMany({
+      where: { id: { in: bomIds } },
+      select: { id: true, productName: true, status: true },
+    });
+    if (boms.length !== bomIds.length) {
+      throw new Error("One or more batch formulations were not found");
+    }
+    const notReady = boms.find((b) => b.status !== "ACTIVE" && b.status !== "APPROVED");
+    if (notReady) {
+      throw new Error(
+        `"${notReady.productName}" is ${notReady.status}. Approve the batch formulation before planning it.`
+      );
+    }
+
+    await prisma.$transaction(async (tx) => {
+      await tx.productionPlanItem.deleteMany({ where: { productionPlanId: planId } });
+      await tx.productionPlan.update({
+        where: { id: planId },
+        data: {
+          ...(data.description !== undefined ? { description: data.description } : {}),
+          ...(data.scheduledFor !== undefined
+            ? { scheduledFor: data.scheduledFor ? new Date(data.scheduledFor) : null }
+            : {}),
+          items: {
+            create: items.map((item, index) => ({
+              bomId: item.bomId,
+              targetQuantity: Number(item.targetQuantity),
+              sequence: index + 1,
+            })),
+          },
+        },
+      });
+    });
+
+    await aggregateIngredientsForPlan(planId);
+    return getProductionPlan(planId);
+  } catch (error) {
+    console.error("updateProductionPlan error:", error);
     throw error;
   }
 }
@@ -139,7 +216,14 @@ export async function getProductionPlans(filters?: {
               select: {
                 id: true,
                 productName: true,
+                yieldUnit: true,
+                expectedYield: true,
                 finishedSku: { select: { id: true, sku: true, name: true } },
+                ingredients: {
+                  include: {
+                    material: { select: { id: true, name: true, sku: true, unitOfMeasure: true } },
+                  },
+                },
               },
             },
           },
@@ -151,6 +235,7 @@ export async function getProductionPlans(filters?: {
           },
         },
         createdBy: { select: { id: true, fullName: true } },
+        releasedBy: { select: { id: true, fullName: true } },
       },
       orderBy: { createdAt: "desc" },
     });
@@ -192,6 +277,7 @@ export async function getProductionPlan(planId: string) {
           orderBy: { material: { name: "asc" } },
         },
         createdBy: { select: { id: true, fullName: true, email: true } },
+        releasedBy: { select: { id: true, fullName: true, email: true } },
       },
     });
 
@@ -216,6 +302,9 @@ export async function addFormulationToPlan(
   targetQuantity: number,
   sequence?: number
 ) {
+  if (!Number.isFinite(Number(targetQuantity)) || Number(targetQuantity) <= 0) {
+    throw new Error('Target quantity must be greater than zero');
+  }
   try {
     const plan = await prisma.productionPlan.findUnique({
       where: { id: planId },
@@ -324,21 +413,36 @@ export async function removeFormulationFromPlan(planId: string, itemId: string) 
  * Sums up all ingredients from all BOMs in the plan, considering target quantities.
  * Stores result in plan_aggregated_ingredients for easy viewing.
  */
-export async function aggregateIngredientsForPlan(planId: string) {
+export async function aggregateIngredientsForPlan(planId: string, tx?: any) {
+  const db = tx ?? prisma;
   try {
-    const plan = await prisma.productionPlan.findUnique({
+    const plan = await db.productionPlan.findUnique({
       where: { id: planId },
       include: {
         items: {
           include: {
             bom: {
               include: {
+                finishedSku: {
+                  select: { id: true, packSize: true, packUnit: true, unitOfMeasure: true },
+                },
                 ingredients: {
-                  include: { material: { select: { id: true, unitOfMeasure: true } } },
+                  include: {
+                    material: {
+                      select: {
+                        id: true,
+                        name: true,
+                        packSize: true,
+                        packUnit: true,
+                        unitOfMeasure: true,
+                      },
+                    },
+                  },
                 },
               },
             },
           },
+          orderBy: { sequence: "asc" },
         },
       },
     });
@@ -347,66 +451,343 @@ export async function aggregateIngredientsForPlan(planId: string) {
       throw new Error(`Production plan not found: ${planId}`);
     }
 
-    // Delete existing aggregated ingredients
-    await prisma.planAggregatedIngredient.deleteMany({
-      where: { productionPlanId: planId },
-    });
+    // One snapshot row per formula × ingredient: the exact per-batch quantity,
+    // the batch multiplier and the resulting total requirement.
+    const requirementRows: Array<{
+      productionPlanId: string;
+      planItemId: string;
+      bomId: string;
+      materialId: string;
+      quantityPerBatch: number;
+      perBatchRequired: number;
+      batchCount: number;
+      totalRequired: number;
+      unitOfMeasure: string;
+      isPercentage: boolean;
+    }> = [];
 
-    // Calculate aggregated ingredients
+    for (const item of plan.items) {
+      for (const line of computeFormulaRequirements(item)) {
+        requirementRows.push({
+          productionPlanId: planId,
+          planItemId: item.id,
+          bomId: item.bomId,
+          ...line,
+        });
+      }
+    }
+
+    // Consolidated requirements are the sum of the formula-level rows, so the
+    // Ingredient Station can never be given a total that disagrees with them.
     const ingredientMap = new Map<
       string,
       { quantity: number; unitOfMeasure: string; itemCount: number }
     >();
-
-    for (const item of plan.items) {
-      const scale = Number(item.targetQuantity) / Number(item.bom.expectedYield ?? 1);
-
-      for (const ingredient of item.bom.ingredients) {
-        const key = ingredient.materialId;
-        const projectedQty = ingredient.isPercentage
-          ? (Number(ingredient.quantity) / 100) * scale * Number(item.bom.expectedYield ?? 1)
-          : Number(ingredient.quantity) * scale;
-
-        if (ingredientMap.has(key)) {
-          const existing = ingredientMap.get(key)!;
-          existing.quantity += projectedQty;
-          existing.itemCount += 1;
-        } else {
-          ingredientMap.set(key, {
-            quantity: projectedQty,
-            unitOfMeasure: ingredient.unitOfMeasure,
-            itemCount: 1,
-          });
-        }
+    for (const row of requirementRows) {
+      const existing = ingredientMap.get(row.materialId);
+      if (existing) {
+        existing.quantity += row.totalRequired;
+        existing.itemCount += 1;
+      } else {
+        ingredientMap.set(row.materialId, {
+          quantity: row.totalRequired,
+          unitOfMeasure: row.unitOfMeasure,
+          itemCount: 1,
+        });
       }
     }
 
-    // Create aggregated ingredient records
     const aggregatedData: any[] = [];
     for (const [materialId, data] of ingredientMap.entries()) {
       aggregatedData.push({
         id: `agg-${planId}-${materialId}`,
         productionPlanId: planId,
         materialId,
-        totalQuantity: data.quantity,
+        totalQuantity: Number(data.quantity.toFixed(4)),
         unitOfMeasure: data.unitOfMeasure,
         status: "PENDING",
       });
     }
 
-    if (aggregatedData.length > 0) {
-      await prisma.planAggregatedIngredient.createMany({
-        data: aggregatedData,
-        skipDuplicates: true,
-      });
+    const writeSnapshot = async (client: any) => {
+      await client.planIngredientRequirement.deleteMany({ where: { productionPlanId: planId } });
+      await client.planAggregatedIngredient.deleteMany({ where: { productionPlanId: planId } });
+
+      if (requirementRows.length > 0) {
+        await client.planIngredientRequirement.createMany({
+          data: requirementRows,
+          skipDuplicates: true,
+        });
+      }
+      if (aggregatedData.length > 0) {
+        await client.planAggregatedIngredient.createMany({
+          data: aggregatedData,
+          skipDuplicates: true,
+        });
+      }
+    };
+
+    // Join the caller's transaction when one is provided (release), otherwise
+    // commit the snapshot on its own (create/edit).
+    if (tx) {
+      await writeSnapshot(tx);
+    } else {
+      await prisma.$transaction(writeSnapshot);
     }
 
-    console.log(`✓ Aggregated ${aggregatedData.length} ingredients for production plan`);
+    console.log(
+      `✓ Aggregated ${aggregatedData.length} ingredients from ${requirementRows.length} formula requirement line(s)`
+    );
     return aggregatedData;
   } catch (error) {
     console.error("aggregateIngredientsForPlan error:", error);
     throw error;
   }
+}
+
+interface FormulaRequirementLine {
+  materialId: string;
+  quantityPerBatch: number;
+  perBatchRequired: number;
+  batchCount: number;
+  totalRequired: number;
+  unitOfMeasure: string;
+  isPercentage: boolean;
+}
+
+/**
+ * Expand one plan item's approved batch formula into per-ingredient requirement
+ * lines: `per batch × batches = total required`.
+ */
+function computeFormulaRequirements(item: any): FormulaRequirementLine[] {
+  const productName = item.bom?.productName ?? "Batch formula";
+  const expectedYield = Number(item.bom?.expectedYield ?? 0);
+  const targetQuantity = Number(item.targetQuantity ?? 0);
+
+  if (!(expectedYield > 0)) {
+    throw new Error(
+      `"${productName}" has no batch yield. Set the expected yield on the approved batch formula.`
+    );
+  }
+  if (!(targetQuantity > 0)) {
+    throw new Error(`"${productName}" needs a positive planned quantity.`);
+  }
+
+  const batchCount = targetQuantity / expectedYield;
+  const lines: FormulaRequirementLine[] = [];
+
+  for (const ingredient of item.bom?.ingredients ?? []) {
+    let perBatchRequired: number;
+    let totalRequired: number;
+
+    if (ingredient.isPercentage) {
+      const total = percentageIngredientPacks(
+        ingredient.quantity,
+        targetQuantity,
+        item.bom.finishedSku,
+        ingredient.material
+      );
+      if (total === null) {
+        throw new Error(
+          `Cannot calculate ${ingredient.material?.name ?? "ingredient"}: percentage ingredients need a weight per pack on both the finished product and the ingredient`
+        );
+      }
+      totalRequired = total;
+      perBatchRequired = total / batchCount;
+    } else {
+      perBatchRequired = Number(ingredient.quantity);
+      totalRequired = perBatchRequired * batchCount;
+    }
+
+    if (!Number.isFinite(perBatchRequired) || !Number.isFinite(totalRequired)) {
+      throw new Error(
+        `Cannot calculate ${ingredient.material?.name ?? "ingredient"} for "${productName}"`
+      );
+    }
+
+    lines.push({
+      materialId: ingredient.materialId,
+      quantityPerBatch: Number(ingredient.quantity),
+      perBatchRequired: Number(perBatchRequired.toFixed(4)),
+      batchCount: Number(batchCount.toFixed(4)),
+      totalRequired: Number(totalRequired.toFixed(4)),
+      unitOfMeasure: ingredient.unitOfMeasure || ingredient.material?.unitOfMeasure || "",
+      isPercentage: Boolean(ingredient.isPercentage),
+    });
+  }
+
+  return lines;
+}
+
+/**
+ * Full requirement calculation for the UI, formula by formula plus the
+ * consolidated list that feeds the Ingredient Station work order.
+ */
+export async function getPlanIngredientRequirements(planId: string) {
+  const plan = await prisma.productionPlan.findUnique({
+    where: { id: planId },
+    include: {
+      items: {
+        include: {
+          bom: {
+            include: {
+              finishedSku: { select: { id: true, name: true, sku: true, unitOfMeasure: true } },
+              ingredients: {
+                include: {
+                  material: {
+                    select: {
+                      id: true,
+                      name: true,
+                      sku: true,
+                      packSize: true,
+                      packUnit: true,
+                      unitOfMeasure: true,
+                    },
+                  },
+                },
+              },
+            },
+          },
+          ingredientRequirements: {
+            include: {
+              material: {
+                select: {
+                  id: true,
+                  name: true,
+                  sku: true,
+                  packSize: true,
+                  packUnit: true,
+                  unitOfMeasure: true,
+                },
+              },
+            },
+            orderBy: { material: { name: "asc" } },
+          },
+        },
+        orderBy: { sequence: "asc" },
+      },
+    },
+  });
+
+  if (!plan) throw new Error(`Production plan not found: ${planId}`);
+
+  const round = (value: number) => Number(Number(value ?? 0).toFixed(4));
+
+  const formulas = plan.items.map((item: any) => {
+    const expectedYield = Number(item.bom?.expectedYield ?? 0);
+    const targetQuantity = Number(item.targetQuantity ?? 0);
+
+    // Prefer the persisted snapshot; fall back to deriving it for plans that
+    // predate this feature (read-only, never rewrites the consolidated cache).
+    const persisted: any[] = item.ingredientRequirements ?? [];
+    const batchCount =
+      expectedYield > 0 ? targetQuantity / expectedYield : Number(persisted[0]?.batchCount ?? 0);
+    const rows = persisted.length
+      ? persisted.map((row: any) => ({
+          materialId: row.materialId,
+          name: row.material?.name ?? "Ingredient",
+          sku: row.material?.sku ?? "—",
+          unitOfMeasure: row.unitOfMeasure,
+          quantityPerBatch: Number(row.quantityPerBatch),
+          perBatchRequired: Number(row.perBatchRequired),
+          batchCount: Number(row.batchCount),
+          totalRequired: Number(row.totalRequired),
+          isPercentage: row.isPercentage,
+          packWeightKg: packWeightFrom(row.material),
+        }))
+      : computeFormulaRequirements(item).map((row) => {
+          const ingredient = item.bom?.ingredients?.find(
+            (line: any) => line.materialId === row.materialId
+          );
+          return {
+            materialId: row.materialId,
+            name: ingredient?.material?.name ?? "Ingredient",
+            sku: ingredient?.material?.sku ?? "—",
+            unitOfMeasure: row.unitOfMeasure,
+            quantityPerBatch: row.quantityPerBatch,
+            perBatchRequired: row.perBatchRequired,
+            batchCount: row.batchCount,
+            totalRequired: row.totalRequired,
+            isPercentage: row.isPercentage,
+            packWeightKg: packWeightFrom(ingredient?.material),
+          };
+        });
+
+    const ingredients = rows.map((row) => ({
+      ...row,
+      perBatchWeightKg:
+        row.packWeightKg === null ? null : round(row.perBatchRequired * row.packWeightKg),
+      totalWeightKg: row.packWeightKg === null ? null : round(row.totalRequired * row.packWeightKg),
+    }));
+
+    return {
+      planItemId: item.id,
+      sequence: item.sequence,
+      bomId: item.bomId,
+      productName: item.bom?.finishedSku?.name ?? item.bom?.productName ?? "Product",
+      sku: item.bom?.finishedSku?.sku ?? "—",
+      expectedYield: round(expectedYield),
+      yieldUnit: item.bom?.yieldUnit ?? "",
+      targetQuantity: round(targetQuantity),
+      batchCount: round(batchCount),
+      ingredients,
+      totalWeightKg: round(
+        ingredients.reduce((sum, line) => sum + Number(line.totalWeightKg ?? 0), 0)
+      ),
+    };
+  });
+
+  const consolidatedMap = new Map<string, any>();
+  for (const formula of formulas) {
+    for (const line of formula.ingredients) {
+      const existing = consolidatedMap.get(line.materialId);
+      const source = {
+        planItemId: formula.planItemId,
+        bomId: formula.bomId,
+        productName: formula.productName,
+        totalRequired: line.totalRequired,
+        unitOfMeasure: line.unitOfMeasure,
+      };
+      if (existing) {
+        existing.totalRequired = round(existing.totalRequired + line.totalRequired);
+        existing.totalWeightKg = round(Number(existing.totalWeightKg ?? 0) + Number(line.totalWeightKg ?? 0));
+        existing.sources.push(source);
+      } else {
+        consolidatedMap.set(line.materialId, {
+          materialId: line.materialId,
+          name: line.name,
+          sku: line.sku,
+          unitOfMeasure: line.unitOfMeasure,
+          totalRequired: line.totalRequired,
+          packWeightKg: line.packWeightKg,
+          totalWeightKg: line.totalWeightKg,
+          sources: [source],
+        });
+      }
+    }
+  }
+
+  const consolidated = [...consolidatedMap.values()].sort((a, b) =>
+    String(a.name).localeCompare(String(b.name))
+  );
+
+  return {
+    plan: {
+      id: plan.id,
+      planNumber: plan.planNumber,
+      status: plan.status,
+      description: plan.description,
+      scheduledFor: plan.scheduledFor,
+    },
+    formulas,
+    consolidated,
+    totals: {
+      formulas: formulas.length,
+      batches: round(formulas.reduce((sum, formula) => sum + formula.batchCount, 0)),
+      ingredients: consolidated.length,
+      totalWeightKg: round(consolidated.reduce((sum, line) => sum + Number(line.totalWeightKg ?? 0), 0)),
+    },
+  };
 }
 
 /**
@@ -437,46 +818,180 @@ export async function getPlanAggregatedIngredients(planId: string): Promise<Aggr
 }
 
 /**
- * Schedule production plan (DRAFT → SCHEDULED).
+ * Release error with an HTTP status so the route can answer 404/409/400
+ * precisely (especially for a duplicate release).
  */
-export async function scheduleProductionPlan(planId: string, scheduledFor: Date) {
-  try {
-    const plan = await prisma.productionPlan.findUnique({
-      where: { id: planId },
-      select: { id: true, status: true, items: { select: { id: true } } },
+export class PlanReleaseError extends Error {
+  statusCode: number;
+
+  constructor(message: string, statusCode = 400) {
+    super(message);
+    this.name = "PlanReleaseError";
+    this.statusCode = statusCode;
+  }
+}
+
+/**
+ * Centralized ingredient release.
+ *
+ * One transaction performs the whole release: validate the approved formulas,
+ * atomically claim DRAFT → SCHEDULED, generate the requirement snapshot, create
+ * the three station work orders and send the station notifications. Any failure
+ * rolls everything back, and a repeated call is rejected because the claim only
+ * matches a DRAFT plan.
+ */
+export async function releasePlanIngredients(input: {
+  planId: string;
+  releasedById: string;
+  scheduledFor?: Date | null;
+}) {
+  const releasedAt = new Date();
+
+  const outcome = await prisma.$transaction(async (tx) => {
+    const plan = await tx.productionPlan.findUnique({
+      where: { id: input.planId },
+      select: {
+        id: true,
+        planNumber: true,
+        status: true,
+        scheduledFor: true,
+        items: { select: { id: true, bomId: true } },
+      },
     });
 
-    if (!plan) {
-      throw new Error(`Production plan not found: ${planId}`);
-    }
+    if (!plan) throw new PlanReleaseError("Production plan not found", 404);
 
     if (plan.status !== "DRAFT") {
-      throw new Error(
-        `Cannot schedule production plan with status ${plan.status}. Only DRAFT plans can be scheduled.`
+      throw new PlanReleaseError(
+        plan.status === "SCHEDULED"
+          ? "Ingredients for this production order have already been released"
+          : `Only draft production orders can release ingredients (current: ${plan.status})`,
+        409
       );
     }
 
     if (plan.items.length === 0) {
-      throw new Error("Cannot schedule empty production plan. Add at least one formulation.");
+      throw new PlanReleaseError(
+        "Add at least one batch formula before releasing ingredients",
+        400
+      );
     }
 
-    const updated = await prisma.productionPlan.update({
-      where: { id: planId },
-      data: {
-        status: "SCHEDULED",
-        scheduledFor: new Date(scheduledFor),
-      },
-      include: {
-        items: { include: { bom: { select: { productName: true } } } },
+    // Every formula must still be approved, carry a batch yield and have
+    // ingredients before any requirement snapshot is written.
+    const boms = await tx.bom.findMany({
+      where: { id: { in: plan.items.map((item) => item.bomId) } },
+      select: {
+        id: true,
+        productName: true,
+        status: true,
+        expectedYield: true,
+        _count: { select: { ingredients: true } },
       },
     });
+    const notReady = boms.find(
+      (bom) =>
+        (bom.status !== "ACTIVE" && bom.status !== "APPROVED") ||
+        !(Number(bom.expectedYield) > 0) ||
+        bom._count.ingredients === 0
+    );
+    if (notReady) {
+      const reason =
+        notReady.status !== "ACTIVE" && notReady.status !== "APPROVED"
+          ? `is ${notReady.status}`
+          : !(Number(notReady.expectedYield) > 0)
+            ? "has no batch yield"
+            : "has no ingredients";
+      throw new PlanReleaseError(
+        `Cannot release ingredients: "${notReady.productName}" ${reason}. Approved batch formulas with a yield are required.`,
+        400
+      );
+    }
 
-    console.log(`✓ Scheduled production plan with ${updated.items.length} formulations`);
-    return updated;
-  } catch (error) {
-    console.error("scheduleProductionPlan error:", error);
-    throw error;
-  }
+    const scheduledFor = input.scheduledFor
+      ? new Date(input.scheduledFor)
+      : plan.scheduledFor ?? new Date();
+
+    // Atomic claim: concurrent or repeated releases can only match DRAFT once.
+    const claim = await tx.productionPlan.updateMany({
+      where: { id: plan.id, status: "DRAFT" },
+      data: {
+        status: "SCHEDULED",
+        scheduledFor,
+        releasedById: input.releasedById,
+        releasedAt,
+      },
+    });
+    if (claim.count === 0) {
+      throw new PlanReleaseError(
+        "Ingredients for this production order have already been released",
+        409
+      );
+    }
+
+    // Generate the formula-level snapshot and consolidated cache inside the
+    // same transaction, then create work orders + notifications.
+    await aggregateIngredientsForPlan(plan.id, tx);
+
+    const requirementCount = await tx.planIngredientRequirement.count({
+      where: { productionPlanId: plan.id },
+    });
+    if (requirementCount === 0) {
+      throw new PlanReleaseError(
+        "Cannot release ingredients: no requirements could be calculated from the approved batch formulas",
+        400
+      );
+    }
+
+    await notifyStationWorkOrders({
+      planId: plan.id,
+      tx,
+      action:
+        "The ingredients for this production order have been released. Receive the requirements and start your station.",
+    });
+
+    return {
+      planId: plan.id,
+      planNumber: plan.planNumber,
+      scheduledFor,
+      releasedAt,
+    };
+  });
+
+  await logActivity({
+    userId: input.releasedById,
+    activityType: "APPROVE",
+    module: "production",
+    description: `Released ingredients for plan ${outcome.planNumber}`,
+    entityType: "ProductionPlan",
+    entityId: outcome.planId,
+  }).catch((error) => console.error("releasePlanIngredients audit log failed:", error));
+
+  const requirements = await getPlanIngredientRequirements(outcome.planId);
+  return {
+    ...outcome,
+    summary: {
+      productionOrder: outcome.planNumber,
+      productionDate: outcome.scheduledFor,
+      products: requirements.formulas.map((formula) => formula.productName),
+      totalBatches: requirements.totals.batches,
+      ingredientCount: requirements.totals.ingredients,
+      totalWeightKg: requirements.totals.totalWeightKg,
+    },
+  };
+}
+
+/**
+ * Legacy schedule endpoint — now routed through the centralized release so there
+ * is only one release path in the system.
+ */
+export async function scheduleProductionPlan(
+  planId: string,
+  scheduledFor: Date,
+  releasedById: string
+) {
+  await releasePlanIngredients({ planId, releasedById, scheduledFor });
+  return getProductionPlan(planId);
 }
 
 /**

@@ -361,7 +361,6 @@ router.post("/", requirePermission("procurement", "create"), async (req: Request
         const {
           materialId,
           quantity,
-          unitOfMeasure,
           batchNumber,
           expiryDate,
           manufacturingDate,
@@ -370,8 +369,8 @@ router.post("/", requirePermission("procurement", "create"), async (req: Request
           supplierBatchNumber,
           unitCost,
         } = it;
-        if (!materialId || !quantity || !unitOfMeasure || !warehouseId) {
-          throw new Error("Each item needs materialId, quantity, unitOfMeasure and warehouseId");
+        if (!materialId || !warehouseId || !Number.isFinite(Number(quantity)) || Number(quantity) <= 0) {
+          throw new Error("Each item needs materialId, a positive quantity and warehouseId");
         }
 
         // 0. Lot code (SOP KIB/QCA/010). The set number is the incoming sequence
@@ -382,6 +381,7 @@ router.post("/", requirePermission("procurement", "create"), async (req: Request
           select: {
             traceabilityCode: true,
             type: true,
+            unitOfMeasure: true,
             suppliers: { include: { supplier: { select: { id: true, name: true, vendorCode: true } } } },
           },
         });
@@ -425,8 +425,9 @@ router.post("/", requirePermission("procurement", "create"), async (req: Request
         const ingredientCode = material?.traceabilityCode ?? null;
         const lotCode = buildLotCode({ vendorCode, ingredientCode, setNumber: resolvedSetNumber, yearCode });
 
-        // The batch number is assigned by QA on inspection. Until then the lot
-        // carries the SOP lot code, or a provisional receipt-scoped reference.
+        // The receiving batch number follows the lot code. QA can correct the
+        // set number during inspection; until then the lot carries the SOP lot
+        // code, or a provisional receipt-scoped reference.
         const resolvedBatchNumber =
           lotCode ?? (String(batchNumber ?? "").trim() || `PENDING-${number}-${lineIndex}`);
 
@@ -460,7 +461,7 @@ router.post("/", requirePermission("procurement", "create"), async (req: Request
             materialId,
             batchLotId: batchLot.id,
             quantity,
-            unitOfMeasure,
+            unitOfMeasure: material.unitOfMeasure,
             unitCost: resolvedUnitCost,
           },
         });
@@ -472,7 +473,7 @@ router.post("/", requirePermission("procurement", "create"), async (req: Request
           batchLotId: batchLot.id,
           warehouseId,
           quantity: Number(quantity),
-          unitOfMeasure,
+          unitOfMeasure: material.unitOfMeasure,
           referenceType: "GRN",
           referenceId: receipt.id,
           createdById: req.user!.id,
@@ -614,7 +615,6 @@ router.post("/consignment", requirePermission("procurement", "create"), async (r
         const {
           consignmentItemId,
           quantity,
-          unitOfMeasure,
           batchNumber,
           warehouseId,
           expiryDate,
@@ -622,8 +622,8 @@ router.post("/consignment", requirePermission("procurement", "create"), async (r
           setNumber,
           supplierBatchNumber,
         } = it;
-        if (!consignmentItemId || !quantity || !unitOfMeasure || !warehouseId) {
-          throw new Error("Each item needs consignmentItemId, quantity, unitOfMeasure and warehouseId");
+        if (!consignmentItemId || !warehouseId || !Number.isFinite(Number(quantity)) || Number(quantity) <= 0) {
+          throw new Error("Each item needs consignmentItemId, a positive quantity and warehouseId");
         }
 
         // Get the consignment item to find the material
@@ -661,8 +661,9 @@ router.post("/consignment", requirePermission("procurement", "create"), async (r
         }
 
         const lotCode = buildLotCode({ vendorCode, ingredientCode, setNumber: resolvedSetNumber, yearCode });
-        // Batch number is assigned by QA on inspection; until then the lot code
-        // (or a provisional reference) identifies the lot.
+        // The receiving batch number follows the lot code. QA can correct the
+        // set number during inspection; otherwise the lot code (or a provisional
+        // reference) identifies the lot.
         const resolvedBatchNumber =
           lotCode ?? (String(batchNumber ?? "").trim() || `PENDING-${number}-${consignmentItem.id.slice(0, 6)}`);
 
@@ -694,7 +695,7 @@ router.post("/consignment", requirePermission("procurement", "create"), async (r
             materialId,
             batchLotId: batchLot.id,
             quantity,
-            unitOfMeasure,
+            unitOfMeasure: consignmentItem.unitOfMeasure,
             unitCost: Number(consignmentItem.poItem?.unitCost ?? 0),
           },
         });
@@ -707,7 +708,7 @@ router.post("/consignment", requirePermission("procurement", "create"), async (r
           warehouseId,
           consignmentItemId: consignmentItem.id,
           quantity: Number(quantity),
-          unitOfMeasure,
+          unitOfMeasure: consignmentItem.unitOfMeasure,
           referenceType: "GRN",
           referenceId: receipt.id,
           createdById: req.user!.id,

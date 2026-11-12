@@ -2,6 +2,7 @@ import { Router, type Request, type Response } from "express";
 import { requireAuth } from "../middleware/auth.js";
 import { requirePermission } from "../middleware/rbac.js";
 import { prisma } from "../lib/db.js";
+import { percentageIngredientPacks } from "../lib/uom.js";
 import { postLedgerEntry } from "../lib/ledger.js";
 import { LedgerEventType, ProductionOrderStatus } from "@prisma/client";
 import {
@@ -17,12 +18,16 @@ import {
 } from "../services/batchFormulation.js";
 import {
   createProductionPlan,
+  updateProductionPlan,
   getProductionPlans,
   getProductionPlan,
   addFormulationToPlan,
   removeFormulationFromPlan,
   aggregateIngredientsForPlan,
   getPlanAggregatedIngredients,
+  getPlanIngredientRequirements,
+  releasePlanIngredients,
+  PlanReleaseError,
   scheduleProductionPlan,
   startProductionPlan,
   completeProductionPlan,
@@ -117,7 +122,6 @@ router.post(
         ingredients: ingredients.map((ing: any) => ({
           materialId: ing.materialId,
           quantity: Number(ing.quantity),
-          unitOfMeasure: ing.unitOfMeasure,
           isPercentage: ing.isPercentage ?? false,
         })),
         createdById: req.user!.id,
@@ -188,17 +192,16 @@ router.post(
   requirePermission("production", "update"),
   async (req: Request, res: Response) => {
     try {
-      const { materialId, quantity, unitOfMeasure, isPercentage } = req.body;
+      const { materialId, quantity, isPercentage } = req.body;
 
-      if (!materialId || quantity === undefined || !unitOfMeasure) {
-        return res.status(400).json({ error: "materialId, quantity, and unitOfMeasure are required" });
+      if (!materialId || quantity === undefined) {
+        return res.status(400).json({ error: "materialId and quantity are required" });
       }
 
       const ingredient = await addIngredient(
         req.params.id,
         materialId,
         Number(quantity),
-        unitOfMeasure,
         isPercentage ?? false
       );
 
@@ -386,6 +389,41 @@ router.post(
 );
 
 /**
+ * PATCH /production-plans/:id — edit a DRAFT plan and its batch formulas.
+ */
+router.patch(
+  "/production-plans/:id",
+  requirePermission("production", "update"),
+  async (req: Request, res: Response) => {
+    try {
+      const { description, scheduledFor, items } = req.body;
+      const plan = await updateProductionPlan(req.params.id, {
+        description,
+        scheduledFor:
+          scheduledFor === undefined
+            ? undefined
+            : scheduledFor
+              ? new Date(scheduledFor)
+              : null,
+        items: Array.isArray(items)
+          ? items.map((it: any) => ({
+              bomId: String(it.bomId),
+              targetQuantity: Number(it.targetQuantity),
+            }))
+          : [],
+      });
+      res.json({ productionPlan: plan });
+    } catch (error: any) {
+      if (error?.message) {
+        return res.status(400).json({ error: error.message });
+      }
+      console.error("PATCH /production/production-plans/:id error:", error);
+      res.status(500).json({ error: "Database error" });
+    }
+  }
+);
+
+/**
  * GET /production-plans/:id — Get single production plan with all details
  */
 router.get(
@@ -415,8 +453,8 @@ router.post(
     try {
       const { bomId, targetQuantity, sequence } = req.body;
 
-      if (!bomId || targetQuantity === undefined) {
-        return res.status(400).json({ error: "bomId and targetQuantity are required" });
+      if (!bomId || !(Number(targetQuantity) > 0)) {
+        return res.status(400).json({ error: "bomId and a positive targetQuantity are required" });
       }
 
       const item = await addFormulationToPlan(
@@ -428,7 +466,13 @@ router.post(
 
       res.status(201).json({ item, message: "Formulation added to production plan" });
     } catch (error: any) {
-      if (error?.message?.includes("not found") || error?.message?.includes("Cannot modify")) {
+      if (
+        error?.message?.includes("not found") ||
+        error?.message?.includes("Cannot modify") ||
+        error?.message?.includes("greater than zero") ||
+        error?.message?.includes("percentage ingredients need") ||
+        error?.message?.includes("Cannot calculate")
+      ) {
         return res.status(400).json({ error: error.message });
       }
       console.error("POST /production/production-plans/:id/formulations error:", error);
@@ -458,6 +502,28 @@ router.delete(
 );
 
 /**
+ * GET /production-plans/:id/ingredient-requirements
+ * Formula-level calculation: per-batch quantity × batches = total required,
+ * plus the consolidated requirement that feeds the Ingredient Station.
+ */
+router.get(
+  "/production-plans/:id/ingredient-requirements",
+  requirePermission("production", "read"),
+  async (req: Request, res: Response) => {
+    try {
+      const requirements = await getPlanIngredientRequirements(req.params.id);
+      res.json(requirements);
+    } catch (error: any) {
+      console.error("GET /production/production-plans/:id/ingredient-requirements error:", error);
+      if (error?.message?.includes("not found")) {
+        return res.status(404).json({ error: error.message });
+      }
+      res.status(400).json({ error: error?.message || "Failed to calculate requirements" });
+    }
+  }
+);
+
+/**
  * GET /production-plans/:id/aggregated-ingredients — Get aggregated ingredients for plan
  */
 router.get(
@@ -475,7 +541,38 @@ router.get(
 );
 
 /**
- * POST /production-plans/:id/schedule — Schedule production plan (DRAFT → SCHEDULED)
+ * POST /production-plans/:id/release-ingredients
+ * The single, centralized ingredient release action. Confirmation summary is
+ * fetched by the client from the ingredient-requirements endpoint.
+ */
+router.post(
+  "/production-plans/:id/release-ingredients",
+  requirePermission("production", "update"),
+  async (req: Request, res: Response) => {
+    try {
+      const { scheduledFor } = req.body ?? {};
+      const result = await releasePlanIngredients({
+        planId: req.params.id,
+        releasedById: req.user!.id,
+        scheduledFor: scheduledFor ? new Date(scheduledFor) : undefined,
+      });
+      res.status(201).json({
+        message: `Ingredients released for ${result.planNumber}`,
+        ...result,
+      });
+    } catch (error: any) {
+      if (error instanceof PlanReleaseError || error?.statusCode) {
+        return res.status(error.statusCode ?? 400).json({ error: error.message });
+      }
+      console.error("POST /production/production-plans/:id/release-ingredients error:", error);
+      res.status(500).json({ error: error?.message || "Failed to release ingredients" });
+    }
+  }
+);
+
+/**
+ * POST /production-plans/:id/schedule — Legacy alias for the centralized
+ * release action, kept so existing clients share the same transaction-safe path.
  */
 router.post(
   "/production-plans/:id/schedule",
@@ -488,11 +585,18 @@ router.post(
         return res.status(400).json({ error: "scheduledFor date is required" });
       }
 
-      const plan = await scheduleProductionPlan(req.params.id, new Date(scheduledFor));
-      res.json({ productionPlan: plan, message: "Production plan scheduled" });
+      const plan = await scheduleProductionPlan(
+        req.params.id,
+        new Date(scheduledFor),
+        req.user!.id
+      );
+      res.json({ productionPlan: plan, message: "Ingredients released" });
     } catch (error: any) {
-      if (error?.message?.includes("not found") || error?.message?.includes("Cannot schedule")) {
-        return res.status(400).json({ error: error.message });
+      if (error instanceof PlanReleaseError || error?.statusCode) {
+        return res.status(error.statusCode ?? 400).json({ error: error.message });
+      }
+      if (error?.message?.includes("not found")) {
+        return res.status(404).json({ error: error.message });
       }
       console.error("POST /production/production-plans/:id/schedule error:", error);
       res.status(500).json({ error: error?.message || "Database error" });
@@ -597,7 +701,9 @@ router.get("/shifts", requirePermission("production", "read"), async (_req: Requ
 });
 
 // ---------------------------------------------------------------------------
-// Production Orders (wizard: BOM -> Schedule -> Machine/Shift)
+// Production Orders (wizard: BOM -> Schedule)
+// Machine and shift are intentionally out of the active planning workflow. The
+// nullable columns remain for future ERP integration.
 // ---------------------------------------------------------------------------
 
 router.get("/production-orders", requirePermission("production", "read"), async (req: Request, res: Response) => {
@@ -607,7 +713,6 @@ router.get("/production-orders", requirePermission("production", "read"), async 
       where: status ? { status: status as ProductionOrderStatus } : {},
       include: {
         bom: { include: { finishedSku: { select: { name: true, sku: true } } } },
-        shift: { select: { name: true } },
         createdBy: { select: { fullName: true } },
         finishedBatch: { select: { batchNumber: true, status: true } },
         ingredientsReleasedBy: { select: { fullName: true } },
@@ -640,23 +745,11 @@ router.get("/production-orders", requirePermission("production", "read"), async 
       planByOrder.set(a.productionOrderId, a.planItem?.productionPlan?.planNumber ?? null);
     }
 
-    // ProductionOrder stores `machineId` without a Prisma relation, so hydrate the
-    // machines explicitly to keep the `machine` shape the UI expects.
-    const machineIds = [
-      ...new Set(orders.map((o) => o.machineId).filter((id): id is string => Boolean(id))),
-    ];
-    const machines = machineIds.length
-      ? await prisma.machine.findMany({
-          where: { id: { in: machineIds } },
-          select: { id: true, name: true, code: true },
-        })
-      : [];
-    const machineById = new Map(machines.map((machine) => [machine.id, machine]));
-
+    // ProductionOrder stores `machineId` without a Prisma relation. Machine and
+    // shift are not part of the active planning response anymore.
     res.json({
       productionOrders: orders.map((o) => ({
         ...o,
-        machine: o.machineId ? machineById.get(o.machineId) ?? null : null,
         planLinked: planByOrder.has(o.id),
         planNumber: planByOrder.get(o.id) ?? null,
       })),
@@ -669,13 +762,28 @@ router.get("/production-orders", requirePermission("production", "read"), async 
 
 router.post("/production-orders", requirePermission("production", "create"), async (req: Request, res: Response) => {
   try {
-    const { bomId, targetQuantity, scheduledStart, machineId, shiftId } = req.body;
-    if (!bomId || !targetQuantity) {
-      return res.status(400).json({ error: "bomId and targetQuantity are required" });
+    const { bomId, targetQuantity, scheduledStart } = req.body;
+    if (!bomId || !(Number(targetQuantity) > 0)) {
+      return res.status(400).json({ error: "bomId and a positive targetQuantity are required" });
     }
     const bom = await prisma.bom.findUnique({
       where: { id: bomId },
-      include: { ingredients: true },
+      include: {
+        finishedSku: { select: { packSize: true, packUnit: true, unitOfMeasure: true } },
+        ingredients: {
+          include: {
+            material: {
+              select: {
+                id: true,
+                name: true,
+                packSize: true,
+                packUnit: true,
+                unitOfMeasure: true,
+              },
+            },
+          },
+        },
+      },
     });
     if (!bom) return res.status(404).json({ error: "Batch formulation not found" });
     if (bom.status !== "ACTIVE") {
@@ -692,8 +800,6 @@ router.post("/production-orders", requirePermission("production", "create"), asy
           targetQuantity: Number(targetQuantity),
           status: "SCHEDULED",
           scheduledStart: scheduledStart ? new Date(scheduledStart) : null,
-          machineId: machineId ?? null,
-          shiftId: shiftId ?? null,
           createdById: req.user!.id,
         },
         include: { bom: true },
@@ -701,10 +807,22 @@ router.post("/production-orders", requirePermission("production", "create"), asy
 
       // Pre-populate ingredients list
       for (const ing of bom.ingredients) {
-        const scale = Number(targetQuantity) / Number(bom.expectedYield ?? 1);
+        const expectedYield = Number(bom.expectedYield);
+        const scale = Number(targetQuantity) / (expectedYield > 0 ? expectedYield : 1);
         const projectedQty = ing.isPercentage
-          ? (Number(ing.quantity) / 100) * scale * Number(bom.expectedYield ?? 1)
+          ? percentageIngredientPacks(
+              ing.quantity,
+              targetQuantity,
+              bom.finishedSku,
+              ing.material
+            )
           : Number(ing.quantity) * scale;
+
+        if (projectedQty === null || !Number.isFinite(projectedQty)) {
+          throw new Error(
+            `Cannot calculate ${ing.material.name}: percentage ingredients need a weight per pack on both the finished product and the ingredient`
+          );
+        }
 
         await tx.productionIngredient.create({
           data: {
@@ -719,7 +837,10 @@ router.post("/production-orders", requirePermission("production", "create"), asy
     });
 
     res.status(201).json({ productionOrder });
-  } catch (error) {
+  } catch (error: any) {
+    if (error?.message?.includes("percentage ingredients need") || error?.message?.includes("Cannot calculate")) {
+      return res.status(400).json({ error: error.message });
+    }
     console.error("POST /production/production-orders error:", error);
     res.status(500).json({ error: "Database error" });
   }
@@ -733,7 +854,7 @@ router.post("/production-orders", requirePermission("production", "create"), asy
  */
 router.post("/production-orders/batch", requirePermission("production", "create"), async (req: Request, res: Response) => {
   try {
-    const { orders, scheduledStart, machineId, shiftId } = req.body;
+    const { orders, scheduledStart } = req.body;
 
     if (!Array.isArray(orders) || orders.length === 0) {
       return res.status(400).json({ error: "Select at least one product to produce" });
@@ -750,7 +871,22 @@ router.post("/production-orders/batch", requirePermission("production", "create"
 
     const boms = await prisma.bom.findMany({
       where: { id: { in: bomIds } },
-      include: { ingredients: true },
+      include: {
+        finishedSku: { select: { packSize: true, packUnit: true, unitOfMeasure: true } },
+        ingredients: {
+          include: {
+            material: {
+              select: {
+                id: true,
+                name: true,
+                packSize: true,
+                packUnit: true,
+                unitOfMeasure: true,
+              },
+            },
+          },
+        },
+      },
     });
     if (boms.length !== bomIds.length) {
       return res.status(404).json({ error: "One or more batch formulations were not found" });
@@ -778,18 +914,28 @@ router.post("/production-orders/batch", requirePermission("production", "create"
             targetQuantity,
             status: "SCHEDULED",
             scheduledStart: scheduledStart ? new Date(scheduledStart) : null,
-            machineId: machineId ?? null,
-            shiftId: shiftId ?? null,
             createdById: req.user!.id,
           },
           include: { bom: true },
         });
 
         for (const ing of bom.ingredients) {
-          const scale = targetQuantity / Number(bom.expectedYield ?? 1);
+          const expectedYield = Number(bom.expectedYield);
+          const scale = targetQuantity / (expectedYield > 0 ? expectedYield : 1);
           const projectedQty = ing.isPercentage
-            ? (Number(ing.quantity) / 100) * scale * Number(bom.expectedYield ?? 1)
+            ? percentageIngredientPacks(
+                ing.quantity,
+                targetQuantity,
+                bom.finishedSku,
+                ing.material
+              )
             : Number(ing.quantity) * scale;
+
+          if (projectedQty === null || !Number.isFinite(projectedQty)) {
+            throw new Error(
+              `Cannot calculate ${ing.material.name}: percentage ingredients need a weight per pack on both the finished product and the ingredient`
+            );
+          }
 
           await tx.productionIngredient.create({
             data: {
@@ -807,6 +953,9 @@ router.post("/production-orders/batch", requirePermission("production", "create"
 
     res.status(201).json({ productionOrders: created });
   } catch (error: any) {
+    if (error?.message?.includes("percentage ingredients need") || error?.message?.includes("Cannot calculate")) {
+      return res.status(400).json({ error: error.message });
+    }
     console.error("POST /production/production-orders/batch error:", error);
     res.status(500).json({ error: error?.message || "Database error" });
   }
@@ -1040,6 +1189,10 @@ router.post("/production-orders/:id/complete", requirePermission("production", "
 
     const finishedSkuId = order.bom.finishedSkuId;
     const yieldQty = Number(actualYield);
+    const finishedSku = await prisma.material.findUnique({
+      where: { id: finishedSkuId! },
+      select: { unitOfMeasure: true },
+    });
 
     const targetQty = Number(order.targetQuantity);
     const errorPercentage = targetQty > 0 ? (Math.abs(yieldQty - targetQty) / targetQty) * 100 : 0;
@@ -1067,7 +1220,7 @@ router.post("/production-orders/:id/complete", requirePermission("production", "
         batchLotId: batchLot.id,
         warehouseId,
         quantity: yieldQty,
-        unitOfMeasure: order.bom.yieldUnit || "kg",
+        unitOfMeasure: finishedSku?.unitOfMeasure ?? order.bom.yieldUnit ?? "kg",
         referenceType: "PROD_ORDER",
         referenceId: order.id,
         createdById: req.user!.id,
@@ -1116,12 +1269,18 @@ router.post("/production-orders/:id/complete", requirePermission("production", "
  */
 router.post("/waste", requirePermission("production", "update"), async (req: Request, res: Response) => {
   try {
-    const { materialId, warehouseId, quantity, unitOfMeasure, batchLotId, notes } = req.body;
-    if (!materialId || !warehouseId || !quantity || !unitOfMeasure) {
-      return res.status(400).json({ error: "materialId, warehouseId, quantity and unitOfMeasure are required" });
+    const { materialId, warehouseId, quantity, batchLotId, notes } = req.body;
+    if (!materialId || !warehouseId || !quantity) {
+      return res.status(400).json({ error: "materialId, warehouseId and quantity are required" });
     }
     const qty = Number(quantity);
     if (!qty || qty <= 0) return res.status(400).json({ error: "quantity must be a positive number" });
+
+    const material = await prisma.material.findUnique({
+      where: { id: materialId },
+      select: { unitOfMeasure: true },
+    });
+    if (!material) return res.status(404).json({ error: "Material not found" });
 
     await postLedgerEntry(prisma, {
       eventType: LedgerEventType.WASTE,
@@ -1129,13 +1288,13 @@ router.post("/waste", requirePermission("production", "update"), async (req: Req
       warehouseId,
       batchLotId: batchLotId ?? null,
       quantity: -qty,
-      unitOfMeasure,
+      unitOfMeasure: material.unitOfMeasure,
       referenceType: "PRODUCTION_WASTE",
       createdById: req.user!.id,
       notes: notes ?? "Production waste",
     });
 
-    res.json({ ok: true, message: `Waste of ${qty} ${unitOfMeasure} recorded` });
+    res.json({ ok: true, message: `Waste of ${qty} ${material.unitOfMeasure} recorded` });
   } catch (error: any) {
     console.error("POST /production/waste error:", error);
     res.status(500).json({ error: error?.message || "Database error" });

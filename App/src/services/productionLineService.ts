@@ -17,6 +17,7 @@ import { prisma } from '../lib/db.js';
 import { LedgerEventType } from '@prisma/client';
 import { postLedgerEntry } from '../lib/ledger.js';
 import { logActivity } from './userActivityLogger.js';
+import { notifyStationWorkOrders, refreshStationWorkOrders, syncWorkInProgress, STATION_LABELS, STATION_ORDER } from './productionStationService.js';
 
 const ISSUABLE_PLAN_STATUSES = ['SCHEDULED', 'IN_PROGRESS'];
 const ACTIVE_PLAN_STATUSES = ['SCHEDULED', 'IN_PROGRESS', 'COMPLETED'];
@@ -209,6 +210,7 @@ function enrichItems(plan: any, carryover?: Map<string, number>) {
 }
 
 function serializePlan(plan: any, carryover?: Map<string, number>) {
+  const orders: any[] = plan.stationWorkOrders ?? [];
   return {
     id: plan.id,
     planNumber: plan.planNumber,
@@ -220,6 +222,23 @@ function serializePlan(plan: any, carryover?: Map<string, number>) {
     createdBy: plan.createdBy ?? null,
     items: enrichItems(plan, carryover),
     aggregatedIngredients: plan.aggregatedIngredients ?? [],
+    stationWorkOrders: STATION_ORDER.map((station) => {
+      const order = orders.find((row) => row.station === station);
+      const expected = Number(order?.expectedQuantity ?? 0);
+      const processed = Number(order?.processedQuantity ?? 0);
+      return {
+        station,
+        label: STATION_LABELS[station],
+        status: order?.status ?? 'PENDING',
+        expectedQuantity: expected,
+        receivedQuantity: Number(order?.receivedQuantity ?? 0),
+        processedQuantity: processed,
+        transferredQuantity: Number(order?.transferredQuantity ?? 0),
+        outstandingQuantity: Number(order?.outstandingQuantity ?? 0),
+        variance: Number((processed - expected).toFixed(4)),
+        unitOfMeasure: order?.unitOfMeasure ?? 'kg',
+      };
+    }),
     progress: summarize(plan),
   };
 }
@@ -241,6 +260,7 @@ const PLAN_INCLUDE = {
     include: { material: { select: { id: true, name: true, sku: true, unitOfMeasure: true } } },
     orderBy: { materialId: 'asc' as const },
   },
+  stationWorkOrders: true,
 } as const;
 
 // ---------------------------------------------------------------------------
@@ -255,6 +275,16 @@ export async function getProductionLinePlans(filters?: { status?: string }) {
     include: PLAN_INCLUDE,
     orderBy: { scheduledFor: 'desc' },
   });
+
+  // Older plans predate the work-order feature: backfill them once, then reuse.
+  await Promise.all(
+    (plans as any[]).map(async (plan) => {
+      if ((plan.stationWorkOrders ?? []).length < 3) {
+        plan.stationWorkOrders = await refreshStationWorkOrders(plan.id).catch(() => []);
+      }
+    })
+  );
+
   const carryover = await computeCarryoverByBom(plans.flatMap((p) => p.items.map((i) => i.bomId)));
   return plans.map((plan) => serializePlan(plan, carryover));
 }
@@ -265,8 +295,10 @@ export async function getPlanStationView(planId: string) {
     include: PLAN_INCLUDE,
   });
   if (!plan) throw new Error('Production plan not found');
+  const existing = (plan as any).stationWorkOrders ?? [];
+  const stationWorkOrders = existing.length < 3 ? await refreshStationWorkOrders(plan.id) : existing;
   const carryover = await computeCarryoverByBom(plan.items.map((i) => i.bomId));
-  return serializePlan(plan, carryover);
+  return serializePlan({ ...plan, stationWorkOrders }, carryover);
 }
 
 /**
@@ -716,12 +748,19 @@ export async function issuePlanIngredients(data: {
   });
 
   // Grinding and production stations now have work waiting.
-  await notifyStations({
+  // Persist the station balances and any outstanding quantity, then tell the
+  // grinding station what has landed and what is still missing.
+  await syncWorkInProgress(plan.id).catch((error) =>
+    console.error('syncWorkInProgress (issue) failed:', error)
+  );
+  await refreshStationWorkOrders(plan.id).catch((error) =>
+    console.error('refreshStationWorkOrders (issue) failed:', error)
+  );
+  await notifyStationWorkOrders({
     planId: plan.id,
-    planNumber: plan.planNumber,
-    title: `Ingredients issued — ${plan.planNumber}`,
-    body: `Ingredients for ${plan.planNumber} have been issued. Grinding can start.`,
-  }).catch((error) => console.error('notifyStations (issue) failed:', error));
+    stations: ['GRINDING'],
+    action: 'Ingredients have been issued. Receive them and record the grinding throughput.',
+  }).catch((error) => console.error('notifyStationWorkOrders (issue) failed:', error));
 
   return getPlanStationView(plan.id);
 }
@@ -743,13 +782,17 @@ export async function submitGrindingRecord(data: {
   /** Serial grinding batch number. Omit to take the next number automatically. */
   grindingBatchNumber?: number | string | null;
   productionDate?: string;
-  unitOfMeasure?: string;
   remarks?: string;
   recordedById: string;
 }) {
   const item = await prisma.productionPlanItem.findUnique({
     where: { id: data.planItemId },
-    include: { bom: { select: { productName: true } }, productionPlan: { select: { id: true, planNumber: true } } },
+    include: {
+      bom: {
+        select: { productName: true, finishedSku: { select: { unitOfMeasure: true } } },
+      },
+      productionPlan: { select: { id: true, planNumber: true } },
+    },
   });
   if (!item) throw new Error('Plan item not found');
   if (item.productionPlanId !== data.planId) throw new Error('Plan item does not belong to this plan');
@@ -758,7 +801,9 @@ export async function submitGrindingRecord(data: {
   const achieved = Number(data.achievedQuantity);
   const remainders = (data.remainders ?? []).filter((r) => Number(r.quantity) > 0);
 
-  if (!(input >= 0) || !(achieved >= 0)) throw new Error('Quantities must be zero or greater');
+  if (!Number.isFinite(input) || !Number.isFinite(achieved) || input <= 0 || achieved < 0) {
+    throw new Error('Input quantity must be greater than zero and achieved quantity cannot be negative');
+  }
   if (achieved > input) throw new Error('Achieved quantity cannot exceed the input quantity');
 
   const plan = await prisma.productionPlan.findUnique({
@@ -789,7 +834,7 @@ export async function submitGrindingRecord(data: {
         inputQuantity: input,
         achievedQuantity: achieved,
         remainderQuantity: remainderTotal,
-        unitOfMeasure: data.unitOfMeasure ?? 'kg',
+        unitOfMeasure: item.bom.finishedSku?.unitOfMeasure ?? 'kg',
         machineId: data.machineId ?? null,
         batchNumber: data.batchNumber ?? null,
         grindingBatchNumber,
@@ -876,6 +921,19 @@ export async function submitGrindingRecord(data: {
     entityId: record.id,
   });
 
+  // Ground output moves to the production station; leftovers stay in WIP.
+  await syncWorkInProgress(plan.id).catch((error) =>
+    console.error('syncWorkInProgress (grinding) failed:', error)
+  );
+  await refreshStationWorkOrders(plan.id).catch((error) =>
+    console.error('refreshStationWorkOrders (grinding) failed:', error)
+  );
+  await notifyStationWorkOrders({
+    planId: plan.id,
+    stations: ['PRODUCTION'],
+    action: 'Ground material is available. Receive it and record the finished output.',
+  }).catch((error) => console.error('notifyStationWorkOrders (grinding) failed:', error));
+
   return getPlanStationView(plan.id);
 }
 
@@ -893,7 +951,6 @@ export async function submitFinishingRecord(data: {
   batchNumber: string;
   expiryDate?: string;
   productionDate?: string;
-  unitOfMeasure?: string;
   remarks?: string;
   recordedById: string;
 }) {
@@ -976,7 +1033,7 @@ export async function submitFinishingRecord(data: {
         achievedQuantity: achieved,
         remainderQuantity: Number(data.remainderQuantity ?? 0),
         carryoverUsedQuantity: carryoverUsed,
-        unitOfMeasure: data.unitOfMeasure ?? finishedSku.unitOfMeasure ?? 'kg',
+        unitOfMeasure: finishedSku.unitOfMeasure ?? 'kg',
         // Snapshot the output cost so the day's value never drifts.
         unitCost: Number(finishedSku.standardCost ?? 0),
         batchNumber: data.batchNumber,
@@ -1019,6 +1076,14 @@ export async function submitFinishingRecord(data: {
     entityType: 'ProductionStageRecord',
     entityId: record.id,
   });
+
+  // Close out completed WIP and refresh the station balances.
+  await syncWorkInProgress(planId).catch((error) =>
+    console.error('syncWorkInProgress (finishing) failed:', error)
+  );
+  await refreshStationWorkOrders(planId).catch((error) =>
+    console.error('refreshStationWorkOrders (finishing) failed:', error)
+  );
 
   return getPlanStationView(planId);
 }

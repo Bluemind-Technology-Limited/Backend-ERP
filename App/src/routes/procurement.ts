@@ -271,8 +271,8 @@ router.post("/requisitions", requirePermission("procurement", "create"), async (
       return res.status(400).json({ error: "At least one item is required" });
     }
     for (const it of items) {
-      if (!it.materialId || !it.quantity || !it.unitOfMeasure) {
-        return res.status(400).json({ error: "Each item needs materialId, quantity and unitOfMeasure" });
+      if (!it.materialId || !(Number(it.quantity) > 0)) {
+        return res.status(400).json({ error: "Each item needs materialId and a quantity greater than zero" });
       }
     }
 
@@ -280,11 +280,12 @@ router.post("/requisitions", requirePermission("procurement", "create"), async (
     const materialIds = [...new Set(items.map((it: any) => String(it.materialId)))];
     const materials = await prisma.material.findMany({
       where: { id: { in: materialIds } },
-      select: { id: true, name: true, type: true },
+      select: { id: true, name: true, type: true, unitOfMeasure: true },
     });
     if (materials.length !== materialIds.length) {
       return res.status(400).json({ error: "One or more materials were not found" });
     }
+    const materialById = new Map(materials.map((m) => [m.id, m]));
     const finished = materials.find((m) => m.type === "FINISHED");
     if (finished) {
       return res.status(400).json({
@@ -302,7 +303,8 @@ router.post("/requisitions", requirePermission("procurement", "create"), async (
           create: items.map((it) => ({
             materialId: it.materialId,
             quantity: it.quantity,
-            unitOfMeasure: it.unitOfMeasure,
+            // The material's pack is the only source of truth for the unit.
+            unitOfMeasure: materialById.get(it.materialId)!.unitOfMeasure,
           })),
         },
       },
@@ -328,8 +330,8 @@ router.patch("/requisitions/:id/items", requirePermission("procurement", "update
       return res.status(400).json({ error: "At least one item is required" });
     }
     for (const it of items) {
-      if (!it.materialId || !(Number(it.quantity) > 0) || !it.unitOfMeasure) {
-        return res.status(400).json({ error: "Each item needs materialId, a quantity greater than zero and unitOfMeasure" });
+      if (!it.materialId || !(Number(it.quantity) > 0)) {
+        return res.status(400).json({ error: "Each item needs materialId and a quantity greater than zero" });
       }
     }
 
@@ -352,11 +354,12 @@ router.patch("/requisitions/:id/items", requirePermission("procurement", "update
     const materialIds = [...new Set(items.map((it: any) => String(it.materialId)))];
     const materials = await prisma.material.findMany({
       where: { id: { in: materialIds } },
-      select: { id: true, name: true, type: true },
+      select: { id: true, name: true, type: true, unitOfMeasure: true },
     });
     if (materials.length !== materialIds.length) {
       return res.status(400).json({ error: "One or more materials were not found" });
     }
+    const materialById = new Map(materials.map((m) => [m.id, m]));
     const finished = materials.find((m) => m.type === "FINISHED");
     if (finished) {
       return res.status(400).json({
@@ -374,7 +377,7 @@ router.patch("/requisitions/:id/items", requirePermission("procurement", "update
             create: items.map((it: any) => ({
               materialId: it.materialId,
               quantity: Number(it.quantity),
-              unitOfMeasure: it.unitOfMeasure,
+              unitOfMeasure: materialById.get(it.materialId)!.unitOfMeasure,
             })),
           },
         },
@@ -574,6 +577,19 @@ router.post("/purchase-orders", requirePermission("procurement", "create"), asyn
       }));
     }
 
+    // The pack label always comes from the material master, never the client.
+    for (const it of poItems) {
+      if (!it.materialId || !(Number(it.quantity) > 0)) {
+        return res.status(400).json({ error: "Every purchase order line needs a material and a positive quantity" });
+      }
+    }
+    const poMaterialIds = [...new Set(poItems.map((it: any) => String(it.materialId)))];
+    const poMaterials = await prisma.material.findMany({
+      where: { id: { in: poMaterialIds } },
+      select: { id: true, unitOfMeasure: true },
+    });
+    const poUom = new Map(poMaterials.map((m) => [m.id, m.unitOfMeasure]));
+
     const number = `PO-${Date.now().toString().slice(-8)}`;
     const purchaseOrder = await prisma.purchaseOrder.create({
       data: {
@@ -590,7 +606,7 @@ router.post("/purchase-orders", requirePermission("procurement", "create"), asyn
             supplierId: it.supplierId ?? supplierId,
             quantity: it.quantity,
             unitCost: it.unitCost ?? 0,
-            unitOfMeasure: it.unitOfMeasure,
+            unitOfMeasure: poUom.get(it.materialId) ?? it.unitOfMeasure,
           })),
         },
       },
@@ -782,16 +798,15 @@ router.get("/consignments/:id", requirePermission("procurement", "read"), async 
  */
 router.post("/consignments/:id/items", requirePermission("procurement", "create"), async (req: Request, res: Response) => {
   try {
-    const { materialId, quantity, unitOfMeasure, poItemId } = req.body;
-    if (!materialId || !quantity || !unitOfMeasure) {
-      return res.status(400).json({ error: "materialId, quantity, and unitOfMeasure are required" });
+    const { materialId, quantity, poItemId } = req.body;
+    if (!materialId || !Number.isFinite(Number(quantity)) || Number(quantity) <= 0) {
+      return res.status(400).json({ error: "materialId and a positive quantity are required" });
     }
 
     const item = await consignmentService.addItemToConsignment({
       consignmentId: req.params.id,
       materialId,
       quantity,
-      unitOfMeasure,
       poItemId: poItemId ?? null,
     });
 
@@ -807,15 +822,14 @@ router.post("/consignments/:id/items", requirePermission("procurement", "create"
  */
 router.patch("/consignments/items/:itemId", requirePermission("procurement", "update"), async (req: Request, res: Response) => {
   try {
-    const { quantity, unitOfMeasure } = req.body;
-    if (!quantity || !unitOfMeasure) {
-      return res.status(400).json({ error: "quantity and unitOfMeasure are required" });
+    const { quantity } = req.body;
+    if (!Number.isFinite(Number(quantity)) || Number(quantity) <= 0) {
+      return res.status(400).json({ error: "A positive quantity is required" });
     }
 
     const item = await consignmentService.updateConsignmentItem({
       itemId: req.params.itemId,
       quantity,
-      unitOfMeasure,
     });
 
     res.json({ item });
@@ -944,8 +958,8 @@ router.get("/consignments/:id/distributions", requirePermission("procurement", "
 router.post("/consignments/items/:itemId/distribute", requirePermission("procurement", "create"), async (req: Request, res: Response) => {
   try {
     const { binId, quantity } = req.body;
-    if (!binId || !quantity) {
-      return res.status(400).json({ error: "binId and quantity are required" });
+    if (!binId || !Number.isFinite(Number(quantity)) || Number(quantity) <= 0) {
+      return res.status(400).json({ error: "binId and a positive quantity are required" });
     }
 
     const distribution = await consignmentService.distributeToWarehouseBin({

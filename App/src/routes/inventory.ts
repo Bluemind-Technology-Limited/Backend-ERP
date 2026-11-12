@@ -81,13 +81,19 @@ router.get("/stock/history", requirePermission("inventory", "read"), async (req:
  */
 router.post("/stock/transfer", requirePermission("inventory", "create"), async (req: Request, res: Response) => {
   try {
-    const { materialId, batchLotId, quantity, unitOfMeasure, fromWarehouseId, toWarehouseId, fromBinId, toBinId, notes } = req.body;
-    if (!materialId || !quantity || !unitOfMeasure || !fromWarehouseId || !toWarehouseId) {
-      return res.status(400).json({ error: "materialId, quantity, unitOfMeasure, fromWarehouseId and toWarehouseId are required" });
+    const { materialId, batchLotId, quantity, fromWarehouseId, toWarehouseId, fromBinId, toBinId, notes } = req.body;
+    if (!materialId || !quantity || !fromWarehouseId || !toWarehouseId) {
+      return res.status(400).json({ error: "materialId, quantity, fromWarehouseId and toWarehouseId are required" });
     }
     if (fromWarehouseId === toWarehouseId) {
       return res.status(400).json({ error: "Source and destination warehouses must differ" });
     }
+
+    const material = await prisma.material.findUnique({
+      where: { id: materialId },
+      select: { unitOfMeasure: true },
+    });
+    if (!material) return res.status(404).json({ error: "Material not found" });
 
     const qty = Number(quantity);
     if (!Number.isFinite(qty) || qty <= 0) {
@@ -101,7 +107,7 @@ router.post("/stock/transfer", requirePermission("inventory", "create"), async (
         throw new HttpError(400, "There is no stock left to transfer from the source warehouse.");
       }
       if (qty > available) {
-        throw new HttpError(400, `Only ${available} ${unitOfMeasure} available in the source warehouse.`);
+        throw new HttpError(400, `Only ${available} ${material.unitOfMeasure} available in the source warehouse.`);
       }
 
       // OUT from source
@@ -112,7 +118,7 @@ router.post("/stock/transfer", requirePermission("inventory", "create"), async (
         warehouseId: fromWarehouseId,
         binId: fromBinId ?? null,
         quantity: -qty,
-        unitOfMeasure,
+        unitOfMeasure: material.unitOfMeasure,
         referenceType: "TRANSFER",
         createdById: req.user!.id,
         notes: notes ?? null,
@@ -125,7 +131,7 @@ router.post("/stock/transfer", requirePermission("inventory", "create"), async (
         warehouseId: toWarehouseId,
         binId: toBinId ?? null,
         quantity: qty,
-        unitOfMeasure,
+        unitOfMeasure: material.unitOfMeasure,
         referenceType: "TRANSFER",
         createdById: req.user!.id,
         notes: notes ?? null,
@@ -153,9 +159,9 @@ router.post("/stock/transfer", requirePermission("inventory", "create"), async (
  */
 router.post("/stock/adjustment", requirePermission("inventory", "create"), async (req: Request, res: Response) => {
   try {
-    const { materialId, batchLotId, warehouseId, quantity, unitOfMeasure, reason } = req.body;
-    if (!materialId || !quantity || !unitOfMeasure || !warehouseId) {
-      return res.status(400).json({ error: "materialId, quantity, unitOfMeasure and warehouseId are required" });
+    const { materialId, batchLotId, warehouseId, quantity, reason } = req.body;
+    if (!materialId || !quantity || !warehouseId) {
+      return res.status(400).json({ error: "materialId, quantity and warehouseId are required" });
     }
     if (quantity === 0) return res.status(400).json({ error: "Adjustment quantity cannot be zero" });
 
@@ -171,7 +177,7 @@ router.post("/stock/adjustment", requirePermission("inventory", "create"), async
         if (available + qty < 0) {
           throw new HttpError(
             400,
-            `Only ${available} ${unitOfMeasure} available — stock cannot go below zero.`
+            `Only ${available} ${material.unitOfMeasure} available — stock cannot go below zero.`
           );
         }
       }
@@ -182,7 +188,7 @@ router.post("/stock/adjustment", requirePermission("inventory", "create"), async
         batchLotId: batchLotId ?? null,
         warehouseId,
         quantity: qty,
-        unitOfMeasure,
+        unitOfMeasure: material.unitOfMeasure,
         referenceType: "ADJUSTMENT",
         createdById: req.user!.id,
         notes: reason ?? null,

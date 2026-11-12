@@ -23,6 +23,17 @@ const EDITABLE_CONSIGNMENT_STATUSES = [
 
 const REASON_CODES = ['SHORTAGE', 'DAMAGE', 'OVERAGE', 'QUALITY_REJECT', 'RECOUNT'];
 
+/** Business-rule failure that maps directly to an HTTP status in the route. */
+export class QuantityAdjustmentError extends Error {
+  statusCode: number;
+
+  constructor(message: string, statusCode: 400 | 404 | 409 = 400) {
+    super(message);
+    this.name = 'QuantityAdjustmentError';
+    this.statusCode = statusCode;
+  }
+}
+
 // Roles that may approve (Head of QC owns this; Super Admin as break-glass).
 export const QUANTITY_APPROVER_ROLES = ['HEAD_OF_QC', 'SUPER_ADMIN'];
 
@@ -73,11 +84,11 @@ export async function proposeQuantityAdjustment(data: {
   });
 
   if (!item) {
-    throw new Error('Consignment item not found');
+    throw new QuantityAdjustmentError('Consignment item not found', 404);
   }
 
   if (!EDITABLE_CONSIGNMENT_STATUSES.includes(item.consignment.status)) {
-    throw new Error(
+    throw new QuantityAdjustmentError(
       `Cannot change quantities once the consignment is ${item.consignment.status}`
     );
   }
@@ -86,18 +97,18 @@ export async function proposeQuantityAdjustment(data: {
   const oldQuantity = Number(item.quantity);
 
   if (!Number.isFinite(newQuantity) || newQuantity <= 0) {
-    throw new Error('New quantity must be greater than zero');
+    throw new QuantityAdjustmentError('New quantity must be greater than zero');
   }
   if (newQuantity === oldQuantity) {
-    throw new Error('New quantity is the same as the current quantity');
+    throw new QuantityAdjustmentError('New quantity is the same as the current quantity');
   }
   if (newQuantity < Number(item.distributedQty)) {
-    throw new Error(
+    throw new QuantityAdjustmentError(
       `New quantity cannot be below the already distributed quantity (${item.distributedQty})`
     );
   }
   if (data.reasonCode && !REASON_CODES.includes(data.reasonCode)) {
-    throw new Error(`reasonCode must be one of: ${REASON_CODES.join(', ')}`);
+    throw new QuantityAdjustmentError(`reasonCode must be one of: ${REASON_CODES.join(', ')}`);
   }
 
   // Do not allow back-to-back proposals for the same ingredient.
@@ -105,7 +116,10 @@ export async function proposeQuantityAdjustment(data: {
     where: { consignmentItemId: data.consignmentItemId, status: 'PENDING' },
   });
   if (existingPending) {
-    throw new Error('A quantity change for this ingredient is already awaiting approval');
+    throw new QuantityAdjustmentError(
+      'A quantity change for this ingredient is already awaiting approval',
+      409
+    );
   }
 
   // QC must have finished checking this ingredient before changing its quantity.
@@ -114,7 +128,7 @@ export async function proposeQuantityAdjustment(data: {
     const checks = approval.checkItems.filter((c) => c.consignmentItemId === data.consignmentItemId);
     const outstanding = checks.filter((c) => c.status === 'PENDING' || !c.result);
     if (checks.length === 0 || outstanding.length > 0) {
-      throw new Error(
+      throw new QuantityAdjustmentError(
         `Complete all quality checks for ${item.material.name} before changing its quantity`
       );
     }
@@ -226,9 +240,12 @@ export async function approveQuantityAdjustment(adjustmentId: string, approvedBy
   const existing = await prisma.quantityAdjustment.findUnique({
     where: { id: adjustmentId },
   });
-  if (!existing) throw new Error('Quantity adjustment not found');
+  if (!existing) throw new QuantityAdjustmentError('Quantity adjustment not found', 404);
   if (existing.status !== 'PENDING') {
-    throw new Error(`Cannot approve a quantity adjustment with status ${existing.status}`);
+    throw new QuantityAdjustmentError(
+      `Cannot approve a quantity adjustment with status ${existing.status}`,
+      409
+    );
   }
 
   const result = await prisma.$transaction(async (tx) => {
@@ -239,6 +256,21 @@ export async function approveQuantityAdjustment(adjustmentId: string, approvedBy
         consignment: { select: { id: true, consignmentNumber: true, warehouseId: true } },
       },
     });
+
+    // Claim the row inside the transaction. Two concurrent approvals block on
+    // this update; the loser sees count 0 and rolls back before double-posting.
+    const claim = await tx.quantityAdjustment.updateMany({
+      where: { id: adjustmentId, status: 'PENDING' },
+      data: {
+        status: 'APPROVED',
+        approvedById,
+        decidedAt: new Date(),
+        appliedAt: new Date(),
+      },
+    });
+    if (claim.count === 0) {
+      throw new QuantityAdjustmentError('This quantity change has already been processed', 409);
+    }
 
     const newQuantity = Number(adjustment.newQuantity);
 
@@ -286,13 +318,7 @@ export async function approveQuantityAdjustment(adjustmentId: string, approvedBy
 
     const updated = await tx.quantityAdjustment.update({
       where: { id: adjustmentId },
-      data: {
-        status: 'APPROVED',
-        approvedById,
-        decidedAt: new Date(),
-        appliedAt: new Date(),
-        inventoryTransactionId: transactionId,
-      },
+      data: { inventoryTransactionId: transactionId },
       include: {
         material: { select: { name: true, sku: true } },
         consignment: { select: { consignmentNumber: true } },
@@ -331,22 +357,32 @@ export async function rejectQuantityAdjustment(
   rejectionReason: string
 ) {
   const existing = await prisma.quantityAdjustment.findUnique({ where: { id: adjustmentId } });
-  if (!existing) throw new Error('Quantity adjustment not found');
+  if (!existing) throw new QuantityAdjustmentError('Quantity adjustment not found', 404);
   if (existing.status !== 'PENDING') {
-    throw new Error(`Cannot reject a quantity adjustment with status ${existing.status}`);
+    throw new QuantityAdjustmentError(
+      `Cannot reject a quantity adjustment with status ${existing.status}`,
+      409
+    );
   }
   if (!rejectionReason || !rejectionReason.trim()) {
-    throw new Error('A rejection reason is required');
+    throw new QuantityAdjustmentError('A rejection reason is required');
   }
 
-  const updated = await prisma.quantityAdjustment.update({
-    where: { id: adjustmentId },
+  const decided = await prisma.quantityAdjustment.updateMany({
+    where: { id: adjustmentId, status: 'PENDING' },
     data: {
       status: 'REJECTED',
       approvedById,
       decidedAt: new Date(),
       rejectionReason: rejectionReason.trim(),
     },
+  });
+  if (decided.count === 0) {
+    throw new QuantityAdjustmentError('This quantity change has already been processed', 409);
+  }
+
+  const updated = await prisma.quantityAdjustment.findUniqueOrThrow({
+    where: { id: adjustmentId },
     include: {
       material: { select: { name: true } },
       consignment: { select: { consignmentNumber: true } },

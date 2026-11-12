@@ -9,7 +9,8 @@ export interface CreateBatchFormulationInput {
   ingredients: Array<{
     materialId: string;
     quantity: number;
-    unitOfMeasure: string;
+    /** Deprecated — the material's pack label is authoritative. */
+    unitOfMeasure?: string;
     isPercentage?: boolean;
   }>;
   createdById: string;
@@ -33,23 +34,37 @@ export async function createBatchFormulation(input: CreateBatchFormulationInput)
     // Verify finished SKU exists
     const finishedSku = await prisma.material.findUnique({
       where: { id: input.finishedSkuId },
-      select: { id: true, name: true, sku: true },
+      select: { id: true, name: true, sku: true, unitOfMeasure: true },
     });
 
     if (!finishedSku) {
       throw new Error(`Finished SKU not found: ${input.finishedSkuId}`);
     }
 
+    if (!Number.isFinite(Number(input.expectedYield)) || Number(input.expectedYield) <= 0) {
+      throw new Error("Expected yield must be greater than zero");
+    }
+
     // Verify all ingredient materials exist
     const ingredientIds = input.ingredients.map((ing) => ing.materialId);
+    for (const ing of input.ingredients) {
+      const qty = Number(ing.quantity);
+      if (!Number.isFinite(qty) || qty <= 0) {
+        throw new Error("Every ingredient needs a quantity greater than zero");
+      }
+      if (ing.isPercentage && qty > 100) {
+        throw new Error("Percentage ingredients cannot exceed 100%");
+      }
+    }
     const ingredientMaterials = await prisma.material.findMany({
       where: { id: { in: ingredientIds } },
-      select: { id: true, name: true },
+      select: { id: true, name: true, unitOfMeasure: true },
     });
 
     if (ingredientMaterials.length !== ingredientIds.length) {
       throw new Error("One or more ingredient materials not found");
     }
+    const ingredientUom = new Map(ingredientMaterials.map((m) => [m.id, m.unitOfMeasure]));
 
     // Create BOM with ingredients
     const bom = await prisma.bom.create({
@@ -57,14 +72,14 @@ export async function createBatchFormulation(input: CreateBatchFormulationInput)
         productName: input.productName,
         description: input.description,
         expectedYield: input.expectedYield,
-        yieldUnit: input.yieldUnit,
+        yieldUnit: finishedSku.unitOfMeasure,
         finishedSkuId: input.finishedSkuId,
         status: "DRAFT",
         ingredients: {
           create: input.ingredients.map((ing) => ({
             materialId: ing.materialId,
             quantity: ing.quantity,
-            unitOfMeasure: ing.unitOfMeasure,
+            unitOfMeasure: ingredientUom.get(ing.materialId)!,
             isPercentage: ing.isPercentage ?? false,
           })),
         },
@@ -235,13 +250,19 @@ export async function updateBatchFormulation(
       );
     }
 
+    if (
+      input.expectedYield !== undefined &&
+      (!Number.isFinite(Number(input.expectedYield)) || Number(input.expectedYield) <= 0)
+    ) {
+      throw new Error("Expected yield must be greater than zero");
+    }
+
     const bom = await prisma.bom.update({
       where: { id: bomId },
       data: {
         productName: input.productName,
         description: input.description,
         expectedYield: input.expectedYield,
-        yieldUnit: input.yieldUnit,
         updatedById: input.updatedById,
       },
       include: {
@@ -272,7 +293,6 @@ export async function addIngredient(
   bomId: string,
   materialId: string,
   quantity: number,
-  unitOfMeasure: string,
   isPercentage: boolean = false
 ) {
   try {
@@ -291,12 +311,25 @@ export async function addIngredient(
       );
     }
 
+    const material = await prisma.material.findUnique({
+      where: { id: materialId },
+      select: { unitOfMeasure: true },
+    });
+    if (!material) throw new Error(`Material not found: ${materialId}`);
+
+    if (!Number.isFinite(Number(quantity)) || Number(quantity) <= 0) {
+      throw new Error("Ingredient quantity must be greater than zero");
+    }
+    if (isPercentage && Number(quantity) > 100) {
+      throw new Error("Percentage ingredients cannot exceed 100%");
+    }
+
     const ingredient = await prisma.bomIngredient.create({
       data: {
         bomId,
         materialId,
         quantity,
-        unitOfMeasure,
+        unitOfMeasure: material.unitOfMeasure,
         isPercentage,
       },
       include: {

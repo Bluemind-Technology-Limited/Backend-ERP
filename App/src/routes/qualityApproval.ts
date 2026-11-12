@@ -24,6 +24,10 @@ const CHECK_TYPES = [
 /** Map a thrown service error to a sensible HTTP status. */
 function sendError(res: Response, error: any, fallback: string) {
   const message = error?.message || fallback;
+  const statusCode = Number(error?.statusCode ?? error?.status);
+  if (Number.isInteger(statusCode) && statusCode >= 400 && statusCode < 600) {
+    return res.status(statusCode).json({ error: message });
+  }
   if (/not found/i.test(message)) return res.status(404).json({ error: message });
   if (/already|Cannot|does not match|must be/i.test(message)) {
     return res.status(400).json({ error: message });

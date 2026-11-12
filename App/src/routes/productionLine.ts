@@ -2,6 +2,7 @@ import { Router, type Request, type Response } from "express";
 import { requireAuth } from "../middleware/auth.js";
 import { requirePermission } from "../middleware/rbac.js";
 import * as productionLineService from "../services/productionLineService.js";
+import * as productionStationService from "../services/productionStationService.js";
 
 const router: Router = Router();
 router.use(requireAuth);
@@ -133,6 +134,74 @@ router.get(
 );
 
 /**
+ * GET /production-line/plans/:planId/flow
+ * Expected / received / processed / transferred / outstanding / WIP per station.
+ */
+router.get(
+  "/plans/:planId/flow",
+  requirePermission("production", "read"),
+  async (req: Request, res: Response) => {
+    try {
+      const flow = await productionStationService.getStationFlow(req.params.planId);
+      res.json({ flow });
+    } catch (error: any) {
+      console.error("GET /production-line/plans/:planId/flow error:", error);
+      sendError(res, error, "Failed to load the station flow");
+    }
+  }
+);
+
+/**
+ * GET /production-line/wip?status=&station=&planId=&from=&to=
+ */
+router.get(
+  "/wip",
+  requirePermission("production", "read"),
+  async (req: Request, res: Response) => {
+    try {
+      const result = await productionStationService.getWorkInProgress({
+        status: req.query.status ? String(req.query.status).toUpperCase() : undefined,
+        station: req.query.station ? String(req.query.station).toUpperCase() : undefined,
+        planId: req.query.planId ? String(req.query.planId) : undefined,
+        from: req.query.from ? String(req.query.from) : undefined,
+        to: req.query.to ? String(req.query.to) : undefined,
+      });
+      res.json(result);
+    } catch (error: any) {
+      console.error("GET /production-line/wip error:", error);
+      sendError(res, error, "Failed to load work in progress");
+    }
+  }
+);
+
+/**
+ * POST /production-line/wip/:id/transfer
+ * Body: { quantity, notes? } — moves outstanding WIP to the next station.
+ */
+router.post(
+  "/wip/:id/transfer",
+  requirePermission("production", "update"),
+  async (req: Request, res: Response) => {
+    try {
+      const { quantity, notes } = req.body ?? {};
+      if (quantity === undefined || quantity === null || quantity === "") {
+        return res.status(400).json({ error: "quantity is required" });
+      }
+      const entry = await productionStationService.transferWorkInProgress({
+        id: req.params.id,
+        quantity: Number(quantity),
+        notes: notes ? String(notes) : undefined,
+        userId: req.user!.id,
+      });
+      res.json({ message: "WIP transferred to the next station", entry });
+    } catch (error: any) {
+      console.error("POST /production-line/wip/:id/transfer error:", error);
+      sendError(res, error, "Failed to transfer WIP");
+    }
+  }
+);
+
+/**
  * GET /production-line/plans/:planId — full station view for one plan.
  */
 router.get(
@@ -213,7 +282,6 @@ router.post(
         batchNumber,
         grindingBatchNumber,
         productionDate,
-        unitOfMeasure,
         remarks,
       } = req.body;
 
@@ -249,7 +317,6 @@ router.post(
         batchNumber: batchNumber ?? null,
         grindingBatchNumber: grindingBatchNumber ?? null,
         productionDate,
-        unitOfMeasure,
         remarks,
         recordedById: req.user!.id,
       });
@@ -284,7 +351,6 @@ router.post(
         batchNumber,
         expiryDate,
         productionDate,
-        unitOfMeasure,
         remarks,
       } = req.body;
 
@@ -304,7 +370,6 @@ router.post(
         batchNumber,
         expiryDate,
         productionDate,
-        unitOfMeasure,
         remarks,
         recordedById: req.user!.id,
       });

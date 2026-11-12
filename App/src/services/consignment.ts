@@ -181,8 +181,9 @@ export async function createConsignment(data: {
         setNumber,
         yearCode,
       });
-      // Batch number is assigned by QA on inspection; the provisional reference
-      // only keeps the lot identifiable until then.
+      // The receiving batch number follows the lot code. QA can correct the
+      // set number during inspection; the provisional reference only keeps the
+      // lot identifiable until then.
       const batchNumber =
         lotCode ?? `PENDING-${consignmentNumber}-${String(lineIndex).padStart(2, '0')}`;
 
@@ -212,7 +213,7 @@ export async function createConsignment(data: {
           poItemId: poItem.id,
           quantity,
           receivedQty: quantity,
-          unitOfMeasure: item.unitOfMeasure,
+          unitOfMeasure: material.unitOfMeasure,
           distributedQty: 0,
         },
       });
@@ -223,7 +224,7 @@ export async function createConsignment(data: {
           materialId: material.id,
           batchLotId: batchLot.id,
           quantity,
-          unitOfMeasure: item.unitOfMeasure,
+          unitOfMeasure: material.unitOfMeasure,
           unitCost: Number(item.unitCost ?? poItem.unitCost),
         },
       });
@@ -237,7 +238,7 @@ export async function createConsignment(data: {
         warehouseId: lineWarehouseId,
         consignmentItemId: consignmentItem.id,
         quantity,
-        unitOfMeasure: item.unitOfMeasure,
+        unitOfMeasure: material.unitOfMeasure,
         referenceType: 'GRN',
         referenceId: receipt.id,
         createdById: data.createdById,
@@ -375,7 +376,6 @@ export async function addItemToConsignment(data: {
   consignmentId: string;
   materialId: string;
   quantity: number;
-  unitOfMeasure: string;
   poItemId?: string | null;
 }) {
   // Verify consignment exists and is in DRAFT state
@@ -388,8 +388,12 @@ export async function addItemToConsignment(data: {
     throw new Error(`Cannot add items to consignment in ${consignment.status} status`);
   }
 
-  // Verify material exists
-  await prisma.material.findUniqueOrThrow({
+  if (!Number.isFinite(Number(data.quantity)) || Number(data.quantity) <= 0) {
+    throw new Error('Consignment quantity must be greater than zero');
+  }
+
+  // Verify material exists and use its pack as the unit of measure.
+  const material = await prisma.material.findUniqueOrThrow({
     where: { id: data.materialId },
   });
 
@@ -411,7 +415,7 @@ export async function addItemToConsignment(data: {
       materialId: data.materialId,
       poItemId: data.poItemId ?? null,
       quantity: data.quantity,
-      unitOfMeasure: data.unitOfMeasure,
+      unitOfMeasure: material.unitOfMeasure,
       receivedQty: 0,
       distributedQty: 0,
     },
@@ -456,7 +460,6 @@ export async function removeItemFromConsignment(itemId: string) {
 export async function updateConsignmentItem(data: {
   itemId: string;
   quantity: number;
-  unitOfMeasure: string;
 }) {
   const item = await prisma.consignmentItem.findUniqueOrThrow({
     where: { id: data.itemId },
@@ -467,11 +470,14 @@ export async function updateConsignmentItem(data: {
     throw new Error(`Cannot update items in consignment in ${item.consignment.status} status`);
   }
 
+  if (!Number.isFinite(Number(data.quantity)) || Number(data.quantity) <= 0) {
+    throw new Error('Consignment quantity must be greater than zero');
+  }
+
   const updated = await prisma.consignmentItem.update({
     where: { id: data.itemId },
     data: {
       quantity: data.quantity,
-      unitOfMeasure: data.unitOfMeasure,
     },
     include: {
       material: true,
@@ -603,6 +609,10 @@ export async function distributeToWarehouseBin(data: {
     where: { id: data.consignmentItemId },
     include: { consignment: true },
   });
+
+  if (!Number.isFinite(Number(data.quantity)) || Number(data.quantity) <= 0) {
+    throw new Error('Distribution quantity must be greater than zero');
+  }
 
   // Quality Approval Check: Consignment must be QUALITY_APPROVED before distribution
   if (item.consignment.status !== ConsignmentStatus.QUALITY_APPROVED) {

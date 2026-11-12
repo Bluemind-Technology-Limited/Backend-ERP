@@ -78,3 +78,114 @@ export async function nextSetNumber(
 export function isValidSetNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value > 0;
 }
+
+export interface SetNumberEditResult {
+  batchLotId: string;
+  oldSetNumber: number | null;
+  oldLotCode: string | null;
+  setNumber: number;
+  lotCode: string | null;
+}
+
+/**
+ * Apply a set number supplied/edited by QA and rebuild the lot code from the
+ * snapshotted vendor, ingredient and year parts.
+ *
+ * The set number is unique within supplier + material + year. The receiving
+ * batch number is kept in step while it still mirrors the old lot code, so the
+ * two identifiers never drift apart. Returns null when no number was supplied.
+ */
+export async function updateBatchLotSetNumber(
+  client: PrismaLike,
+  batchLotId: string,
+  rawSetNumber: unknown
+): Promise<SetNumberEditResult | null> {
+  if (rawSetNumber === undefined || rawSetNumber === null || String(rawSetNumber).trim() === "") {
+    return null;
+  }
+
+  const setNumber = Number(rawSetNumber);
+  if (!isValidSetNumber(setNumber)) {
+    throw new Error("Set number must be a positive whole number");
+  }
+
+  const batchLot = await client.batchLot.findUnique({
+    where: { id: batchLotId },
+    select: {
+      id: true,
+      materialId: true,
+      supplierId: true,
+      setNumber: true,
+      lotCode: true,
+      batchNumber: true,
+      vendorCode: true,
+      ingredientCode: true,
+      yearCode: true,
+    },
+  });
+  if (!batchLot) throw new Error("Batch lot not found");
+
+  if (batchLot.setNumber === setNumber) {
+    return {
+      batchLotId,
+      oldSetNumber: batchLot.setNumber,
+      oldLotCode: batchLot.lotCode,
+      setNumber,
+      lotCode: batchLot.lotCode,
+    };
+  }
+
+  if (batchLot.yearCode) {
+    const clash = await client.batchLot.findFirst({
+      where: {
+        id: { not: batchLotId },
+        materialId: batchLot.materialId,
+        supplierId: batchLot.supplierId,
+        yearCode: batchLot.yearCode,
+        setNumber,
+      },
+      select: { id: true },
+    });
+    if (clash) {
+      throw new Error(
+        `Set number ${setNumber} is already used for this supplier, material and year`
+      );
+    }
+  }
+
+  const lotCode = buildLotCode({
+    vendorCode: batchLot.vendorCode,
+    ingredientCode: batchLot.ingredientCode,
+    setNumber,
+    yearCode: batchLot.yearCode,
+  });
+
+  if (lotCode) {
+    const codeClash = await client.batchLot.findFirst({
+      where: { id: { not: batchLotId }, lotCode },
+      select: { id: true },
+    });
+    if (codeClash) {
+      throw new Error(`Lot code "${lotCode}" is already used`);
+    }
+  }
+
+  const data: { setNumber: number; lotCode?: string; batchNumber?: string } = { setNumber };
+  if (lotCode) {
+    data.lotCode = lotCode;
+    // Only follow the code when the receiving batch number was mirroring it.
+    if (batchLot.lotCode && batchLot.batchNumber === batchLot.lotCode) {
+      data.batchNumber = lotCode;
+    }
+  }
+
+  await client.batchLot.update({ where: { id: batchLotId }, data });
+
+  return {
+    batchLotId,
+    oldSetNumber: batchLot.setNumber,
+    oldLotCode: batchLot.lotCode,
+    setNumber,
+    lotCode: lotCode ?? batchLot.lotCode,
+  };
+}

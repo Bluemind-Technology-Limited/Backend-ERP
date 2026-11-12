@@ -107,6 +107,27 @@ enum ProductionStageStatus {
   FLAGGED
 }
 
+/// The three operational stations a released production plan flows through.
+enum ProductionStation {
+  INGREDIENT
+  GRINDING
+  PRODUCTION
+}
+
+enum StationWorkOrderStatus {
+  PENDING
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum WorkInProgressStatus {
+  OPEN
+  PARTIAL
+  TRANSFERRED
+  CLOSED
+}
+
 enum ConsignmentStatus {
   DRAFT
   READY_FOR_SHIPMENT
@@ -223,6 +244,7 @@ model User {
   bomApprovedBy                Bom[]                           @relation("bom_approved_by")
   bomUpdatedBy                 Bom[]                           @relation("bom_updated_by")
   productionPlans              ProductionPlan[]
+  releasedPlans                ProductionPlan[]                @relation("plan_released_by")
   consignmentsCreated          Consignment[]                   @relation("consignment_creator")
   consignmentsReceived         Consignment[]                   @relation("consignment_receiver")
   consignmentDistributions     ConsignmentDistribution[]
@@ -268,7 +290,12 @@ model Material {
   sku               String       @unique
   type              MaterialType
   category          String?
-  unitOfMeasure     String       @map("unit_of_measure") // kg, liters, units
+  /// Rendered unit of measure label, e.g. "25 KG". Quantities everywhere are
+  /// counts of `packSize` × `packUnit` (100 = 100 packs of 25 KG = 2,500 KG).
+  unitOfMeasure     String       @map("unit_of_measure")
+  /// Physical pack definition: e.g. 25 + KG.
+  packSize          Decimal      @default(1) @map("pack_size") @db.Decimal(15, 4)
+  packUnit          String       @default("KG") @map("pack_unit") // KG | G | PCS
   barcode           String?
   defaultExpiryDate DateTime?    @map("default_expiry_date") // Default expiry (e.g., 2 years out)
   /// Shelf life in days (e.g. 730 = 2 years). Drives the default expiry date.
@@ -298,6 +325,7 @@ model Material {
   bomFinishedSku            Bom[]                      @relation("finished_sku")
   planAggregatedIngredients PlanAggregatedIngredient[] @relation("plan_ingredients")
   planIngredientIssues      PlanIngredientIssue[]
+  planIngredientRequirements PlanIngredientRequirement[] @relation("plan_ingredient_requirements")
   consignmentItems          ConsignmentItem[]          @relation("consignment_items")
   quantityAdjustments       QuantityAdjustment[]
   grindingInputs            ProductionGrindingInput[]
@@ -426,10 +454,6 @@ model BatchLot {
   /// The supplier's own batch number, where they provide one (sits on the label).
   supplierBatchNumber String?        @map("supplier_batch_number")
   supplierId          String?        @map("supplier_id")
-  /// QC Ingredient Batch Number — assigned by QA after inspecting this lot.
-  /// Distinct from `lotCode` / `batchNumber`: it identifies the reviewed batch
-  /// and is what production traceability references.
-  qcBatchNumber       String?        @map("qc_batch_number")
 
   material              Material                  @relation(fields: [materialId], references: [id])
   supplier              Supplier?                 @relation("supplier_lots", fields: [supplierId], references: [id])
@@ -441,7 +465,6 @@ model BatchLot {
   grindingInputs        ProductionGrindingInput[]
 
   @@unique([materialId, batchNumber])
-  @@unique([materialId, qcBatchNumber])
   @@index([vendorCode])
   @@index([ingredientCode])
   @@index([origin])
@@ -865,6 +888,8 @@ model ProductionOrder {
   scheduledStart          DateTime?             @map("scheduled_start")
   actualStart             DateTime?             @map("actual_start")
   actualEnd               DateTime?             @map("actual_end")
+  /// Reserved for a future machine/shift integration. Machine and shift are
+  /// deliberately excluded from the active production-planning workflow.
   machineId               String?               @map("machine_id")
   shiftId                 String?               @map("shift_id")
   createdById             String                @map("created_by_id")
@@ -926,15 +951,22 @@ model ProductionPlan {
   scheduledFor DateTime?            @map("scheduled_for")
   startedAt    DateTime?            @map("started_at")
   completedAt  DateTime?            @map("completed_at")
+  /// Ingredient release audit: who released the requirements and when.
+  releasedById String?              @map("released_by_id")
+  releasedAt   DateTime?            @map("released_at")
   createdById  String               @map("created_by_id")
   createdAt    DateTime             @default(now()) @map("created_at")
   updatedAt    DateTime             @updatedAt @map("updated_at")
 
   createdBy             User                            @relation(fields: [createdById], references: [id])
+  releasedBy            User?                           @relation("plan_released_by", fields: [releasedById], references: [id])
   items                 ProductionPlanItem[]
   aggregatedIngredients PlanAggregatedIngredient[]
   ingredientIssues      PlanIngredientIssue[]
+  ingredientRequirements PlanIngredientRequirement[]
   stageRecords          ProductionStageRecord[]
+  stationWorkOrders     ProductionStationWorkOrder[]
+  wipEntries            WorkInProgress[]
   reconciliations       DailyProductionReconciliation[]
 
   @@index([status])
@@ -954,6 +986,7 @@ model ProductionPlanItem {
   bom                     Bom                      @relation(fields: [bomId], references: [id])
   batchMachineAllocations BatchMachineAllocation[]
   stageRecords            ProductionStageRecord[]
+  ingredientRequirements  PlanIngredientRequirement[]
 
   @@index([productionPlanId])
   @@index([bomId])
@@ -1091,6 +1124,103 @@ model PlanIngredientIssue {
   @@index([materialId])
   @@index([issuedAt])
   @@map("plan_ingredient_issues")
+}
+
+/// Formula-level requirement snapshot: per-batch quantity × batch count = total
+/// required. Regenerated from the approved batch formulas whenever the plan's
+/// items are created, edited or released. Consolidated quantities are summed
+/// from these rows so the Ingredient Station work order can always be traced
+/// back to the exact formula and batch multiplier.
+model PlanIngredientRequirement {
+  id                String   @id @default(uuid())
+  productionPlanId  String   @map("production_plan_id")
+  planItemId        String   @map("plan_item_id")
+  bomId             String   @map("bom_id")
+  materialId        String   @map("material_id")
+  /// Raw value from the batch formula: packs for absolute lines, % for percentage lines.
+  quantityPerBatch  Decimal  @map("quantity_per_batch") @db.Decimal(15, 4)
+  /// Derived packs required for one batch (percentage lines are converted weight-first).
+  perBatchRequired  Decimal  @map("per_batch_required") @db.Decimal(15, 4)
+  /// Target quantity ÷ batch yield.
+  batchCount        Decimal  @map("batch_count") @db.Decimal(15, 4)
+  totalRequired     Decimal  @map("total_required") @db.Decimal(15, 4)
+  unitOfMeasure     String   @map("unit_of_measure")
+  isPercentage      Boolean  @default(false) @map("is_percentage")
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  productionPlan ProductionPlan     @relation(fields: [productionPlanId], references: [id], onDelete: Cascade)
+  planItem       ProductionPlanItem @relation(fields: [planItemId], references: [id], onDelete: Cascade)
+  material       Material           @relation("plan_ingredient_requirements", fields: [materialId], references: [id])
+
+  @@unique([planItemId, materialId])
+  @@index([productionPlanId])
+  @@index([materialId])
+  @@map("plan_ingredient_requirements")
+}
+
+/// One work order per plan per station. Created when a plan is released so each
+/// station gets its expected quantity and a notification, then kept in sync as
+/// material is received, processed and transferred down the line.
+model ProductionStationWorkOrder {
+  id                  String                 @id @default(uuid())
+  productionPlanId    String                 @map("production_plan_id")
+  station             ProductionStation
+  status              StationWorkOrderStatus @default(PENDING)
+  expectedQuantity    Decimal                @default(0) @map("expected_quantity") @db.Decimal(15, 4)
+  receivedQuantity    Decimal                @default(0) @map("received_quantity") @db.Decimal(15, 4)
+  processedQuantity   Decimal                @default(0) @map("processed_quantity") @db.Decimal(15, 4)
+  transferredQuantity Decimal                @default(0) @map("transferred_quantity") @db.Decimal(15, 4)
+  outstandingQuantity Decimal                @default(0) @map("outstanding_quantity") @db.Decimal(15, 4)
+  unitOfMeasure       String                 @default("kg") @map("unit_of_measure")
+  notifiedAt          DateTime?              @map("notified_at")
+  startedAt           DateTime?              @map("started_at")
+  completedAt         DateTime?              @map("completed_at")
+  createdAt           DateTime               @default(now()) @map("created_at")
+  updatedAt           DateTime               @updatedAt @map("updated_at")
+
+  productionPlan ProductionPlan  @relation(fields: [productionPlanId], references: [id], onDelete: Cascade)
+  wipEntries     WorkInProgress[]
+
+  @@unique([productionPlanId, station])
+  @@index([station, status])
+  @@map("production_station_work_orders")
+}
+
+/// Persisted carry-over / work-in-progress pool. A row records quantity that
+/// exists but has not yet moved to the next station, so it can never be counted
+/// as completed output. `key` keeps one row per plan + origin + item/material.
+model WorkInProgress {
+  id                  String               @id @default(uuid())
+  key                 String               @unique
+  productionPlanId    String               @map("production_plan_id")
+  planItemId          String?              @map("plan_item_id")
+  stationWorkOrderId  String?              @map("station_work_order_id")
+  productionDate      DateTime             @map("production_date")
+  productName         String?              @map("product_name")
+  batchNumber         String?              @map("batch_number")
+  batchLotId          String?              @map("batch_lot_id")
+  materialId          String?              @map("material_id")
+  originStation       ProductionStation    @map("origin_station")
+  destinationStation  ProductionStation?   @map("destination_station")
+  expectedQuantity    Decimal              @default(0) @map("expected_quantity") @db.Decimal(15, 4)
+  completedQuantity   Decimal              @default(0) @map("completed_quantity") @db.Decimal(15, 4)
+  transferredQuantity Decimal              @default(0) @map("transferred_quantity") @db.Decimal(15, 4)
+  remainingQuantity   Decimal              @default(0) @map("remaining_quantity") @db.Decimal(15, 4)
+  unitOfMeasure       String               @map("unit_of_measure")
+  status              WorkInProgressStatus @default(OPEN)
+  notes               String?
+  closedAt            DateTime?            @map("closed_at")
+  createdAt           DateTime             @default(now()) @map("created_at")
+  updatedAt           DateTime             @updatedAt @map("updated_at")
+
+  productionPlan       ProductionPlan              @relation(fields: [productionPlanId], references: [id], onDelete: Cascade)
+  stationWorkOrder     ProductionStationWorkOrder? @relation(fields: [stationWorkOrderId], references: [id], onDelete: SetNull)
+
+  @@index([productionPlanId])
+  @@index([originStation, status])
+  @@index([productionDate])
+  @@map("work_in_progress")
 }
 
 // ---------------------------------------------------------------------------
