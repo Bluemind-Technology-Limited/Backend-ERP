@@ -376,10 +376,10 @@ export async function getStationQueue(station: 'ISSUE' | 'GRINDING' | 'FINISHING
   const plans = await getProductionLinePlans();
   return plans.filter((plan) => {
     if (station === 'ISSUE') {
-      return (
-        ISSUABLE_PLAN_STATUSES.includes(plan.status) &&
-        plan.aggregatedIngredients.some((a: any) => a.status !== 'RELEASED')
-      );
+      // Release already deducted the stock, so the Ingredients Station is the
+      // receiving desk: it shows every released batch until the station confirms
+      // the material and grinding starts.
+      return plan.status === 'SCHEDULED';
     }
     if (station === 'GRINDING') {
       return (
@@ -709,11 +709,10 @@ export async function getDailyRecords(filters?: { from?: string; to?: string }) 
 
 export async function issuePlanIngredients(data: {
   planId: string;
-  warehouseId: string;
+  warehouseId?: string;
   lines: Array<{ aggregatedIngredientId: string; quantity: number; batchLotId?: string | null }>;
   issuedById: string;
 }) {
-  if (!data.warehouseId) throw new Error('A warehouse must be selected');
   if (!data.lines?.length) throw new Error('At least one ingredient line is required');
 
   const plan = await prisma.productionPlan.findUnique({
@@ -750,60 +749,14 @@ export async function issuePlanIngredients(data: {
     }
   }
 
-  // Unit costs are captured at issue time so ingredient value stays historical.
-  const costRows = await prisma.material.findMany({
-    where: { id: { in: [...new Set(plan.aggregatedIngredients.map((a) => a.materialId))] } },
-    select: { id: true, standardCost: true },
-  });
-  const costByMaterial = new Map(costRows.map((m) => [m.id, Number(m.standardCost ?? 0)]));
-
+  // Stock already left the store when the plan was released, so the station
+  // records what it physically received without touching the ledger. Deducting
+  // here as well would count the same ingredient twice.
   await prisma.$transaction(async (tx) => {
     for (const line of data.lines) {
       const agg = plan.aggregatedIngredients.find((a) => a.id === line.aggregatedIngredientId);
       if (!agg) throw new Error('Aggregated ingredient does not belong to this plan');
-
-      const quantity = Number(line.quantity);
-      if (!(quantity > 0)) throw new Error('Issued quantity must be greater than zero');
-
-      await postLedgerEntry(tx, {
-        eventType: LedgerEventType.PROD_CONSUMPTION,
-        materialId: agg.materialId,
-        batchLotId: line.batchLotId ?? null,
-        warehouseId: data.warehouseId,
-        quantity: -quantity,
-        unitOfMeasure: agg.unitOfMeasure,
-        referenceType: 'PLAN_ISSUE',
-        referenceId: plan.id,
-        createdById: data.issuedById,
-        notes: `Issued to production plan ${plan.planNumber}`,
-      });
-
-      // One line per issue: material + receipt lot + qty + snapshot cost.
-      await tx.planIngredientIssue.create({
-        data: {
-          productionPlanId: plan.id,
-          aggregatedIngredientId: agg.id,
-          materialId: agg.materialId,
-          batchLotId: line.batchLotId ?? null,
-          quantity,
-          unitOfMeasure: agg.unitOfMeasure,
-          unitCost: costByMaterial.get(agg.materialId) ?? 0,
-          warehouseId: data.warehouseId,
-          issuedById: data.issuedById,
-        },
-      });
-
-      await tx.planAggregatedIngredient.update({
-        where: { id: agg.id },
-        data: {
-          issuedQuantity: Number(agg.issuedQuantity ?? 0) + quantity,
-          issuedWarehouseId: data.warehouseId,
-          issuedBatchLotId: line.batchLotId ?? null,
-          issuedAt: new Date(),
-          issuedById: data.issuedById,
-          status: 'RELEASED',
-        },
-      });
+      if (!(Number(line.quantity) > 0)) throw new Error('Received quantity must be greater than zero');
     }
 
     if (plan.status === 'SCHEDULED') {
@@ -861,6 +814,8 @@ export async function submitGrindingRecord(data: {
   batchNumber?: string | null;
   /** Serial grinding batch number. Omit to take the next number automatically. */
   grindingBatchNumber?: number | string | null;
+  /** Units of mix produced at the grinding station. */
+  mixUnits?: number;
   productionDate?: string;
   remarks?: string;
   recordedById: string;
@@ -1013,6 +968,33 @@ export async function submitGrindingRecord(data: {
         where: { id: created.id },
         data: { returnedTransactionId: firstTransactionId },
       });
+    }
+
+    // Mix setup belongs to the grinding station: the ground mixture is stamped on
+    // the order with a daily MIX- code.
+    const mixUnits = Number(data.mixUnits ?? 0);
+    if (mixUnits > 0) {
+      const order = await tx.productionOrder.findUnique({
+        where: { orderNumber: item.productionPlan.planNumber },
+        select: { id: true },
+      });
+      if (order) {
+        const today = new Date();
+        const dateStr = today.toISOString().split('T')[0].replace(/-/g, '');
+        const dayStart = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+        const count = await tx.productionOrder.count({
+          where: { mixLogDate: { gte: dayStart } },
+        });
+        await tx.productionOrder.update({
+          where: { id: order.id },
+          data: {
+            mixUnits,
+            mixLogDate: today,
+            mixCode: `MIX-${dateStr}-${String(count + 1).padStart(3, '0')}`,
+            status: 'PROCESSING',
+          },
+        });
+      }
     }
 
     return created;
@@ -1183,6 +1165,16 @@ export async function submitFinishingRecord(data: {
       await tx.productionPlan.update({
         where: { id: planId },
         data: { status: 'COMPLETED', completedAt: new Date() },
+      });
+
+      // The order and its plan share one identifier, so completing the plan
+      // closes the order as well.
+      await tx.productionOrder.updateMany({
+        where: {
+          orderNumber: item.productionPlan.planNumber,
+          status: { in: ['SCHEDULED', 'RELEASED', 'PROCESSING'] as never },
+        },
+        data: { status: 'COMPLETED', actualEnd: new Date() },
       });
     }
 

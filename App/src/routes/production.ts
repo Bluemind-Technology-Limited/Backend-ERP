@@ -550,11 +550,12 @@ router.post(
   requirePermission("production", "update"),
   async (req: Request, res: Response) => {
     try {
-      const { scheduledFor } = req.body ?? {};
+      const { scheduledFor, warehouseId } = req.body ?? {};
       const result = await releasePlanIngredients({
         planId: req.params.id,
         releasedById: req.user!.id,
         scheduledFor: scheduledFor ? new Date(scheduledFor) : undefined,
+        warehouseId,
       });
       res.status(201).json({
         message: `Ingredients released for ${result.planNumber}`,
@@ -579,7 +580,7 @@ router.post(
   requirePermission("production", "update"),
   async (req: Request, res: Response) => {
     try {
-      const { scheduledFor } = req.body;
+      const { scheduledFor, warehouseId } = req.body;
 
       if (!scheduledFor) {
         return res.status(400).json({ error: "scheduledFor date is required" });
@@ -588,7 +589,8 @@ router.post(
       const plan = await scheduleProductionPlan(
         req.params.id,
         new Date(scheduledFor),
-        req.user!.id
+        req.user!.id,
+        warehouseId
       );
       res.json({ productionPlan: plan, message: "Ingredients released" });
     } catch (error: any) {
@@ -728,30 +730,25 @@ router.get("/production-orders", requirePermission("production", "read"), async 
       orderBy: { createdAt: "desc" },
     });
 
-    // Flag which orders are plan-linked, so the UI can route release to the
-    // Stock Issue station (the canonical consumer) instead of deducting here.
-    const orderIds = orders.map((o) => o.id);
-    const allocations = orderIds.length
-      ? await prisma.batchMachineAllocation.findMany({
-          where: { productionOrderId: { in: orderIds } },
-          select: {
-            productionOrderId: true,
-            planItem: { select: { productionPlan: { select: { planNumber: true } } } },
-          },
+    // Flag which orders already have their station-side plan, so the UI can
+    // route progress to the stations. The plan number matches the order number.
+    const orderNumbers = orders.map((o) => o.orderNumber);
+    const plans = orderNumbers.length
+      ? await prisma.productionPlan.findMany({
+          where: { planNumber: { in: orderNumbers } },
+          select: { id: true, planNumber: true, status: true },
         })
       : [];
-    const planByOrder = new Map<string, string | null>();
-    for (const a of allocations) {
-      planByOrder.set(a.productionOrderId, a.planItem?.productionPlan?.planNumber ?? null);
-    }
+    const planByNumber = new Map(plans.map((p) => [p.planNumber, p]));
 
     // ProductionOrder stores `machineId` without a Prisma relation. Machine and
     // shift are not part of the active planning response anymore.
     res.json({
       productionOrders: orders.map((o) => ({
         ...o,
-        planLinked: planByOrder.has(o.id),
-        planNumber: planByOrder.get(o.id) ?? null,
+        planLinked: planByNumber.has(o.orderNumber),
+        planId: planByNumber.get(o.orderNumber)?.id ?? null,
+        planNumber: planByNumber.get(o.orderNumber)?.planNumber ?? null,
       })),
     });
   } catch (error) {
@@ -975,279 +972,115 @@ router.post("/production-orders/:id/start", requirePermission("production", "upd
  */
 router.post("/production-orders/:id/release", requirePermission("production", "update"), async (req: Request, res: Response) => {
   try {
-    const { warehouseId, ingredients } = req.body;
+    const { warehouseId } = req.body ?? {};
     if (!warehouseId) {
-      return res.status(400).json({ error: "warehouseId is required" });
-    }
-    if (!ingredients || !Array.isArray(ingredients)) {
-      return res.status(400).json({ error: "ingredients list is required" });
+      return res.status(400).json({ error: "Select the warehouse the ingredients are released from" });
     }
 
     const order = await prisma.productionOrder.findUnique({
       where: { id: req.params.id },
-      include: { productionIngredients: true },
+      include: { bom: { select: { id: true, productName: true } } },
     });
     if (!order) return res.status(404).json({ error: "Production order not found" });
 
-    // Canonical consumption: when this order is allocated to a production plan,
-    // the plan's Stock Issue station is the single path that deducts stock.
-    // Release still records the order's own ingredient tracking + status, but
-    // posts no ledger entry (avoids the historical double deduction).
-    const allocation = await prisma.batchMachineAllocation.findFirst({
-      where: { productionOrderId: order.id },
-      include: {
-        planItem: { include: { productionPlan: { select: { planNumber: true } } } },
-      },
-    });
-    const planLinked = Boolean(allocation);
-    const planNumber = allocation?.planItem.productionPlan.planNumber ?? null;
-
-    await prisma.$transaction(async (tx) => {
-      for (const ingReq of ingredients) {
-        const matchingIng = order.productionIngredients.find(i => i.id === ingReq.id);
-        if (!matchingIng) throw new Error(`Ingredient requirement ${ingReq.id} not found in this order`);
-
-        const releasedQty = Number(ingReq.releasedQuantity);
-        if (releasedQty <= 0) continue;
-
-        await tx.productionIngredient.update({
-          where: { id: matchingIng.id },
-          data: {
-            releasedQuantity: releasedQty,
-            batchLotId: ingReq.batchLotId || null,
-            releasedAt: new Date(),
-            releasedById: req.user!.id,
-          },
-        });
-
-        // Plan-linked: stock is deducted once, at the Stock Issue station.
-        if (planLinked) continue;
-
-        const material = await tx.material.findUnique({
-          where: { id: matchingIng.materialId },
-          select: { unitOfMeasure: true }
-        });
-
-        await postLedgerEntry(tx, {
-          eventType: LedgerEventType.PROD_CONSUMPTION,
-          materialId: matchingIng.materialId,
-          batchLotId: ingReq.batchLotId || null,
-          warehouseId,
-          quantity: -releasedQty,
-          unitOfMeasure: material?.unitOfMeasure || "kg",
-          referenceType: "PROD_ORDER",
-          referenceId: order.id,
-          createdById: req.user!.id,
-          notes: `Released ingredients for order ${order.orderNumber}`,
-        });
-      }
-
-      await tx.productionOrder.update({
-        where: { id: order.id },
-        data: {
-          status: "RELEASED",
-          ingredientsReleasedAt: new Date(),
-          ingredientsReleasedById: req.user!.id,
-        },
+    if (order.status !== "SCHEDULED") {
+      return res.status(409).json({
+        error:
+          order.status === "RELEASED"
+            ? "Ingredients for this order have already been released"
+            : `Only scheduled orders can release ingredients (current: ${order.status})`,
       });
-    });
-
-    res.json({
-      ok: true,
-      stockDeducted: !planLinked,
-      message: planLinked
-        ? `Ingredients recorded for ${order.orderNumber}. Stock is deducted at the Ingredients Station for plan ${planNumber}.`
-        : `Ingredients released for ${order.orderNumber}`,
-    });
-  } catch (error: any) {
-    console.error("POST /production-orders/:id/release error:", error);
-    res.status(500).json({ error: error?.message || "Database error" });
-  }
-});
-
-/**
- * POST /production-orders/:id/mix
- * Records the unit mix generated, generates a mixCode, and transitions status to PROCESSING.
- */
-router.post("/production-orders/:id/mix", requirePermission("production", "update"), async (req: Request, res: Response) => {
-  try {
-    const { mixUnits } = req.body;
-    if (!mixUnits || Number(mixUnits) <= 0) {
-      return res.status(400).json({ error: "mixUnits is required and must be greater than 0" });
     }
 
-    const order = await prisma.productionOrder.findUnique({ where: { id: req.params.id } });
-    if (!order) return res.status(404).json({ error: "Production order not found" });
-
-    const today = new Date();
-    const dateStr = today.toISOString().split("T")[0].replace(/-/g, "");
-    const todayStart = new Date(today.setHours(0,0,0,0));
-    const count = await prisma.productionOrder.count({
-      where: {
-        mixLogDate: { gte: todayStart }
-      }
+    // One order = one plan item. The station-side record is created here, on
+    // release, and carries the order number so the plan, the three stations and
+    // the ledger all show the same identifier.
+    const existing = await prisma.productionPlan.findUnique({
+      where: { planNumber: order.orderNumber },
+      select: { id: true },
     });
-    const seqStr = String(count + 1).padStart(3, "0");
-    const mixCode = `MIX-${dateStr}-${seqStr}`;
+
+    let planId = existing?.id;
+    if (!planId) {
+      const created = await createProductionPlan({
+        planNumber: order.orderNumber,
+        description: `${order.bom?.productName ?? "Production"} — ${order.orderNumber}`,
+        scheduledFor: order.scheduledStart ?? new Date(),
+        createdById: req.user!.id,
+        items: [{ bomId: order.bomId, targetQuantity: Number(order.targetQuantity) }],
+      });
+      planId = created.id;
+    }
+
+    const result = await releasePlanIngredients({
+      planId,
+      releasedById: req.user!.id,
+      scheduledFor: order.scheduledStart ?? undefined,
+      warehouseId,
+    });
 
     await prisma.productionOrder.update({
       where: { id: order.id },
       data: {
-        mixCode,
-        mixUnits: Number(mixUnits),
-        mixLogDate: new Date(),
-        status: "PROCESSING"
-      }
+        status: "RELEASED",
+        ingredientsReleasedAt: new Date(),
+        ingredientsReleasedById: req.user!.id,
+        actualStart: order.scheduledStart ?? null,
+      },
     });
 
-    res.json({ ok: true, mixCode, message: `Batch mix recorded: ${mixCode}` });
+    res.status(201).json({
+      ok: true,
+      planId,
+      summary: result.summary,
+      message: `Ingredients released for ${order.orderNumber}`,
+    });
   } catch (error: any) {
-    console.error("POST /production-orders/:id/mix error:", error);
+    if (error instanceof PlanReleaseError || error?.statusCode) {
+      return res.status(error.statusCode ?? 400).json({ error: error.message });
+    }
+    console.error("POST /production/production-orders/:id/release error:", error);
     res.status(500).json({ error: error?.message || "Database error" });
   }
 });
 
 /**
- * POST /production-orders/:id/returns
- * Logs returned/deficit ingredients, writing positive ledger entries to restore stock.
+ * POST /production-orders/:id/mix — retired.
+ * The mix is recorded at the Grinding Station, alongside the grinding batch number.
  */
-router.post("/production-orders/:id/returns", requirePermission("production", "update"), async (req: Request, res: Response) => {
-  try {
-    const { warehouseId, returns } = req.body;
-    if (!warehouseId) {
-      return res.status(400).json({ error: "warehouseId is required" });
-    }
-    if (!returns || !Array.isArray(returns)) {
-      return res.status(400).json({ error: "returns list is required" });
-    }
-
-    const order = await prisma.productionOrder.findUnique({
-      where: { id: req.params.id },
-      include: { productionIngredients: true },
-    });
-    if (!order) return res.status(404).json({ error: "Production order not found" });
-
-    await prisma.$transaction(async (tx) => {
-      for (const ret of returns) {
-        const matchingIng = order.productionIngredients.find(i => i.id === ret.id);
-        if (!matchingIng) throw new Error(`Ingredient ${ret.id} not found in this order`);
-
-        const returnedQty = Number(ret.returnedQuantity);
-        if (returnedQty <= 0) continue;
-
-        await tx.productionIngredient.update({
-          where: { id: matchingIng.id },
-          data: {
-            returnedQuantity: returnedQty,
-          },
-        });
-
-        const material = await tx.material.findUnique({
-          where: { id: matchingIng.materialId },
-          select: { unitOfMeasure: true }
-        });
-
-        await postLedgerEntry(tx, {
-          eventType: LedgerEventType.ADJUSTMENT,
-          materialId: matchingIng.materialId,
-          batchLotId: matchingIng.batchLotId || null,
-          warehouseId,
-          quantity: returnedQty,
-          unitOfMeasure: material?.unitOfMeasure || "kg",
-          referenceType: "PROD_ORDER",
-          referenceId: order.id,
-          createdById: req.user!.id,
-          notes: `Deficit return from order ${order.orderNumber}`,
-        });
-      }
-    });
-
-    res.json({ ok: true, message: "Deficit/returns recorded successfully" });
-  } catch (error: any) {
-    console.error("POST /production-orders/:id/returns error:", error);
-    res.status(500).json({ error: error?.message || "Database error" });
-  }
+router.post("/production-orders/:id/mix", requirePermission("production", "update"), async (_req: Request, res: Response) => {
+  // Retired: the mix is captured at the Grinding Station, which stamps the
+  // MIX- code on the order together with the grinding batch number.
+  res.status(409).json({
+    error:
+      "Mixing is recorded at the Grinding Station now. Record the grinding batch and its mix units there.",
+  });
 });
 
 /**
- * POST /production-orders/:id/complete
- * Logs actual yield, creates finished batch lot (expiry 2 years out), and completes the order.
+ * POST /production-orders/:id/returns — retired.
+ * The station holding the material records the return, so it is never counted twice.
  */
-router.post("/production-orders/:id/complete", requirePermission("production", "update"), async (req: Request, res: Response) => {
-  try {
-    const { batchNumber, warehouseId, actualYield } = req.body;
-    if (!batchNumber || !warehouseId || actualYield === undefined) {
-      return res.status(400).json({ error: "batchNumber, warehouseId, and actualYield are required" });
-    }
+router.post("/production-orders/:id/returns", requirePermission("production", "update"), async (_req: Request, res: Response) => {
+  // Retired: unused material is returned by the station that physically holds
+  // it (grinding remainders / production losses) so it can never be counted twice.
+  res.status(409).json({
+    error:
+      "Returns are recorded at the station holding the material (Grinding or Production Station).",
+  });
+});
 
-    const order = await prisma.productionOrder.findUnique({
-      where: { id: req.params.id },
-      include: { bom: true },
-    });
-    if (!order) return res.status(404).json({ error: "Production order not found" });
-    if (order.status !== "PROCESSING") return res.status(400).json({ error: "Order must be PROCESSING to complete" });
-
-    const finishedSkuId = order.bom.finishedSkuId;
-    const yieldQty = Number(actualYield);
-    const finishedSku = await prisma.material.findUnique({
-      where: { id: finishedSkuId! },
-      select: { unitOfMeasure: true },
-    });
-
-    const targetQty = Number(order.targetQuantity);
-    const errorPercentage = targetQty > 0 ? (Math.abs(yieldQty - targetQty) / targetQty) * 100 : 0;
-
-    const expiryDate = new Date();
-    expiryDate.setFullYear(expiryDate.getFullYear() + 2);
-
-    const result = await prisma.$transaction(async (tx) => {
-      const batchLot = await tx.batchLot.create({
-        data: {
-          materialId: finishedSkuId!,
-          batchNumber,
-          manufacturingDate: new Date(),
-          expiryDate: expiryDate,
-          // QA inspects received goods only — finished output is available at once.
-          status: "ACTIVE",
-          // Finished production batch — the supervisor typed this batch number.
-          origin: "FINISHED",
-        },
-      });
-
-      await postLedgerEntry(tx, {
-        eventType: LedgerEventType.PROD_OUTPUT,
-        materialId: finishedSkuId!,
-        batchLotId: batchLot.id,
-        warehouseId,
-        quantity: yieldQty,
-        unitOfMeasure: finishedSku?.unitOfMeasure ?? order.bom.yieldUnit ?? "kg",
-        referenceType: "PROD_ORDER",
-        referenceId: order.id,
-        createdById: req.user!.id,
-        notes: `Output for ${order.orderNumber} (batch ${batchNumber})`,
-      });
-
-      await tx.productionOrder.update({
-        where: { id: order.id },
-        data: {
-          status: "COMPLETED",
-          actualEnd: new Date(),
-          actualYield: yieldQty,
-          errorPercentage: errorPercentage,
-          finishedBatchId: batchLot.id,
-          yieldLoggedAt: new Date(),
-          yieldLoggedById: req.user!.id,
-        },
-      });
-
-      return batchLot;
-    });
-
-    res.json({ ok: true, batchLot: result, message: `Batch ${batchNumber} completed with ${errorPercentage.toFixed(2)}% error` });
-  } catch (error: any) {
-    console.error("POST /production-orders/:id/complete error:", error);
-    res.status(500).json({ error: error?.message || "Database error" });
-  }
+/**
+ * POST /production-orders/:id/complete — retired.
+ * Finished goods are posted once, by the Production Station.
+ */
+router.post("/production-orders/:id/complete", requirePermission("production", "update"), async (_req: Request, res: Response) => {
+  // Retired: finished goods are posted once, by the Production Station. This
+  // path used to create a second batch lot and a second output ledger entry.
+  res.status(409).json({
+    error:
+      "Production is completed at the Production Station. Record the finished output there.",
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -1,4 +1,6 @@
 import { prisma } from "../lib/db.js";
+import { postLedgerEntry } from "../lib/ledger.js";
+import { LedgerEventType } from "@prisma/client";
 import { packWeightFrom, percentageIngredientPacks } from "../lib/uom.js";
 import { notifyStationWorkOrders, refreshStationWorkOrders } from "./productionStationService.js";
 import { provisionPlanBatches } from "./productionBatchService.js";
@@ -8,6 +10,11 @@ export interface CreateProductionPlanInput {
   description?: string;
   scheduledFor?: Date;
   createdById: string;
+  /**
+   * Explicit plan number. Production orders pass their own PRD- number here so
+   * one order has one identifier across the plan, the stations and the ledger.
+   */
+  planNumber?: string;
   /** Products (batch formulations) to run on this plan, in order. */
   items?: Array<{ bomId: string; targetQuantity: number }>;
 }
@@ -29,7 +36,7 @@ export interface AggregatedIngredient {
  */
 export async function createProductionPlan(input: CreateProductionPlanInput) {
   try {
-    const planNumber = `PLAN-${Date.now().toString().slice(-8)}`;
+    const planNumber = input.planNumber ?? `PLAN-${Date.now().toString().slice(-8)}`;
     const items = input.items ?? [];
 
     if (items.length > 0) {
@@ -847,6 +854,136 @@ export class PlanReleaseError extends Error {
 }
 
 /**
+ * Deduct the plan's consolidated requirement from one warehouse, taking the
+ * earliest-expiring lot first and splitting across lots when one is not enough.
+ *
+ * This is the single point where ingredient stock leaves the store: the
+ * Ingredients Station only confirms what it physically received, so a batch can
+ * never be deducted twice. Every slice is written to the ledger and to
+ * `PlanIngredientIssue`, which is the plan's lot-level lineage record.
+ */
+async function consumePlanRequirements(
+  tx: any,
+  planId: string,
+  warehouseId: string,
+  userId: string
+) {
+  const requirements = await tx.planAggregatedIngredient.findMany({
+    where: { productionPlanId: planId },
+    include: { material: { select: { name: true, standardCost: true } } },
+    orderBy: { material: { name: "asc" } },
+  });
+
+  const shortages: string[] = [];
+
+  for (const req of requirements) {
+    let remaining = Number(req.totalQuantity ?? 0);
+    if (!(remaining > 0)) continue;
+
+    const balances = await tx.inventoryTransaction.groupBy({
+      by: ["batchLotId"],
+      where: { materialId: req.materialId, warehouseId },
+      _sum: { quantity: true },
+    });
+
+    const candidates = balances
+      .map((row: any) => ({
+        batchLotId: row.batchLotId as string | null,
+        quantity: Number(row._sum.quantity ?? 0),
+      }))
+      .filter((row: any) => row.quantity > 0);
+
+    const available = candidates.reduce((sum: number, row: any) => sum + row.quantity, 0);
+
+    const lotIds = candidates.map((row: any) => row.batchLotId).filter(Boolean) as string[];
+    const lots = lotIds.length
+      ? await tx.batchLot.findMany({
+          where: { id: { in: lotIds } },
+          select: { id: true, expiryDate: true, lotCode: true, batchNumber: true },
+        })
+      : [];
+    const lotById = new Map<string, any>(lots.map((lot: any) => [lot.id, lot]));
+
+    // FEFO: nearest expiry first; lots without an expiry are taken last.
+    candidates.sort((a: any, b: any) => {
+      const ea = a.batchLotId ? lotById.get(a.batchLotId)?.expiryDate ?? null : null;
+      const eb = b.batchLotId ? lotById.get(b.batchLotId)?.expiryDate ?? null : null;
+      if (ea && eb) return ea.getTime() - eb.getTime();
+      if (ea) return -1;
+      if (eb) return 1;
+      return 0;
+    });
+
+    if (available + 0.0001 < remaining) {
+      shortages.push(
+        `${req.material?.name ?? "Ingredient"}: needs ${remaining}, only ${available} in the selected warehouse`
+      );
+      continue;
+    }
+
+    const unitCost = Number(req.material?.standardCost ?? 0);
+    let taken = 0;
+    let firstLotId: string | null = null;
+
+    for (const lot of candidates) {
+      if (remaining <= 0.0001) break;
+      const take = Math.min(remaining, lot.quantity);
+      if (!(take > 0)) continue;
+
+      await postLedgerEntry(tx, {
+        eventType: LedgerEventType.PROD_CONSUMPTION,
+        materialId: req.materialId,
+        batchLotId: lot.batchLotId,
+        warehouseId,
+        quantity: -take,
+        unitOfMeasure: req.unitOfMeasure,
+        referenceType: "PLAN_RELEASE",
+        referenceId: planId,
+        createdById: userId,
+        notes: `Released to production (${req.material?.name ?? "ingredient"})`,
+      });
+
+      await tx.planIngredientIssue.create({
+        data: {
+          productionPlanId: planId,
+          aggregatedIngredientId: req.id,
+          materialId: req.materialId,
+          batchLotId: lot.batchLotId,
+          quantity: take,
+          unitOfMeasure: req.unitOfMeasure,
+          unitCost,
+          warehouseId,
+          issuedById: userId,
+        },
+      });
+
+      if (!firstLotId) firstLotId = lot.batchLotId;
+      remaining -= take;
+      taken += take;
+    }
+
+    await tx.planAggregatedIngredient.update({
+      where: { id: req.id },
+      data: {
+        issuedQuantity: taken,
+        issuedWarehouseId: warehouseId,
+        issuedBatchLotId: firstLotId,
+        issuedAt: new Date(),
+        issuedById: userId,
+        status: "RELEASED",
+      },
+    });
+  }
+
+  if (shortages.length > 0) {
+    throw new PlanReleaseError(
+      `Not enough stock to release: ${shortages.join("; ")}`,
+      400
+    );
+  }
+}
+
+/**
  * Centralized ingredient release.
  *
  * One transaction performs the whole release: validate the approved formulas,
@@ -859,7 +996,13 @@ export async function releasePlanIngredients(input: {
   planId: string;
   releasedById: string;
   scheduledFor?: Date | null;
+  /** Warehouse the ingredients are released from. Stock leaves the store here. */
+  warehouseId?: string | null;
 }) {
+  if (!input.warehouseId) {
+    throw new PlanReleaseError("Select the warehouse the ingredients are released from", 400);
+  }
+  const releaseWarehouseId: string = input.warehouseId;
   const releasedAt = new Date();
 
   const outcome = await prisma.$transaction(async (tx) => {
@@ -958,8 +1101,8 @@ export async function releasePlanIngredients(input: {
       );
     }
 
-    // Give every plan item its one authoritative production batch lot and the
-    // pending QA inspection. Stations only ever reference these lots.
+    // Give every plan item its one authoritative production batch lot. It is
+    // active immediately: the chain has a single QA gate, on the way in.
     try {
       await provisionPlanBatches(tx, plan.id, scheduledFor);
     } catch (error: any) {
@@ -968,6 +1111,10 @@ export async function releasePlanIngredients(input: {
         400
       );
     }
+
+    // Release is where stock moves: the requirement is deducted here and the
+    // Ingredients Station only confirms what it received.
+    await consumePlanRequirements(tx, plan.id, releaseWarehouseId, input.releasedById);
 
     await notifyStationWorkOrders({
       planId: plan.id,
@@ -1027,9 +1174,10 @@ export async function releasePlanIngredients(input: {
 export async function scheduleProductionPlan(
   planId: string,
   scheduledFor: Date,
-  releasedById: string
+  releasedById: string,
+  warehouseId?: string | null
 ) {
-  await releasePlanIngredients({ planId, releasedById, scheduledFor });
+  await releasePlanIngredients({ planId, releasedById, scheduledFor, warehouseId });
   return getProductionPlan(planId);
 }
 

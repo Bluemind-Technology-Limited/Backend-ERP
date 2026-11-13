@@ -139,8 +139,10 @@ export async function provisionPlanBatches(
         ingredientCode: sku.traceabilityCode,
         yearCode,
         origin: 'FINISHED',
-        // Quality approval is pending; the lot is released when QA approves it.
-        status: 'QUARANTINE',
+        // The only QA gate in the chain is the incoming one. A production batch
+        // is usable immediately, so stations and finished goods can reference it
+        // without a second review.
+        status: 'ACTIVE',
         manufacturingDate: productionDate,
         expiryDate,
         notes: `Production batch for plan ${planId}`,
@@ -150,18 +152,6 @@ export async function provisionPlanBatches(
     await tx.productionPlanItem.update({
       where: { id: item.id },
       data: { batchLotId: batchLot.id },
-    });
-
-    await tx.inspectionRecord.create({
-      data: {
-        inspectionType: 'FINISHED_BATCH',
-        materialId: sku.id,
-        batchLotId: batchLot.id,
-        // The QA list resolves this to the plan number + product.
-        referenceId: item.id,
-        result: 'PENDING',
-        notes: 'Awaiting QA approval of the production batch code',
-      },
     });
 
     provisions.push({ planItemId: item.id, batchLotId: batchLot.id, lotCode });

@@ -67,6 +67,10 @@ export interface StockRow {
   unitOfMeasure: string;
   batchLotId: string | null;
   batchNumber: string | null;
+  /** Full lot code (set-based identifier) for the batch behind this row. */
+  lotCode?: string | null;
+  /** Batch lot status, e.g. QUARANTINE / APPROVED. */
+  batchStatus?: string | null;
   manufacturingDate?: Date | null;
   expiryDate?: Date | null;
   warehouseId: string;
@@ -109,7 +113,7 @@ export async function getStock(
     }),
     prisma.warehouse.findMany({ where: { id: { in: warehouseIds } }, select: { id: true, name: true } }),
     batchIds.length
-      ? prisma.batchLot.findMany({ where: { id: { in: batchIds } }, select: { id: true, batchNumber: true, manufacturingDate: true, expiryDate: true } })
+      ? prisma.batchLot.findMany({ where: { id: { in: batchIds } }, select: { id: true, batchNumber: true, lotCode: true, status: true, manufacturingDate: true, expiryDate: true } })
       : Promise.resolve([]),
   ]);
 
@@ -127,6 +131,8 @@ export async function getStock(
         unitOfMeasure: g.unitOfMeasure,
         batchLotId: g.batchLotId,
         batchNumber: g.batchLotId ? batchMap.get(g.batchLotId)?.batchNumber ?? null : null,
+        lotCode: g.batchLotId ? batchMap.get(g.batchLotId)?.lotCode ?? null : null,
+        batchStatus: g.batchLotId ? batchMap.get(g.batchLotId)?.status ?? null : null,
         manufacturingDate: g.batchLotId ? batchMap.get(g.batchLotId)?.manufacturingDate ?? null : null,
         expiryDate: g.batchLotId ? batchMap.get(g.batchLotId)?.expiryDate ?? null : null,
         warehouseId: g.warehouseId,

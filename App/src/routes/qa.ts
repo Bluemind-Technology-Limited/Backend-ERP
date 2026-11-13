@@ -13,6 +13,7 @@ import {
 } from "../lib/r2.js";
 import { logActivity } from "../services/userActivityLogger.js";
 import { updateBatchLotSetNumber, type SetNumberEditResult } from "../lib/lotCode.js";
+import { recomputePurchaseOrderStatus } from "../services/purchaseOrderStatus.js";
 import {
   applyFinishedBatchApproval,
   applyFinishedBatchRejection,
@@ -82,7 +83,7 @@ router.get("/inspections", requirePermission("qa", "read"), async (req: Request,
     // Resolve the reference (GRN or Production Order) for context
     const grnIds = inspections.filter((i) => i.inspectionType === "GRN").map((i) => i.referenceId).filter(Boolean) as string[];
     const prodIds = inspections.filter((i) => i.inspectionType === "FINISHED_BATCH").map((i) => i.referenceId).filter(Boolean) as string[];
-    const [grns, prodOrders, planItems] = await Promise.all([
+    const [grns, prodOrders, planItems, grnItems] = await Promise.all([
       grnIds.length
         ? prisma.goodsReceipt.findMany({ where: { id: { in: grnIds } }, select: { id: true, number: true } })
         : Promise.resolve([]),
@@ -100,6 +101,18 @@ router.get("/inspections", requirePermission("qa", "read"), async (req: Request,
             },
           })
         : Promise.resolve([]),
+      grnIds.length
+        ? prisma.goodsReceiptItem.findMany({
+            where: { grnId: { in: grnIds } },
+            select: {
+              grnId: true,
+              materialId: true,
+              batchLotId: true,
+              quantity: true,
+              unitOfMeasure: true,
+            },
+          })
+        : Promise.resolve([]),
     ]);
     const grnMap = new Map(grns.map((g) => [g.id, g.number]));
     const prodMap = new Map(prodOrders.map((p) => [p.id, p.orderNumber]));
@@ -109,14 +122,28 @@ router.get("/inspections", requirePermission("qa", "read"), async (req: Request,
         `${p.productionPlan?.planNumber ?? "PLAN"} · ${p.bom?.productName ?? "batch"}`,
       ])
     );
+    const grnItemMap = new Map(
+      grnItems.map((item) => [
+        `${item.grnId}:${item.materialId}:${item.batchLotId}`,
+        item,
+      ])
+    );
 
-    const rows = inspections.map((i) => ({
-      ...i,
-      referenceLabel:
-        i.inspectionType === "GRN"
-          ? grnMap.get(i.referenceId ?? "") ?? i.referenceId
-          : prodMap.get(i.referenceId ?? "") ?? planItemMap.get(i.referenceId ?? "") ?? i.referenceId,
-    }));
+    const rows = inspections.map((i) => {
+      const grnItem =
+        i.inspectionType === "GRN" && i.referenceId
+          ? grnItemMap.get(`${i.referenceId}:${i.materialId}:${i.batchLotId}`)
+          : null;
+      return {
+        ...i,
+        receivedQuantity: grnItem?.quantity ?? null,
+        receivedUnitOfMeasure: grnItem?.unitOfMeasure ?? null,
+        referenceLabel:
+          i.inspectionType === "GRN"
+            ? grnMap.get(i.referenceId ?? "") ?? i.referenceId
+            : prodMap.get(i.referenceId ?? "") ?? planItemMap.get(i.referenceId ?? "") ?? i.referenceId,
+      };
+    });
 
     res.json({ inspections: rows });
   } catch (error) {
@@ -126,12 +153,91 @@ router.get("/inspections", requirePermission("qa", "read"), async (req: Request,
 });
 
 /**
- * POST /inspections/:id/release
- * PASS the inspection and release the batch lot from QUARANTINE -> ACTIVE.
+ * QA-only received-quantity edit.
+ * Updates the GRN line, posts the stock delta and keeps the PO balance/status in
+ * step. Only PENDING GRN inspections reach this path.
  */
+async function applyQaQuantityEdit(
+  tx: any,
+  inspection: { id: string; inspectionType: string; referenceId: string | null; materialId: string; batchLotId: string | null },
+  rawQuantity: unknown,
+  userId: string
+) {
+  if (inspection.inspectionType !== "GRN") return;
+  if (rawQuantity === undefined || rawQuantity === null || String(rawQuantity).trim() === "") return;
+
+  const quantity = Number(rawQuantity);
+  if (!Number.isFinite(quantity) || quantity <= 0) {
+    throw new Error("Received quantity must be greater than zero");
+  }
+  if (!inspection.referenceId) return;
+
+  const item = await tx.goodsReceiptItem.findFirst({
+    where: {
+      grnId: inspection.referenceId,
+      materialId: inspection.materialId,
+      ...(inspection.batchLotId ? { batchLotId: inspection.batchLotId } : {}),
+    },
+    select: { id: true, quantity: true, unitOfMeasure: true, batchLotId: true, materialId: true },
+  });
+  if (!item) throw new Error("GRN line not found for this inspection");
+
+  const delta = Number((quantity - Number(item.quantity)).toFixed(4));
+  if (Math.abs(delta) < 0.0001) return;
+
+  const movement = await tx.inventoryTransaction.findFirst({
+    where: {
+      referenceType: "GRN",
+      referenceId: inspection.referenceId,
+      batchLotId: item.batchLotId,
+    },
+    select: { warehouseId: true },
+  });
+  if (!movement?.warehouseId) {
+    throw new Error("Cannot adjust quantity: original receipt movement not found");
+  }
+
+  await tx.goodsReceiptItem.update({
+    where: { id: item.id },
+    data: { quantity },
+  });
+
+  await postLedgerEntry(tx, {
+    eventType: LedgerEventType.ADJUSTMENT,
+    materialId: item.materialId,
+    batchLotId: item.batchLotId,
+    warehouseId: movement.warehouseId,
+    quantity: delta,
+    unitOfMeasure: item.unitOfMeasure,
+    referenceType: "QA_QUANTITY_EDIT",
+    referenceId: inspection.id,
+    createdById: userId,
+    notes: `QA adjusted received quantity ${item.quantity} → ${quantity}`,
+  });
+
+  const receipt = await tx.goodsReceipt.findUnique({
+    where: { id: inspection.referenceId },
+    select: { poId: true },
+  });
+  if (receipt?.poId) {
+    const poItem = await tx.purchaseOrderItem.findFirst({
+      where: { poId: receipt.poId, materialId: item.materialId },
+      select: { id: true, receivedQty: true },
+    });
+    if (poItem) {
+      await tx.purchaseOrderItem.update({
+        where: { id: poItem.id },
+        data: {
+          receivedQty: Math.max(0, Number(poItem.receivedQty) + delta),
+        },
+      });
+    }
+    await recomputePurchaseOrderStatus(tx, receipt.poId);
+  }
+}
 router.post("/inspections/:id/release", requirePermission("qa", "approve"), async (req: Request, res: Response) => {
   try {
-    const { notes, setNumber } = req.body;
+    const { notes, setNumber, quantity } = req.body;
     const inspection = await prisma.inspectionRecord.findUnique({
       where: { id: req.params.id },
       include: { batchLot: true },
@@ -147,6 +253,8 @@ router.post("/inspections/:id/release", requirePermission("qa", "approve"), asyn
         inspection.batchLot
           ? await updateBatchLotSetNumber(tx, inspection.batchLot.id, setNumber)
           : null;
+
+      await applyQaQuantityEdit(tx, inspection, quantity, req.user!.id);
 
       let updated;
       if (isFinishedBatch && inspection.batchLot) {
@@ -327,14 +435,14 @@ router.patch(
   requirePermission("qa", "update"),
   async (req: Request, res: Response) => {
     try {
-      const { notes, setNumber } = req.body ?? {};
+      const { notes, setNumber, quantity } = req.body ?? {};
       if (notes !== undefined && notes !== null && typeof notes !== "string") {
         return res.status(400).json({ error: "notes must be text" });
       }
 
       const inspection = await prisma.inspectionRecord.findUnique({
         where: { id: req.params.id },
-        select: { id: true, result: true, batchLotId: true, inspectionType: true },
+        select: { id: true, result: true, batchLotId: true, inspectionType: true, referenceId: true, materialId: true },
       });
       if (!inspection) return res.status(404).json({ error: "Inspection record not found" });
       if (inspection.result !== "PENDING") {
@@ -346,6 +454,19 @@ router.patch(
           inspection.batchLotId
             ? await updateBatchLotSetNumber(tx, inspection.batchLotId, setNumber)
             : null;
+
+        await applyQaQuantityEdit(
+          tx,
+          {
+            id: inspection.id,
+            inspectionType: inspection.inspectionType,
+            referenceId: inspection.referenceId,
+            materialId: inspection.materialId,
+            batchLotId: inspection.batchLotId,
+          },
+          quantity,
+          req.user!.id
+        );
 
         if (codeChange?.lotCode && inspection.batchLotId) {
           await tx.productionStageRecord.updateMany({

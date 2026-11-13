@@ -283,6 +283,7 @@ router.post(
         machineId,
         batchNumber,
         grindingBatchNumber,
+        mixUnits,
         productionDate,
         remarks,
       } = req.body;
@@ -322,6 +323,7 @@ router.post(
         machineId: machineId ?? null,
         batchNumber: batchNumber ?? null,
         grindingBatchNumber: grindingBatchNumber ?? null,
+        mixUnits: mixUnits === undefined ? undefined : Number(mixUnits),
         productionDate,
         remarks,
         recordedById: req.user!.id,

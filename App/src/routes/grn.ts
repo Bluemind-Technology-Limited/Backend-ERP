@@ -287,6 +287,23 @@ router.post("/", requirePermission("procurement", "create"), async (req: Request
     // Never receive more than the PO still has outstanding — the remainder is
     // what a later receipt is allowed to claim.
     if (po) {
+      // PO receipts are locked to the outstanding line quantity. QA is the only
+      // role that can adjust a received quantity afterwards.
+      const poLineById = new Map(po.items.map((line) => [line.id, line]));
+      for (const it of items) {
+        if (!it?.poItemId) continue;
+        const line = poLineById.get(String(it.poItemId));
+        if (!line) {
+          return res.status(400).json({ error: "PO line not found for this receipt" });
+        }
+        const outstanding = Number(line.quantity) - Number(line.receivedQty);
+        if (Math.abs(Number(it.quantity) - outstanding) > 0.0001) {
+          return res.status(400).json({
+            error: `The received quantity is locked to the outstanding PO quantity (${outstanding}). QA can adjust it after receipt.`,
+          });
+        }
+      }
+
       const requestedByMaterial = new Map<string, number>();
       for (const it of items) {
         if (!it?.materialId) continue;
