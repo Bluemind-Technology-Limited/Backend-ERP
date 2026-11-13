@@ -550,15 +550,14 @@ router.post(
   requirePermission("production", "update"),
   async (req: Request, res: Response) => {
     try {
-      const { scheduledFor, warehouseId } = req.body ?? {};
+      const { scheduledFor } = req.body ?? {};
       const result = await releasePlanIngredients({
         planId: req.params.id,
         releasedById: req.user!.id,
         scheduledFor: scheduledFor ? new Date(scheduledFor) : undefined,
-        warehouseId,
       });
       res.status(201).json({
-        message: `Ingredients released for ${result.planNumber}`,
+        message: `Order ${result.planNumber} released — waiting at the Ingredients Station`,
         ...result,
       });
     } catch (error: any) {
@@ -580,7 +579,7 @@ router.post(
   requirePermission("production", "update"),
   async (req: Request, res: Response) => {
     try {
-      const { scheduledFor, warehouseId } = req.body;
+      const { scheduledFor } = req.body;
 
       if (!scheduledFor) {
         return res.status(400).json({ error: "scheduledFor date is required" });
@@ -589,8 +588,7 @@ router.post(
       const plan = await scheduleProductionPlan(
         req.params.id,
         new Date(scheduledFor),
-        req.user!.id,
-        warehouseId
+        req.user!.id
       );
       res.json({ productionPlan: plan, message: "Ingredients released" });
     } catch (error: any) {
@@ -967,73 +965,121 @@ router.post("/production-orders/:id/start", requirePermission("production", "upd
 });
 
 /**
- * POST /production-orders/:id/release
- * Releases ingredients, updates releasedQuantity/batchLotId, and logs negative PROD_CONSUMPTION entries.
+ * Release one production order: create/look up its plan, snapshot the
+ * requirement and hand it to the Ingredients Station. No stock moves here —
+ * the Ingredients Manager deducts it when they release to grinding.
  */
-router.post("/production-orders/:id/release", requirePermission("production", "update"), async (req: Request, res: Response) => {
+async function releaseProductionOrder(orderId: string, userId: string) {
+  const order = await prisma.productionOrder.findUnique({
+    where: { id: orderId },
+    include: { bom: { select: { id: true, productName: true } } },
+  });
+  if (!order) throw new PlanReleaseError("Production order not found", 404);
+
+  if (order.status !== "SCHEDULED") {
+    throw new PlanReleaseError(
+      order.status === "RELEASED"
+        ? `${order.orderNumber} has already been released`
+        : `Only scheduled orders can be released (${order.orderNumber}: ${order.status})`,
+      order.status === "RELEASED" ? 409 : 400
+    );
+  }
+
+  // One order = one plan item. The station-side record is created here and
+  // carries the order number so the plan, the stations and the ledger all show
+  // the same identifier.
+  const existing = await prisma.productionPlan.findUnique({
+    where: { planNumber: order.orderNumber },
+    select: { id: true },
+  });
+
+  let planId = existing?.id;
+  if (!planId) {
+    const created = await createProductionPlan({
+      planNumber: order.orderNumber,
+      description: `${order.bom?.productName ?? "Production"} — ${order.orderNumber}`,
+      scheduledFor: order.scheduledStart ?? new Date(),
+      createdById: userId,
+      items: [{ bomId: order.bomId, targetQuantity: Number(order.targetQuantity) }],
+    });
+    planId = created.id;
+  }
+
+  await releasePlanIngredients({
+    planId,
+    releasedById: userId,
+    scheduledFor: order.scheduledStart ?? undefined,
+  });
+
+  await prisma.productionOrder.update({
+    where: { id: order.id },
+    data: {
+      status: "RELEASED",
+      ingredientsReleasedAt: new Date(),
+      ingredientsReleasedById: userId,
+      actualStart: order.scheduledStart ?? null,
+    },
+  });
+
+  return { orderNumber: order.orderNumber, planId };
+}
+
+/**
+ * POST /production-orders/release-day
+ * Releases every planned order for one day in a single action.
+ * Body: { orderIds: string[] }
+ */
+router.post("/production-orders/release-day", requirePermission("production", "update"), async (req: Request, res: Response) => {
   try {
-    const { warehouseId } = req.body ?? {};
-    if (!warehouseId) {
-      return res.status(400).json({ error: "Select the warehouse the ingredients are released from" });
+    const { orderIds } = req.body ?? {};
+    if (!Array.isArray(orderIds) || orderIds.length === 0) {
+      return res.status(400).json({ error: "orderIds must be a non-empty array" });
     }
 
-    const order = await prisma.productionOrder.findUnique({
-      where: { id: req.params.id },
-      include: { bom: { select: { id: true, productName: true } } },
-    });
-    if (!order) return res.status(404).json({ error: "Production order not found" });
+    const released: string[] = [];
+    const skipped: Array<{ orderId: string; reason: string }> = [];
 
-    if (order.status !== "SCHEDULED") {
-      return res.status(409).json({
-        error:
-          order.status === "RELEASED"
-            ? "Ingredients for this order have already been released"
-            : `Only scheduled orders can release ingredients (current: ${order.status})`,
+    for (const id of orderIds) {
+      try {
+        const result = await releaseProductionOrder(String(id), req.user!.id);
+        released.push(result.orderNumber);
+      } catch (error: any) {
+        skipped.push({ orderId: String(id), reason: error?.message ?? "Failed to release" });
+      }
+    }
+
+    if (released.length === 0) {
+      return res.status(400).json({
+        error: skipped[0]?.reason ?? "No orders could be released",
       });
     }
-
-    // One order = one plan item. The station-side record is created here, on
-    // release, and carries the order number so the plan, the three stations and
-    // the ledger all show the same identifier.
-    const existing = await prisma.productionPlan.findUnique({
-      where: { planNumber: order.orderNumber },
-      select: { id: true },
-    });
-
-    let planId = existing?.id;
-    if (!planId) {
-      const created = await createProductionPlan({
-        planNumber: order.orderNumber,
-        description: `${order.bom?.productName ?? "Production"} — ${order.orderNumber}`,
-        scheduledFor: order.scheduledStart ?? new Date(),
-        createdById: req.user!.id,
-        items: [{ bomId: order.bomId, targetQuantity: Number(order.targetQuantity) }],
-      });
-      planId = created.id;
-    }
-
-    const result = await releasePlanIngredients({
-      planId,
-      releasedById: req.user!.id,
-      scheduledFor: order.scheduledStart ?? undefined,
-      warehouseId,
-    });
-
-    await prisma.productionOrder.update({
-      where: { id: order.id },
-      data: {
-        status: "RELEASED",
-        ingredientsReleasedAt: new Date(),
-        ingredientsReleasedById: req.user!.id,
-        actualStart: order.scheduledStart ?? null,
-      },
-    });
 
     res.status(201).json({
       ok: true,
-      planId,
-      summary: result.summary,
-      message: `Ingredients released for ${order.orderNumber}`,
+      released,
+      skipped,
+      message: `${released.length} order(s) released to the Ingredients Station`,
+    });
+  } catch (error: any) {
+    if (error instanceof PlanReleaseError || error?.statusCode) {
+      return res.status(error.statusCode ?? 400).json({ error: error.message });
+    }
+    console.error("POST /production/production-orders/release-day error:", error);
+    res.status(500).json({ error: error?.message || "Database error" });
+  }
+});
+
+/**
+ * POST /production-orders/:id/release
+ * Releases a single order to the Ingredients Station.
+ */
+router.post("/production-orders/:id/release", requirePermission("production", "update"), async (req: Request, res: Response) => {
+  try {
+    const result = await releaseProductionOrder(req.params.id, req.user!.id);
+    res.status(201).json({
+      ok: true,
+      planId: result.planId,
+      message: `Order ${result.orderNumber} released — waiting at the Ingredients Station`,
     });
   } catch (error: any) {
     if (error instanceof PlanReleaseError || error?.statusCode) {

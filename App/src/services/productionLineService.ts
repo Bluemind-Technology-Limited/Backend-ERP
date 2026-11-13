@@ -3,8 +3,8 @@
  *
  * The three hand-off stations behind a production plan:
  *
- *   1. STOCK MANAGER (STORE_OFFICER) — sees the plan's aggregated ingredient
- *      list, picks a warehouse and deducts the required quantities.
+ *   1. INGREDIENTS STATION (STORE_OFFICER) — receives the released order, then
+ *      releases the requirement to grinding (the only point stock is deducted).
  *   2. GRINDING SUPERVISOR — receives the plan's batches, records the actual
  *      ground output for the day and returns any unused input ingredients.
  *   3. PRODUCTION SUPERVISOR — receives the required finished-goods output,
@@ -17,6 +17,7 @@ import { prisma } from '../lib/db.js';
 import { LedgerEventType } from '@prisma/client';
 import { postLedgerEntry } from '../lib/ledger.js';
 import { logActivity } from './userActivityLogger.js';
+import { consumePlanRequirements } from './productionPlan.js';
 import { notifyStationWorkOrders, refreshStationWorkOrders, syncWorkInProgress, STATION_LABELS, STATION_ORDER } from './productionStationService.js';
 
 const ISSUABLE_PLAN_STATUSES = ['SCHEDULED', 'IN_PROGRESS'];
@@ -311,9 +312,6 @@ const PLAN_INCLUDE = {
         },
       },
       stageRecords: { include: { remainders: true }, orderBy: { recordedAt: 'desc' as const } },
-      batchLot: {
-        select: { id: true, batchNumber: true, lotCode: true, setNumber: true, status: true },
-      },
     },
     orderBy: { sequence: 'asc' as const },
   },
@@ -376,27 +374,101 @@ export async function getStationQueue(station: 'ISSUE' | 'GRINDING' | 'FINISHING
   const plans = await getProductionLinePlans();
   return plans.filter((plan) => {
     if (station === 'ISSUE') {
-      // Release already deducted the stock, so the Ingredients Station is the
-      // receiving desk: it shows every released batch until the station confirms
-      // the material and grinding starts.
-      return plan.status === 'SCHEDULED';
+      // Released by production and not yet fully handed over: a partial release
+      // keeps the order on this station until every ingredient is out.
+      return (
+        plan.status === 'SCHEDULED' ||
+        (plan.status === 'IN_PROGRESS' &&
+          plan.aggregatedIngredients.some(
+            (agg: any) => Number(agg.totalQuantity) - Number(agg.issuedQuantity ?? 0) > 0.0001
+          ))
+      );
     }
     if (station === 'GRINDING') {
+      // Visible as soon as the order is released; it stays pending (dim) until
+      // the ingredients are actually released to grinding.
       return (
-        plan.status === 'IN_PROGRESS' &&
+        ['SCHEDULED', 'IN_PROGRESS'].includes(plan.status) &&
         plan.items.some((item: any) => Number(item.grindingOutstanding ?? item.targetQuantity) > 0.0001)
       );
     }
     return (
-      plan.status !== 'COMPLETED' &&
-      plan.status !== 'CANCELLED' &&
-      plan.items.some(
-        (item: any) =>
-          Number(item.groundQuantity ?? 0) > 0 &&
-          Number(item.finishingOutstanding ?? item.targetQuantity) > 0.0001
-      )
+      ['SCHEDULED', 'IN_PROGRESS'].includes(plan.status)
     );
   });
+}
+
+// ---------------------------------------------------------------------------
+// Release records — one row per ingredient lot handed to the floor
+// ---------------------------------------------------------------------------
+
+/**
+ * Every release line across the line, newest first. This is the Ingredients
+ * Station's record of what was handed over, by whom and from which lot.
+ */
+export async function getReleaseHistory(filters?: {
+  planId?: string;
+  limit?: number;
+}) {
+  const rows = await prisma.planIngredientIssue.findMany({
+    where: filters?.planId ? { productionPlanId: filters.planId } : {},
+    orderBy: { issuedAt: 'desc' },
+    take: Math.min(Math.max(Number(filters?.limit ?? 100), 1), 500),
+    include: {
+      material: { select: { id: true, name: true, sku: true, unitOfMeasure: true } },
+      productionPlan: {
+        select: {
+          id: true,
+          planNumber: true,
+          status: true,
+          scheduledFor: true,
+        },
+      },
+    },
+  });
+
+  const userIds = [...new Set(rows.map((row) => row.issuedById).filter(Boolean))];
+  const users = userIds.length
+    ? await prisma.user.findMany({
+        where: { id: { in: userIds } },
+        select: { id: true, fullName: true, email: true },
+      })
+    : [];
+  const userById = new Map(users.map((user) => [user.id, user]));
+
+  const warehouseIds = [
+    ...new Set(rows.map((row) => row.warehouseId).filter(Boolean)),
+  ] as string[];
+  const warehouses = warehouseIds.length
+    ? await prisma.warehouse.findMany({
+        where: { id: { in: warehouseIds } },
+        select: { id: true, name: true },
+      })
+    : [];
+  const warehouseById = new Map(warehouses.map((warehouse) => [warehouse.id, warehouse]));
+
+  return rows.map((row) => ({
+    id: row.id,
+    planId: row.productionPlanId,
+    planNumber: row.productionPlan?.planNumber ?? null,
+    planStatus: row.productionPlan?.status ?? null,
+    scheduledFor: row.productionPlan?.scheduledFor ?? null,
+    materialId: row.materialId,
+    materialName: row.material?.name ?? "Ingredient",
+    materialSku: row.material?.sku ?? "",
+    unitOfMeasure: row.unitOfMeasure,
+    quantity: Number(row.quantity),
+    unitCost: Number(row.unitCost ?? 0),
+    batchLotId: row.batchLotId,
+    warehouseId: row.warehouseId,
+    warehouseName: row.warehouseId ? warehouseById.get(row.warehouseId)?.name ?? null : null,
+    issuedAt: row.issuedAt,
+    issuedById: row.issuedById,
+    issuedByName:
+      userById.get(row.issuedById)?.fullName ??
+      userById.get(row.issuedById)?.email ??
+      null,
+  }));
 }
 
 // ---------------------------------------------------------------------------
@@ -707,57 +779,74 @@ export async function getDailyRecords(filters?: { from?: string; to?: string }) 
 // Station 1 — Stock Manager issues ingredients
 // ---------------------------------------------------------------------------
 
+/**
+ * Station 1 — the Ingredients Manager releases the order to grinding.
+ *
+ * This is the only place ingredient stock leaves the store. The manager enters
+ * how much of each ingredient they are handing over; the release is deducted
+ * earliest-expiry lot first across every warehouse holding the material. Omitting
+ * `lines` releases every outstanding requirement in full.
+ */
 export async function issuePlanIngredients(data: {
   planId: string;
-  warehouseId?: string;
-  lines: Array<{ aggregatedIngredientId: string; quantity: number; batchLotId?: string | null }>;
   issuedById: string;
+  /** Quantities to release now, in the ingredient's displayed unit. */
+  lines?: Array<{ aggregatedIngredientId: string; quantity: number }>;
+  /** Release from this warehouse only. Omitted = any warehouse (FEFO). */
+  warehouseId?: string | null;
 }) {
-  if (!data.lines?.length) throw new Error('At least one ingredient line is required');
-
   const plan = await prisma.productionPlan.findUnique({
     where: { id: data.planId },
-    include: { aggregatedIngredients: true, items: { select: { id: true } } },
+    include: { aggregatedIngredients: true },
   });
-  if (!plan) throw new Error('Production plan not found');
+  if (!plan) throw new Error('Production order not found');
 
-  if (!ISSUABLE_PLAN_STATUSES.includes(plan.status)) {
+  if (!['SCHEDULED', 'IN_PROGRESS'].includes(plan.status)) {
     throw new Error(
-      `Ingredients can only be issued for SCHEDULED or IN_PROGRESS plans (current: ${plan.status})`
+      `Ingredients can only be released for a released order (current: ${plan.status})`
     );
   }
-
-  // Guard: if a production order allocated to this plan already released its
-  // ingredients, issuing here would deduct the same stock twice.
-  const allocations = await prisma.batchMachineAllocation.findMany({
-    where: { productionPlanItemId: { in: plan.items.map((i) => i.id) } },
-    select: { productionOrderId: true },
-  });
-  const orderIds = [...new Set(allocations.map((a) => a.productionOrderId))];
-  if (orderIds.length > 0) {
-    const consumed = await prisma.inventoryTransaction.count({
-      where: {
-        referenceType: 'PROD_ORDER',
-        referenceId: { in: orderIds },
-        eventType: 'PROD_CONSUMPTION',
-      },
-    });
-    if (consumed > 0) {
-      throw new Error(
-        'Ingredients were already released for a production order in this plan. Use either the production line or the order release — not both.'
-      );
-    }
+  if (plan.aggregatedIngredients.length === 0) {
+    throw new Error('This order has no ingredient requirement to release');
   }
 
-  // Stock already left the store when the plan was released, so the station
-  // records what it physically received without touching the ledger. Deducting
-  // here as well would count the same ingredient twice.
-  await prisma.$transaction(async (tx) => {
+  const outstandingIds = plan.aggregatedIngredients
+    .filter(
+      (agg) => Number(agg.totalQuantity) - Number(agg.issuedQuantity ?? 0) > 0.0001
+    )
+    .map((agg) => agg.id);
+  if (outstandingIds.length === 0) {
+    throw new Error('All ingredients for this order have already been released');
+  }
+
+  // A cap per ingredient makes partial releases possible; no lines means "all".
+  let requested: Map<string, number> | undefined;
+  if (data.lines && data.lines.length > 0) {
+    requested = new Map();
     for (const line of data.lines) {
-      const agg = plan.aggregatedIngredients.find((a) => a.id === line.aggregatedIngredientId);
-      if (!agg) throw new Error('Aggregated ingredient does not belong to this plan');
-      if (!(Number(line.quantity) > 0)) throw new Error('Received quantity must be greater than zero');
+      const quantity = Number(line.quantity);
+      if (!(quantity > 0)) continue;
+      if (!plan.aggregatedIngredients.some((agg) => agg.id === line.aggregatedIngredientId)) {
+        throw new Error('Ingredient line does not belong to this order');
+      }
+      requested.set(line.aggregatedIngredientId, quantity);
     }
+    if (requested.size === 0) throw new Error('Enter a quantity to release');
+  }
+
+  const warehouses = data.warehouseId
+    ? await prisma.warehouse.findMany({ where: { id: data.warehouseId }, select: { id: true } })
+    : await prisma.warehouse.findMany({ select: { id: true } });
+  if (warehouses.length === 0) throw new Error('No warehouse is configured');
+
+  await prisma.$transaction(async (tx) => {
+    await consumePlanRequirements(
+      tx,
+      plan.id,
+      warehouses.map((warehouse) => warehouse.id),
+      data.issuedById,
+      requested
+    );
 
     if (plan.status === 'SCHEDULED') {
       await tx.productionPlan.update({
@@ -767,18 +856,21 @@ export async function issuePlanIngredients(data: {
     }
   });
 
+  const releaseSummary =
+    data.lines?.length
+      ? `released ${data.lines.filter((l) => Number(l.quantity) > 0).length} ingredient line(s)`
+      : 'released the full requirement';
+
   await logActivity({
     userId: data.issuedById,
     activityType: 'TRANSFER',
     module: 'production',
-    description: `Issued ${data.lines.length} ingredient line(s) for plan ${plan.planNumber}`,
+    description: `Ingredients ${releaseSummary} to grinding for ${plan.planNumber}`,
     entityType: 'ProductionPlan',
     entityId: plan.id,
   });
 
   // Grinding and production stations now have work waiting.
-  // Persist the station balances and any outstanding quantity, then tell the
-  // grinding station what has landed and what is still missing.
   await syncWorkInProgress(plan.id).catch((error) =>
     console.error('syncWorkInProgress (issue) failed:', error)
   );
@@ -788,7 +880,7 @@ export async function issuePlanIngredients(data: {
   await notifyStationWorkOrders({
     planId: plan.id,
     stations: ['GRINDING'],
-    action: 'Ingredients have been issued. Receive them and record the grinding throughput.',
+    action: 'Ingredients have been released to grinding. Receive them and record the throughput.',
   }).catch((error) => console.error('notifyStationWorkOrders (issue) failed:', error));
 
   return getPlanStationView(plan.id);
@@ -826,9 +918,6 @@ export async function submitGrindingRecord(data: {
       bom: {
         select: { productName: true, finishedSku: { select: { unitOfMeasure: true } } },
       },
-      batchLot: {
-        select: { id: true, batchNumber: true, lotCode: true, status: true },
-      },
       productionPlan: { select: { id: true, planNumber: true, status: true } },
     },
   });
@@ -836,6 +925,9 @@ export async function submitGrindingRecord(data: {
   if (item.productionPlanId !== data.planId) throw new Error('Plan item does not belong to this plan');
   if (item.productionPlan.status === 'COMPLETED' || item.productionPlan.status === 'CANCELLED') {
     throw new Error(`This production plan is ${item.productionPlan.status.toLowerCase()} and cannot be processed`);
+  }
+  if (item.productionPlan.status !== 'IN_PROGRESS') {
+    throw new Error('Ingredients must be released to grinding before this order can be processed');
   }
 
   const input = Number(data.inputQuantity);
@@ -855,14 +947,6 @@ export async function submitGrindingRecord(data: {
   if (!Number.isFinite(batchesProcessed) || batchesProcessed < 0) {
     throw new Error('Batches processed cannot be negative');
   }
-
-  if (!item.batchLotId || !item.batchLot) {
-    throw new Error('This batch has no QA batch code yet — release the ingredients first');
-  }
-  if (item.batchLot.status === 'REJECTED') {
-    throw new Error('This batch was rejected by QA and cannot be produced');
-  }
-  const approvedBatchLot = item.batchLot;
 
   const plan = await prisma.productionPlan.findUnique({
     where: { id: data.planId },
@@ -896,8 +980,10 @@ export async function submitGrindingRecord(data: {
         remainderQuantity: remainderTotal,
         unitOfMeasure: item.bom.finishedSku?.unitOfMeasure ?? 'kg',
         machineId: data.machineId ?? null,
-        batchNumber: approvedBatchLot.lotCode ?? approvedBatchLot.batchNumber,
-        batchLotId: approvedBatchLot.id,
+        // Finished products carry no lot code: the grinding batch number is the
+        // production identity for the ground material.
+        batchNumber: String(grindingBatchNumber),
+        batchLotId: null,
         grindingBatchNumber,
         productionDate: data.productionDate ? new Date(data.productionDate) : new Date(),
         remarks: data.remarks,
@@ -1053,9 +1139,6 @@ export async function submitFinishingRecord(data: {
       bom: {
         include: { finishedSku: { select: { id: true, name: true, unitOfMeasure: true, standardCost: true } } },
       },
-      batchLot: {
-        select: { id: true, batchNumber: true, lotCode: true, status: true, expiryDate: true },
-      },
       productionPlan: { select: { id: true, planNumber: true, status: true } },
     },
   });
@@ -1064,17 +1147,23 @@ export async function submitFinishingRecord(data: {
   if (item.productionPlan.status === 'COMPLETED' || item.productionPlan.status === 'CANCELLED') {
     throw new Error(`This production plan is ${item.productionPlan.status.toLowerCase()} and cannot be processed`);
   }
+  if (item.productionPlan.status !== 'IN_PROGRESS') {
+    throw new Error('Ingredients must be released to grinding before this order can be finished');
+  }
 
   const finishedSku = item.bom?.finishedSku;
   if (!finishedSku) throw new Error('This plan item\'s BOM has no finished SKU configured');
 
-  if (!item.batchLotId || !item.batchLot) {
-    throw new Error('This batch has no QA batch code yet — release the ingredients first');
-  }
-  if (item.batchLot.status === 'REJECTED') {
-    throw new Error('This batch was rejected by QA and cannot be finished');
-  }
-  const approvedBatchNumber = item.batchLot.lotCode ?? item.batchLot.batchNumber;
+  // Finished products carry no lot code. The production identity is the grinding
+  // batch number that produced this output.
+  const lastGrinding = await prisma.productionStageRecord.findFirst({
+    where: { planItemId: item.id, stage: 'GRINDING' },
+    orderBy: { recordedAt: 'desc' },
+    select: { grindingBatchNumber: true },
+  });
+  const productionBatchNumber =
+    (data.batchNumber ?? '').toString().trim() ||
+    (lastGrinding?.grindingBatchNumber ? String(lastGrinding.grindingBatchNumber) : null);
 
   const achieved = Number(data.achievedQuantity);
   if (!(achieved >= 0)) throw new Error('Achieved quantity must be zero or greater');
@@ -1097,13 +1186,11 @@ export async function submitFinishingRecord(data: {
   }
 
   const record = await prisma.$transaction(async (tx) => {
-    const finishedBatchLotId = item.batchLotId;
-
     if (achieved > 0) {
       await postLedgerEntry(tx, {
         eventType: LedgerEventType.PROD_OUTPUT,
         materialId: finishedSku.id,
-        batchLotId: finishedBatchLotId,
+        batchLotId: null,
         warehouseId: data.warehouseId,
         quantity: achieved,
         unitOfMeasure: finishedSku.unitOfMeasure ?? 'kg',
@@ -1127,10 +1214,10 @@ export async function submitFinishingRecord(data: {
         unitOfMeasure: finishedSku.unitOfMeasure ?? 'kg',
         // Snapshot the output cost so the day's value never drifts.
         unitCost: Number(finishedSku.standardCost ?? 0),
-        batchNumber: approvedBatchNumber,
-        batchLotId: finishedBatchLotId,
+        batchNumber: productionBatchNumber,
+        batchLotId: null,
         warehouseId: data.warehouseId,
-        finishedBatchLotId,
+        finishedBatchLotId: null,
         productionDate: data.productionDate ? new Date(data.productionDate) : new Date(),
         remarks: data.remarks,
         recordedById: data.recordedById,

@@ -3,7 +3,6 @@ import { postLedgerEntry } from "../lib/ledger.js";
 import { LedgerEventType } from "@prisma/client";
 import { packWeightFrom, percentageIngredientPacks } from "../lib/uom.js";
 import { notifyStationWorkOrders, refreshStationWorkOrders } from "./productionStationService.js";
-import { provisionPlanBatches } from "./productionBatchService.js";
 import { logActivity } from "./userActivityLogger.js";
 
 export interface CreateProductionPlanInput {
@@ -627,7 +626,9 @@ function computeFormulaRequirements(item: any): FormulaRequirementLine[] {
       perBatchRequired: Number(perBatchRequired.toFixed(4)),
       batchCount: Number(batchCount.toFixed(4)),
       totalRequired: Number(totalRequired.toFixed(4)),
-      unitOfMeasure: ingredient.unitOfMeasure || ingredient.material?.unitOfMeasure || "",
+      // The material's pack label is authoritative: a quantity is a count of
+      // those packs (50 × 25 KG), never a bare "KG".
+      unitOfMeasure: ingredient.material?.unitOfMeasure || ingredient.unitOfMeasure || "",
       isPercentage: Boolean(ingredient.isPercentage),
     });
   }
@@ -678,9 +679,6 @@ export async function getPlanIngredientRequirements(planId: string) {
               },
             },
             orderBy: { material: { name: "asc" } },
-          },
-          batchLot: {
-            select: { id: true, batchNumber: true, lotCode: true, setNumber: true, status: true },
           },
         },
         orderBy: { sequence: "asc" },
@@ -749,9 +747,8 @@ export async function getPlanIngredientRequirements(planId: string) {
       yieldUnit: item.bom?.yieldUnit ?? "",
       targetQuantity: round(targetQuantity),
       batchCount: round(batchCount),
-      batchCode: item.batchLot?.lotCode ?? item.batchLot?.batchNumber ?? null,
-      batchStatus: item.batchLot?.status ?? null,
-      batchApprovedAt: item.batchApprovedAt ?? null,
+      // Finished products carry no lot code; the production identity is the
+      // order number plus the grinding batch number recorded at the station.
       ingredients,
       totalWeightKg: round(
         ingredients.reduce((sum, line) => sum + Number(line.totalWeightKg ?? 0), 0)
@@ -854,40 +851,91 @@ export class PlanReleaseError extends Error {
 }
 
 /**
- * Deduct the plan's consolidated requirement from one warehouse, taking the
- * earliest-expiring lot first and splitting across lots when one is not enough.
+ * Deduct the plan's consolidated requirement across the selected warehouses,
+ * taking the earliest-expiring lot first and splitting across lots and
+ * warehouses when one is not enough.
  *
  * This is the single point where ingredient stock leaves the store: the
  * Ingredients Station only confirms what it physically received, so a batch can
  * never be deducted twice. Every slice is written to the ledger and to
  * `PlanIngredientIssue`, which is the plan's lot-level lineage record.
  */
-async function consumePlanRequirements(
+export async function consumePlanRequirements(
   tx: any,
   planId: string,
-  warehouseId: string,
-  userId: string
+  warehouseIds: string[],
+  userId: string,
+  /** Optional per-ingredient cap (keyed by aggregated ingredient id). */
+  requested?: Map<string, number>
 ) {
   const requirements = await tx.planAggregatedIngredient.findMany({
     where: { productionPlanId: planId },
-    include: { material: { select: { name: true, standardCost: true } } },
+    include: {
+      material: {
+        select: {
+          name: true,
+          standardCost: true,
+          packSize: true,
+          packUnit: true,
+          unitOfMeasure: true,
+        },
+      },
+    },
     orderBy: { material: { name: "asc" } },
   });
+
+  const round = (value: number) => Number(Number(value).toFixed(4));
 
   const shortages: string[] = [];
 
   for (const req of requirements) {
-    let remaining = Number(req.totalQuantity ?? 0);
-    if (!(remaining > 0)) continue;
+    // Quantities are counts of the material's packs ("25 KG" = 1 pack is 25 kg).
+    // The requirement and the stock are already in that unit, so they are
+    // compared directly — never converted to kilograms.
+    const stockUnit: string = req.material?.unitOfMeasure ?? req.unitOfMeasure;
+
+    const requiredPacks = Number(req.totalQuantity ?? 0);
+    const alreadyIssued = Number(req.issuedQuantity ?? 0);
+
+    // Only the outstanding quantity is taken out of stock, so raising the order
+    // again (or an order that was already deducted before the flow changed)
+    // cannot consume the same material twice. A requested quantity caps it
+    // further, which is what partial releases use.
+    let remaining = requiredPacks - alreadyIssued;
+    const rawCap = requested?.get(req.id);
+    const cap = rawCap === undefined ? undefined : rawCap;
+    if (cap !== undefined) remaining = Math.min(remaining, cap);
+    if (!(remaining > 0.0001)) {
+      const fullyReleased = alreadyIssued + 0.0001 >= requiredPacks;
+      if (req.status !== (fullyReleased ? "RELEASED" : "PARTIAL") || req.unitOfMeasure !== stockUnit) {
+        await tx.planAggregatedIngredient.update({
+          where: { id: req.id },
+          data: {
+            status: fullyReleased ? "RELEASED" : "PARTIAL",
+            issuedAt: new Date(),
+            issuedById: userId,
+            unitOfMeasure: stockUnit,
+            totalQuantity: round(requiredPacks),
+            issuedQuantity: round(alreadyIssued),
+          },
+        });
+      }
+      continue;
+    }
 
     const balances = await tx.inventoryTransaction.groupBy({
-      by: ["batchLotId"],
-      where: { materialId: req.materialId, warehouseId },
+      by: ["warehouseId", "batchLotId"],
+      where: {
+        materialId: req.materialId,
+        warehouseId: { in: warehouseIds },
+        unitOfMeasure: stockUnit,
+      },
       _sum: { quantity: true },
     });
 
     const candidates = balances
       .map((row: any) => ({
+        warehouseId: row.warehouseId as string,
         batchLotId: row.batchLotId as string | null,
         quantity: Number(row._sum.quantity ?? 0),
       }))
@@ -916,7 +964,9 @@ async function consumePlanRequirements(
 
     if (available + 0.0001 < remaining) {
       shortages.push(
-        `${req.material?.name ?? "Ingredient"}: needs ${remaining}, only ${available} in the selected warehouse`
+        `${req.material?.name ?? "Ingredient"}: needs ${round(remaining)} × ${stockUnit}, only ${round(
+          available
+        )} × ${stockUnit} in stock`
       );
       continue;
     }
@@ -924,6 +974,7 @@ async function consumePlanRequirements(
     const unitCost = Number(req.material?.standardCost ?? 0);
     let taken = 0;
     let firstLotId: string | null = null;
+    let firstWarehouseId: string | null = null;
 
     for (const lot of candidates) {
       if (remaining <= 0.0001) break;
@@ -934,9 +985,9 @@ async function consumePlanRequirements(
         eventType: LedgerEventType.PROD_CONSUMPTION,
         materialId: req.materialId,
         batchLotId: lot.batchLotId,
-        warehouseId,
+        warehouseId: lot.warehouseId,
         quantity: -take,
-        unitOfMeasure: req.unitOfMeasure,
+        unitOfMeasure: stockUnit,
         referenceType: "PLAN_RELEASE",
         referenceId: planId,
         createdById: userId,
@@ -950,14 +1001,15 @@ async function consumePlanRequirements(
           materialId: req.materialId,
           batchLotId: lot.batchLotId,
           quantity: take,
-          unitOfMeasure: req.unitOfMeasure,
+          unitOfMeasure: stockUnit,
           unitCost,
-          warehouseId,
+          warehouseId: lot.warehouseId,
           issuedById: userId,
         },
       });
 
       if (!firstLotId) firstLotId = lot.batchLotId;
+      if (!firstWarehouseId) firstWarehouseId = lot.warehouseId;
       remaining -= take;
       taken += take;
     }
@@ -965,12 +1017,17 @@ async function consumePlanRequirements(
     await tx.planAggregatedIngredient.update({
       where: { id: req.id },
       data: {
-        issuedQuantity: taken,
-        issuedWarehouseId: warehouseId,
+        // Persist in the material's stock unit (packs) so issued/outstanding
+        // and the station dashboards all read the same numbers.
+        totalQuantity: round(requiredPacks),
+        unitOfMeasure: stockUnit,
+        issuedQuantity: round(alreadyIssued + taken),
+        issuedWarehouseId: firstWarehouseId,
         issuedBatchLotId: firstLotId,
         issuedAt: new Date(),
         issuedById: userId,
-        status: "RELEASED",
+        status:
+          alreadyIssued + taken + 0.0001 >= requiredPacks ? "RELEASED" : "PARTIAL",
       },
     });
   }
@@ -988,21 +1045,16 @@ async function consumePlanRequirements(
  *
  * One transaction performs the whole release: validate the approved formulas,
  * atomically claim DRAFT → SCHEDULED, generate the requirement snapshot, create
- * the three station work orders and send the station notifications. Any failure
- * rolls everything back, and a repeated call is rejected because the claim only
- * matches a DRAFT plan.
+ * the three station work orders and notify the stations. **No stock moves here** —
+ * the Ingredients Manager deducts the requirement when they release the order to
+ * grinding. Any failure rolls everything back, and a repeated call is rejected
+ * because the claim only matches a DRAFT plan.
  */
 export async function releasePlanIngredients(input: {
   planId: string;
   releasedById: string;
   scheduledFor?: Date | null;
-  /** Warehouse the ingredients are released from. Stock leaves the store here. */
-  warehouseId?: string | null;
 }) {
-  if (!input.warehouseId) {
-    throw new PlanReleaseError("Select the warehouse the ingredients are released from", 400);
-  }
-  const releaseWarehouseId: string = input.warehouseId;
   const releasedAt = new Date();
 
   const outcome = await prisma.$transaction(async (tx) => {
@@ -1101,20 +1153,10 @@ export async function releasePlanIngredients(input: {
       );
     }
 
-    // Give every plan item its one authoritative production batch lot. It is
-    // active immediately: the chain has a single QA gate, on the way in.
-    try {
-      await provisionPlanBatches(tx, plan.id, scheduledFor);
-    } catch (error: any) {
-      throw new PlanReleaseError(
-        error?.message ?? "Failed to provision the production batch codes",
-        400
-      );
-    }
-
-    // Release is where stock moves: the requirement is deducted here and the
-    // Ingredients Station only confirms what it received.
-    await consumePlanRequirements(tx, plan.id, releaseWarehouseId, input.releasedById);
+    // No stock movement and no batch lot here: lot codes belong to received
+    // materials, never to finished products. The order only becomes visible at
+    // the stations, and the Ingredients Manager deducts the requirement when
+    // they release it to grinding (issuePlanIngredients).
 
     await notifyStationWorkOrders({
       planId: plan.id,
@@ -1174,10 +1216,9 @@ export async function releasePlanIngredients(input: {
 export async function scheduleProductionPlan(
   planId: string,
   scheduledFor: Date,
-  releasedById: string,
-  warehouseId?: string | null
+  releasedById: string
 ) {
-  await releasePlanIngredients({ planId, releasedById, scheduledFor, warehouseId });
+  await releasePlanIngredients({ planId, releasedById, scheduledFor });
   return getProductionPlan(planId);
 }
 

@@ -223,30 +223,49 @@ router.get(
 // ---------------------------------------------------------------------------
 
 /**
+ * GET /production-line/releases
+ * Every ingredient release line, newest first — the Ingredients Station record.
+ */
+router.get(
+  "/releases",
+  requirePermission("production", "read"),
+  async (req: Request, res: Response) => {
+    try {
+      const releases = await productionLineService.getReleaseHistory({
+        planId: req.query.planId ? String(req.query.planId) : undefined,
+        limit: req.query.limit ? Number(req.query.limit) : undefined,
+      });
+      res.json({ releases });
+    } catch (error: any) {
+      console.error("GET /production-line/releases error:", error);
+      sendError(res, error, "Failed to load the release records");
+    }
+  }
+);
+
+/**
  * POST /production-line/plans/:planId/issue
- * Body: { warehouseId, lines: [{ aggregatedIngredientId, quantity, batchLotId? }] }
- * Gated on `inventory:update` because it is a stock deduction.
+ * Releases ingredients to grinding and deducts them from stock (earliest-expiry
+ * lots first, across every warehouse). Body: `{ lines: [{ aggregatedIngredientId,
+ * quantity }] }` for a partial release; omit `lines` to release everything
+ * outstanding. Gated on `inventory:update` because it is the deduction point.
  */
 router.post(
   "/plans/:planId/issue",
   requirePermission("inventory", "update"),
   async (req: Request, res: Response) => {
     try {
-      const { warehouseId, lines } = req.body;
-      if (!warehouseId) return res.status(400).json({ error: "warehouseId is required" });
-      if (!Array.isArray(lines) || lines.length === 0) {
-        return res.status(400).json({ error: "lines must be a non-empty array" });
-      }
-
+      const { lines, warehouseId } = req.body ?? {};
       const plan = await productionLineService.issuePlanIngredients({
         planId: req.params.planId,
-        warehouseId,
-        lines: lines.map((l: any) => ({
-          aggregatedIngredientId: l.aggregatedIngredientId,
-          quantity: Number(l.quantity),
-          batchLotId: l.batchLotId ?? null,
-        })),
         issuedById: req.user!.id,
+        warehouseId: warehouseId ? String(warehouseId) : undefined,
+        lines: Array.isArray(lines)
+          ? lines.map((line: any) => ({
+              aggregatedIngredientId: String(line.aggregatedIngredientId),
+              quantity: Number(line.quantity),
+            }))
+          : undefined,
       });
 
       res.status(201).json({ message: "Ingredients issued to production", plan });

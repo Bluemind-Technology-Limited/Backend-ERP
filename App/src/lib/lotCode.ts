@@ -79,6 +79,7 @@ export function isValidSetNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value > 0;
 }
 
+
 export interface SetNumberEditResult {
   batchLotId: string;
   oldSetNumber: number | null;
