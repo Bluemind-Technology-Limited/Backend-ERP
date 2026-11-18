@@ -282,9 +282,13 @@ router.post(
 
 /**
  * POST /production-line/plans/:planId/items/:itemId/grinding
- * Body: { inputQuantity, achievedQuantity, remainderQuantity?,
+ * Body: { inputQuantity, achievedQuantity, batchesProcessed?, remainderQuantity?,
  *         remainders?: [{ materialId, quantity, batchLotId?, warehouseId? }],
- *         machineId?, batchNumber?, productionDate?, unitOfMeasure?, remarks? }
+ *         machineId?, batchNumber?, grindingBatchNumber?, productionDate?, remarks? }
+ *
+ * `grindingBatchNumber` is the START of the block this record claims. The block
+ * spans one serial per batch actually ground, so grinding 50 batches from 800150
+ * consumes 800151-800200. Omit it to take the next block automatically.
  */
 router.post(
   "/plans/:planId/items/:itemId/grinding",

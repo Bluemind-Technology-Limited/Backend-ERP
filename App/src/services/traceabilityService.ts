@@ -290,6 +290,198 @@ export interface BatchMatch {
   supplier: { id: string; name: string; vendorCode: string | null } | null;
 }
 
+export interface GrindingBatchMatch {
+  id: string;
+  productionDate: Date;
+  productName: string;
+  planNumber: string | null;
+  /** One serial per batch ground — this is the width of the block. */
+  batches: number;
+  unitOfMeasure: string;
+  inputQuantity: number;
+  achievedQuantity: number;
+  blockFrom: number;
+  blockTo: number;
+  /** The number that was searched, when it falls inside this block. */
+  matchedNumber: number | null;
+  /** 1-based position of the matched number inside the block. */
+  positionInBlock: number | null;
+}
+
+/**
+ * Find grinding batches by serial.
+ *
+ * A grinding batch consumes one number per batch ground, so a record owns the
+ * range [grinding_batch_number - width + 1 .. grinding_batch_number]. Searching
+ * any number inside that range returns the record that produced it.
+ */
+export async function searchGrindingBatches(q: string, limit = 25): Promise<GrindingBatchMatch[]> {
+  const term = q?.trim();
+  if (!term || !/^\d+$/.test(term)) return [];
+  const number = Number(term);
+
+  const rows: Array<{ id: string }> = await prisma.$queryRaw`
+    SELECT id
+      FROM production_stage_records
+     WHERE stage = 'GRINDING'
+       AND grinding_batch_number IS NOT NULL
+       AND (grinding_batch_number - GREATEST(1, ROUND(batches_processed)) + 1) <= ${number}
+       AND grinding_batch_number >= ${number}
+     ORDER BY production_date DESC
+     LIMIT ${limit}
+  `;
+
+  const ids = rows.map((r) => r.id);
+  if (!ids.length) return [];
+
+  const records = await prisma.productionStageRecord.findMany({
+    where: { id: { in: ids } },
+    include: {
+      planItem: {
+        include: {
+          bom: {
+            include: { finishedSku: { select: { name: true, unitOfMeasure: true } } },
+          },
+        },
+      },
+      productionPlan: { select: { planNumber: true } },
+    },
+  });
+
+  const byId = new Map(records.map((r) => [r.id, r]));
+
+  return ids
+    .map((id) => byId.get(id))
+    .filter(Boolean)
+    .map((record: any) => {
+      const batches = Math.max(1, Math.round(Number(record.batchesProcessed ?? 1)));
+      const blockTo = Number(record.grindingBatchNumber);
+      const blockFrom = blockTo - batches + 1;
+      const position = number >= blockFrom && number <= blockTo ? number - blockFrom + 1 : null;
+
+      return {
+        id: record.id,
+        productionDate: record.productionDate,
+        productName:
+          record.planItem?.bom?.finishedSku?.name ??
+          record.planItem?.bom?.productName ??
+          'Product',
+        planNumber: record.productionPlan?.planNumber ?? null,
+        batches,
+        unitOfMeasure:
+          record.planItem?.bom?.finishedSku?.unitOfMeasure ?? record.unitOfMeasure ?? '',
+        inputQuantity: Number(record.inputQuantity),
+        achievedQuantity: Number(record.achievedQuantity),
+        blockFrom,
+        blockTo,
+        matchedNumber: number,
+        positionInBlock: position,
+      };
+    });
+}
+
+/**
+ * Everything one grinding batch touched: what it ground, the raw lots it
+ * consumed (with their lot codes), what went back to stock, and what the
+ * production station finished from it.
+ */
+export async function getGrindingBatchDetail(stageRecordId: string) {
+  const record = await prisma.productionStageRecord.findFirst({
+    where: { id: stageRecordId, stage: 'GRINDING' },
+    include: {
+      planItem: {
+        include: {
+          bom: {
+            include: { finishedSku: { select: { name: true, sku: true, unitOfMeasure: true } } },
+          },
+        },
+      },
+      productionPlan: { select: { id: true, planNumber: true, status: true } },
+      grindingInputs: {
+        include: {
+          material: { select: { id: true, name: true, sku: true } },
+          batchLot: {
+            select: {
+              id: true,
+              batchNumber: true,
+              lotCode: true,
+              supplierBatchNumber: true,
+              supplier: { select: { id: true, name: true } },
+            },
+          },
+        },
+      },
+      remainders: {
+        include: { material: { select: { id: true, name: true, sku: true } } },
+      },
+    },
+  });
+  if (!record) return null;
+
+  const finishing = await prisma.productionStageRecord.findMany({
+    where: { planItemId: record.planItemId, stage: 'FINISHING' },
+    orderBy: { recordedAt: 'desc' },
+    select: {
+      id: true,
+      productionDate: true,
+      achievedQuantity: true,
+      rejectedQuantity: true,
+      unitOfMeasure: true,
+      status: true,
+    },
+  });
+
+  const batches = Math.max(1, Math.round(Number(record.batchesProcessed ?? 1)));
+  const blockTo = Number(record.grindingBatchNumber);
+
+  return {
+    id: record.id,
+    productionDate: record.productionDate,
+    productName:
+      record.planItem?.bom?.finishedSku?.name ?? record.planItem?.bom?.productName ?? 'Product',
+    planId: record.productionPlan?.id ?? null,
+    planNumber: record.productionPlan?.planNumber ?? null,
+    planStatus: record.productionPlan?.status ?? null,
+    batches,
+    unitOfMeasure:
+      record.planItem?.bom?.finishedSku?.unitOfMeasure ?? record.unitOfMeasure ?? '',
+    blockFrom: blockTo - batches + 1,
+    blockTo,
+    inputQuantity: Number(record.inputQuantity),
+    achievedQuantity: Number(record.achievedQuantity),
+    receivedQuantity: Number(record.receivedQuantity ?? 0),
+    remainderQuantity: Number(record.remainderQuantity ?? 0),
+    status: record.status,
+    remarks: record.remarks,
+    ingredients: record.grindingInputs.map((line: any) => ({
+      materialId: line.materialId,
+      materialName: line.material?.name ?? null,
+      sku: line.material?.sku ?? null,
+      quantity: Number(line.quantity),
+      unitOfMeasure: line.unitOfMeasure,
+      batchLotId: line.batchLotId,
+      batchNumber: line.batchLot?.batchNumber ?? null,
+      lotCode: line.batchLot?.lotCode ?? null,
+      supplierBatchNumber: line.batchLot?.supplierBatchNumber ?? null,
+      supplier: line.batchLot?.supplier?.name ?? null,
+    })),
+    remainders: record.remainders.map((line: any) => ({
+      materialId: line.materialId,
+      materialName: line.material?.name ?? null,
+      quantity: Number(line.quantity),
+      unitOfMeasure: line.unitOfMeasure,
+    })),
+    finishing: finishing.map((line) => ({
+      id: line.id,
+      productionDate: line.productionDate,
+      achievedQuantity: Number(line.achievedQuantity),
+      rejectedQuantity: Number(line.rejectedQuantity ?? 0),
+      unitOfMeasure: line.unitOfMeasure,
+      status: line.status,
+    })),
+  };
+}
+
 /**
  * Universal search: batch number, material name/SKU, or any lot-code component.
  *

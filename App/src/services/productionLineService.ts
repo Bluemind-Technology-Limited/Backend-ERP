@@ -28,7 +28,8 @@ export const GRINDING_BATCH_SEQUENCE_KEY = 'grinding_batch_number';
 
 /**
  * Current grinding batch serial. `lastNumber` is the highest number used so far
- * (null until the operator seeds it). `nextNumber` is what the next batch gets.
+ * (null until the operator seeds it). `nextNumber` is the start of the next
+ * block — every grinding record consumes one number per batch it grinds.
  */
 export async function getGrindingBatchSequence() {
   const [counter, highest] = await Promise.all([
@@ -39,26 +40,19 @@ export async function getGrindingBatchSequence() {
     }),
   ]);
 
-  const counterValue = counter?.value ?? 0;
+  // Once the operator has set the serial it is authoritative, even when they
+  // move it backwards. Before that, fall back to whatever is already on record.
   const usedValue = Number(highest._max.grindingBatchNumber ?? 0);
-  const lastNumber = Math.max(counterValue, usedValue) || null;
+  const lastNumber = counter ? counter.value : usedValue || null;
 
   return { lastNumber, nextNumber: lastNumber === null ? null : lastNumber + 1 };
 }
 
-/** Seed/correct the serial. It can never be set below a number already used. */
+/** Seed/correct the serial. Any whole number, zero or greater — the operator
+ *  has full control over where the next block starts. */
 export async function setGrindingBatchSequence(lastNumber: number) {
   if (!Number.isInteger(lastNumber) || lastNumber < 0) {
     throw new Error('Last grinding batch number must be a whole number, zero or greater');
-  }
-
-  const highest = await prisma.productionStageRecord.aggregate({
-    where: { grindingBatchNumber: { not: null } },
-    _max: { grindingBatchNumber: true },
-  });
-  const used = Number(highest._max.grindingBatchNumber ?? 0);
-  if (lastNumber < used) {
-    throw new Error(`Cannot be lower than the last assigned grinding batch number (${used})`);
   }
 
   await prisma.sequenceCounter.upsert({
@@ -71,27 +65,60 @@ export async function setGrindingBatchSequence(lastNumber: number) {
 }
 
 /**
- * Resolve the batch number for a grinding record.
+ * How many serial numbers a grinding record consumes.
  *
- * A provided number is accepted when it is not already used (an operator
- * override/seed); otherwise the serial advances atomically by one. The counter
- * always ends up at the highest number issued.
+ * One number per batch actually ground, so grinding 50 batches walks the serial
+ * forward 50. A record always takes at least one number, which keeps every
+ * grinding entry individually identifiable.
  */
-async function claimGrindingBatchNumber(
+export function grindingBatchBlockSize(batchesProcessed: number): number {
+  const rounded = Math.round(Number(batchesProcessed));
+  if (!Number.isFinite(rounded) || rounded < 1) return 1;
+  return rounded;
+}
+
+/**
+ * True when [from..to] intersects a block already issued. Blocks are derived
+ * from (grinding_batch_number = end, batches_processed = width).
+ */
+async function grindingBlockOverlaps(tx: any, from: number, to: number): Promise<boolean> {
+  const rows: Array<{ one: number }> = await tx.$queryRaw`
+    SELECT 1 AS one
+      FROM production_stage_records
+     WHERE stage = 'GRINDING'
+       AND grinding_batch_number IS NOT NULL
+       AND (grinding_batch_number - GREATEST(1, ROUND(batches_processed)) + 1) <= ${to}
+       AND grinding_batch_number >= ${from}
+     LIMIT 1
+  `;
+  return rows.length > 0;
+}
+
+/**
+ * Reserve the grinding batch block for one record.
+ *
+ * - No start supplied: the counter is incremented by `size` atomically and the
+ *   returned block is [new - size + 1 .. new].
+ * - Start supplied (operator override/backfill): the block is
+ *   [start .. start + size - 1]; it may not overlap a block already issued, and
+ *   the counter only ever moves forward.
+ */
+async function claimGrindingBatchBlock(
   tx: any,
-  rawNumber: unknown
-): Promise<number> {
+  rawStart: unknown,
+  size: number
+): Promise<{ from: number; to: number }> {
   const provided =
-    rawNumber === undefined || rawNumber === null || String(rawNumber).trim() === ''
+    rawStart === undefined || rawStart === null || String(rawStart).trim() === ''
       ? null
-      : Number(rawNumber);
+      : Number(rawStart);
 
   if (provided === null) {
-    // Atomic increment. The row must have been seeded by the operator first.
+    // Atomic block reservation. The row must have been seeded by the operator first.
     const updated = await tx.sequenceCounter
       .update({
         where: { key: GRINDING_BATCH_SEQUENCE_KEY },
-        data: { value: { increment: 1 } },
+        data: { value: { increment: size } },
         select: { value: true },
       })
       .catch((error: any) => {
@@ -100,34 +127,60 @@ async function claimGrindingBatchNumber(
         }
         throw error;
       });
-    return Number(updated.value);
+
+    const to = Number(updated.value);
+    const from = to - size + 1;
+
+    // The operator can re-seat the serial anywhere, so skip past numbers that
+    // are already on record instead of colliding with them.
+    if (await grindingBlockOverlaps(tx, from, to)) {
+      const highest = await tx.productionStageRecord.aggregate({
+        where: { stage: 'GRINDING', grindingBatchNumber: { not: null } },
+        _max: { grindingBatchNumber: true },
+      });
+      const base = Math.max(Number(highest._max.grindingBatchNumber ?? 0), to);
+      const jumped = await tx.sequenceCounter.update({
+        where: { key: GRINDING_BATCH_SEQUENCE_KEY },
+        data: { value: base + size },
+        select: { value: true },
+      });
+      const jumpedTo = Number(jumped.value);
+      return { from: jumpedTo - size + 1, to: jumpedTo };
+    }
+
+    return { from, to };
   }
 
   if (!Number.isInteger(provided) || provided <= 0) {
     throw new Error('Grinding batch number must be a positive whole number');
   }
 
-  const clash = await tx.productionStageRecord.findFirst({
-    where: { grindingBatchNumber: provided },
-    select: { id: true },
-  });
-  if (clash) throw new Error(`Grinding batch number ${provided} is already used`);
+  const from = provided;
+  const to = from + size - 1;
+
+  // Blocks are derived from (grinding_batch_number = end, batches_processed =
+  // width), so an overlap check is a range comparison in SQL.
+  if (await grindingBlockOverlaps(tx, from, to)) {
+    throw new Error(
+      `Grinding batch numbers ${from}-${to} overlap numbers that are already used`
+    );
+  }
 
   const counter = await tx.sequenceCounter.findUnique({
     where: { key: GRINDING_BATCH_SEQUENCE_KEY },
   });
   if (!counter) {
     await tx.sequenceCounter.create({
-      data: { key: GRINDING_BATCH_SEQUENCE_KEY, value: provided },
+      data: { key: GRINDING_BATCH_SEQUENCE_KEY, value: to },
     });
-  } else if (provided > counter.value) {
+  } else if (to > counter.value) {
     await tx.sequenceCounter.update({
       where: { key: GRINDING_BATCH_SEQUENCE_KEY },
-      data: { value: provided },
+      data: { value: to },
     });
   }
 
-  return provided;
+  return { from, to };
 }
 
 /**
@@ -212,7 +265,9 @@ function enrichItems(plan: any, carryover?: Map<string, number>) {
 
     const target = Number(item.targetQuantity ?? 0);
     const expectedYield = Number(item.bom?.expectedYield ?? 0);
-    const expectedBatches = expectedYield > 0 ? target / expectedYield : 0;
+    // One batch = one unit of the planned quantity: the grinder works through the
+    // quantity one batch at a time, so the batch count is the quantity itself.
+    const expectedBatches = target;
 
     const groundQuantity = grinding.reduce((sum, r) => sum + Number(r.achievedQuantity), 0);
     const receivedQuantity = grinding.reduce(
@@ -385,12 +440,9 @@ export async function getStationQueue(station: 'ISSUE' | 'GRINDING' | 'FINISHING
       );
     }
     if (station === 'GRINDING') {
-      // Visible as soon as the order is released; it stays pending (dim) until
-      // the ingredients are actually released to grinding.
-      return (
-        ['SCHEDULED', 'IN_PROGRESS'].includes(plan.status) &&
-        plan.items.some((item: any) => Number(item.grindingOutstanding ?? item.targetQuantity) > 0.0001)
-      );
+      // Every day that has grinding work — including finished days, so the
+      // station keeps its history by date.
+      return ['SCHEDULED', 'IN_PROGRESS', 'COMPLETED'].includes(plan.status);
     }
     return (
       ['SCHEDULED', 'IN_PROGRESS'].includes(plan.status)
@@ -904,7 +956,7 @@ export async function submitGrindingRecord(data: {
   inputs?: Array<{ materialId: string; quantity: number; batchLotId?: string | null }>;
   machineId?: string | null;
   batchNumber?: string | null;
-  /** Serial grinding batch number. Omit to take the next number automatically. */
+  /** Serial grinding batch number. Omit to take the next block automatically. */
   grindingBatchNumber?: number | string | null;
   /** Units of mix produced at the grinding station. */
   mixUnits?: number;
@@ -966,7 +1018,13 @@ export async function submitGrindingRecord(data: {
     : Number(data.remainderQuantity ?? 0);
 
   const record = await prisma.$transaction(async (tx) => {
-    const grindingBatchNumber = await claimGrindingBatchNumber(tx, data.grindingBatchNumber);
+    // One serial per batch actually ground: grinding 50 batches moves the
+    // serial forward 50. Fall back to the achieved quantity when the batch
+    // count was left blank.
+    const blockSize = grindingBatchBlockSize(
+      batchesProcessed > 0 ? batchesProcessed : achieved
+    );
+    const block = await claimGrindingBatchBlock(tx, data.grindingBatchNumber, blockSize);
 
     const created = await tx.productionStageRecord.create({
       data: {
@@ -981,10 +1039,11 @@ export async function submitGrindingRecord(data: {
         unitOfMeasure: item.bom.finishedSku?.unitOfMeasure ?? 'kg',
         machineId: data.machineId ?? null,
         // Finished products carry no lot code: the grinding batch number is the
-        // production identity for the ground material.
-        batchNumber: String(grindingBatchNumber),
+        // production identity for the ground material. It is the last number of
+        // the block this record consumed.
+        batchNumber: String(block.to),
         batchLotId: null,
-        grindingBatchNumber,
+        grindingBatchNumber: block.to,
         productionDate: data.productionDate ? new Date(data.productionDate) : new Date(),
         remarks: data.remarks,
         recordedById: data.recordedById,

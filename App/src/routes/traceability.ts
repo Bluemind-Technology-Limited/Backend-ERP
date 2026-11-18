@@ -17,14 +17,36 @@ router.get(
   async (req: Request, res: Response) => {
     try {
       const { q, limit } = req.query;
-      const matches = await traceabilityService.searchBatchLots(
-        String(q ?? ""),
-        limit ? parseInt(String(limit)) : 25
-      );
-      res.json({ matches });
+      const term = String(q ?? "");
+      const take = limit ? parseInt(String(limit)) : 25;
+      const [matches, grinding] = await Promise.all([
+        traceabilityService.searchBatchLots(term, take),
+        traceabilityService.searchGrindingBatches(term, take),
+      ]);
+      res.json({ matches, grinding });
     } catch (error: any) {
       console.error("GET /traceability/search error:", error);
       res.status(500).json({ error: error?.message || "Failed to search batches" });
+    }
+  }
+);
+
+/**
+ * GET /traceability/grinding-batch/:id
+ * Everything one grinding batch touched — ingredients, lot codes, remainders
+ * and the production records finished from it.
+ */
+router.get(
+  "/grinding-batch/:id",
+  requirePermission("production", "read"),
+  async (req: Request, res: Response) => {
+    try {
+      const detail = await traceabilityService.getGrindingBatchDetail(req.params.id);
+      if (!detail) return res.status(404).json({ error: "Grinding batch not found" });
+      res.json({ grinding: detail });
+    } catch (error: any) {
+      console.error("GET /traceability/grinding-batch/:id error:", error);
+      res.status(500).json({ error: error?.message || "Failed to load the grinding batch" });
     }
   }
 );

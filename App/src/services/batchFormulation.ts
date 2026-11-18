@@ -1,4 +1,5 @@
 import { prisma } from "../lib/db.js";
+import { parsePackLabel } from "../lib/uom.js";
 
 export interface CreateBatchFormulationInput {
   productName: string;
@@ -63,6 +64,15 @@ export async function createBatchFormulation(input: CreateBatchFormulationInput)
 
     if (ingredientMaterials.length !== ingredientIds.length) {
       throw new Error("One or more ingredient materials not found");
+    }
+    // A formula line is a count of the material's packs, so the material must
+    // have a pack unit of measure ("25 KG"). Free-text units like "kg" are not
+    // acceptable: they cannot be deducted against pack stock.
+    const missingPack = ingredientMaterials.find((m) => !parsePackLabel(m.unitOfMeasure));
+    if (missingPack) {
+      throw new Error(
+        `"${missingPack.name}" has no pack unit of measure. Set its pack size and unit in Master Data → Materials before adding it to a formulation.`
+      );
     }
     const ingredientUom = new Map(ingredientMaterials.map((m) => [m.id, m.unitOfMeasure]));
 
@@ -313,9 +323,14 @@ export async function addIngredient(
 
     const material = await prisma.material.findUnique({
       where: { id: materialId },
-      select: { unitOfMeasure: true },
+      select: { name: true, unitOfMeasure: true },
     });
     if (!material) throw new Error(`Material not found: ${materialId}`);
+    if (!parsePackLabel(material.unitOfMeasure)) {
+      throw new Error(
+        `"${material.name}" has no pack unit of measure. Set its pack size and unit in Master Data → Materials first.`
+      );
+    }
 
     if (!Number.isFinite(Number(quantity)) || Number(quantity) <= 0) {
       throw new Error("Ingredient quantity must be greater than zero");
@@ -477,7 +492,10 @@ export async function duplicateBatchFormulation(
   try {
     const original = await prisma.bom.findUnique({
       where: { id: bomId },
-      include: { ingredients: true },
+      include: {
+        ingredients: { include: { material: { select: { unitOfMeasure: true } } } },
+        finishedSku: { select: { unitOfMeasure: true } },
+      },
     });
 
     if (!original) {
@@ -489,14 +507,15 @@ export async function duplicateBatchFormulation(
         productName: newProductName,
         description: `Copy of: ${original.productName}`,
         expectedYield: original.expectedYield,
-        yieldUnit: original.yieldUnit,
+        yieldUnit: original.finishedSku?.unitOfMeasure ?? original.yieldUnit,
         finishedSkuId: original.finishedSkuId,
         status: "DRAFT",
         ingredients: {
           create: original.ingredients.map((ing) => ({
             materialId: ing.materialId,
             quantity: ing.quantity,
-            unitOfMeasure: ing.unitOfMeasure,
+            // Always the material's pack label, never the copied text.
+            unitOfMeasure: ing.material?.unitOfMeasure ?? ing.unitOfMeasure,
             isPercentage: ing.isPercentage,
           })),
         },

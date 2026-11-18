@@ -1059,6 +1059,8 @@ model ProductionStageRecord {
   /// QA-approved production batch identity this stage belongs to.
   batchLotId            String?               @map("batch_lot_id")
   /// Serial grinding batch number (global counter, assigned by the station).
+  /// This is the LAST number of the block consumed by this record; the block
+  /// start is derived from `batchesProcessed` (one serial per batch ground).
   grindingBatchNumber   Int?                  @unique @map("grinding_batch_number")
   machineId             String?               @map("machine_id")
   warehouseId           String?               @map("warehouse_id")

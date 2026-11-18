@@ -851,6 +851,20 @@ export class PlanReleaseError extends Error {
 }
 
 /**
+ * "25kg", "25 KG" and "25KG" all name the same pack. Bare "kg" stays distinct
+ * from "25 KG" because it is a weight, not a pack.
+ */
+function unitsMatch(a: unknown, b: unknown): boolean {
+  const norm = (value: unknown) =>
+    String(value ?? "")
+      .toUpperCase()
+      .replace(/\s+/g, "")
+      .trim();
+  const left = norm(a);
+  return left !== "" && left === norm(b);
+}
+
+/**
  * Deduct the plan's consolidated requirement across the selected warehouses,
  * taking the earliest-expiring lot first and splitting across lots and
  * warehouses when one is not enough.
@@ -924,12 +938,8 @@ export async function consumePlanRequirements(
     }
 
     const balances = await tx.inventoryTransaction.groupBy({
-      by: ["warehouseId", "batchLotId"],
-      where: {
-        materialId: req.materialId,
-        warehouseId: { in: warehouseIds },
-        unitOfMeasure: stockUnit,
-      },
+      by: ["warehouseId", "batchLotId", "unitOfMeasure"],
+      where: { materialId: req.materialId, warehouseId: { in: warehouseIds } },
       _sum: { quantity: true },
     });
 
@@ -937,9 +947,12 @@ export async function consumePlanRequirements(
       .map((row: any) => ({
         warehouseId: row.warehouseId as string,
         batchLotId: row.batchLotId as string | null,
+        // Keep the label the stock is actually stored under so the deduction
+        // reduces the same balance bucket.
+        unit: String(row.unitOfMeasure ?? stockUnit),
         quantity: Number(row._sum.quantity ?? 0),
       }))
-      .filter((row: any) => row.quantity > 0);
+      .filter((row: any) => row.quantity > 0 && unitsMatch(row.unit, stockUnit));
 
     const available = candidates.reduce((sum: number, row: any) => sum + row.quantity, 0);
 
@@ -987,7 +1000,7 @@ export async function consumePlanRequirements(
         batchLotId: lot.batchLotId,
         warehouseId: lot.warehouseId,
         quantity: -take,
-        unitOfMeasure: stockUnit,
+        unitOfMeasure: lot.unit,
         referenceType: "PLAN_RELEASE",
         referenceId: planId,
         createdById: userId,
@@ -1001,7 +1014,7 @@ export async function consumePlanRequirements(
           materialId: req.materialId,
           batchLotId: lot.batchLotId,
           quantity: take,
-          unitOfMeasure: stockUnit,
+          unitOfMeasure: lot.unit,
           unitCost,
           warehouseId: lot.warehouseId,
           issuedById: userId,
