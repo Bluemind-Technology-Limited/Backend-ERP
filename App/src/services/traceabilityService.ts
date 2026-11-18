@@ -411,9 +411,7 @@ export async function getGrindingBatchDetail(stageRecordId: string) {
           },
         },
       },
-      remainders: {
-        include: { material: { select: { id: true, name: true, sku: true } } },
-      },
+      remainders: true,
     },
   });
   if (!record) return null;
@@ -430,6 +428,15 @@ export async function getGrindingBatchDetail(stageRecordId: string) {
       status: true,
     },
   });
+
+  const remainderMaterialIds = [...new Set(record.remainders.map((r) => r.materialId))];
+  const remainderMaterials = remainderMaterialIds.length
+    ? await prisma.material.findMany({
+        where: { id: { in: remainderMaterialIds } },
+        select: { id: true, name: true },
+      })
+    : [];
+  const materialNameById = new Map(remainderMaterials.map((m) => [m.id, m.name]));
 
   const batches = Math.max(1, Math.round(Number(record.batchesProcessed ?? 1)));
   const blockTo = Number(record.grindingBatchNumber);
@@ -465,9 +472,9 @@ export async function getGrindingBatchDetail(stageRecordId: string) {
       supplierBatchNumber: line.batchLot?.supplierBatchNumber ?? null,
       supplier: line.batchLot?.supplier?.name ?? null,
     })),
-    remainders: record.remainders.map((line: any) => ({
+    remainders: record.remainders.map((line) => ({
       materialId: line.materialId,
-      materialName: line.material?.name ?? null,
+      materialName: materialNameById.get(line.materialId) ?? null,
       quantity: Number(line.quantity),
       unitOfMeasure: line.unitOfMeasure,
     })),
